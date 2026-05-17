@@ -8,6 +8,10 @@ repository   = { workspace = true }
 authors      = { workspace = true }
 
 [dependencies]
+openhl-types = { workspace = true }
+async-trait  = { workspace = true }
+thiserror    = { workspace = true }
+eyre         = { workspace = true }
 
 [lints]
 workspace = true
