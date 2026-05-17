@@ -6257,6 +6257,7 @@ dependencies = [
  "reth-node-core",
  "reth-node-ethereum",
  "reth-provider",
+ "reth-storage-api",
  "reth-tasks",
  "serde_json",
  "tempfile",

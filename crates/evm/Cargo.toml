@@ -11,9 +11,11 @@ authors      = { workspace = true }
 openhl-consensus         = { workspace = true }
 openhl-types             = { workspace = true }
 async-trait              = { workspace = true }
+eyre                     = { workspace = true }
 alloy-primitives         = { workspace = true }
 alloy-consensus          = { workspace = true }
 reth-ethereum-primitives = { workspace = true }
+reth-storage-api         = { workspace = true }
 
 [dev-dependencies]
 tokio                = { workspace = true }
@@ -25,7 +27,6 @@ reth-chainspec       = { workspace = true }
 reth-provider        = { workspace = true }
 alloy-genesis        = { workspace = true }
 serde_json           = { workspace = true }
-eyre                 = { workspace = true }
 tempfile             = "3"
 
 [lints]
