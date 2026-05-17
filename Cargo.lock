@@ -1470,7 +1470,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ccc2776f0c61eca1ca32528f85548abd1a4be8fb53d1b21c013e4f18da1e7090"
 dependencies = [
  "data-encoding",
- "syn 1.0.109",
+ "syn 2.0.117",
 ]
 
 [[package]]
@@ -2645,6 +2645,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "informalsystems-malachitebft-app-channel"
+version = "0.5.0"
+source = "git+https://github.com/informalsystems/malachite?rev=9ef02b33c4ded5fe3e072631d86448658680fe55#8a64f82061690b70e0522b71f32152295ccb0df5"
+dependencies = [
+ "bytes",
+ "derive-where",
+ "eyre",
+ "informalsystems-malachitebft-app",
+ "informalsystems-malachitebft-config",
+ "informalsystems-malachitebft-engine",
+ "ractor",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
 name = "informalsystems-malachitebft-codec"
 version = "0.5.0"
 source = "git+https://github.com/informalsystems/malachite?rev=9ef02b33c4ded5fe3e072631d86448658680fe55#8a64f82061690b70e0522b71f32152295ccb0df5"
@@ -2811,9 +2827,11 @@ name = "informalsystems-malachitebft-signing-ed25519"
 version = "0.5.0"
 source = "git+https://github.com/informalsystems/malachite?rev=9ef02b33c4ded5fe3e072631d86448658680fe55#8a64f82061690b70e0522b71f32152295ccb0df5"
 dependencies = [
+ "base64",
  "ed25519-consensus",
  "informalsystems-malachitebft-core-types",
  "rand 0.8.6",
+ "serde",
  "signature",
 ]
 
@@ -3809,13 +3827,17 @@ dependencies = [
  "bytes",
  "eyre",
  "informalsystems-malachitebft-app",
+ "informalsystems-malachitebft-app-channel",
+ "informalsystems-malachitebft-config",
  "informalsystems-malachitebft-core-consensus",
  "informalsystems-malachitebft-core-driver",
  "informalsystems-malachitebft-core-types",
  "informalsystems-malachitebft-signing-ed25519",
  "openhl-types",
  "rand 0.8.6",
+ "serde",
  "sha2 0.10.9",
+ "tempfile",
  "thiserror 1.0.69",
  "tokio",
 ]

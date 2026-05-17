@@ -17,13 +17,18 @@ informalsystems-malachitebft-core-types      = { workspace = true }
 informalsystems-malachitebft-core-driver     = { workspace = true }
 informalsystems-malachitebft-core-consensus  = { workspace = true }
 informalsystems-malachitebft-app             = { workspace = true }
-informalsystems-malachitebft-signing-ed25519 = { workspace = true, features = ["rand"] }
+informalsystems-malachitebft-app-channel     = { workspace = true }
+informalsystems-malachitebft-config          = { workspace = true }
+informalsystems-malachitebft-signing-ed25519 = { workspace = true, features = ["rand", "serde"] }
 bytes                                         = "1"
 rand                                          = "0.8"
 sha2                                          = "0.10"
+serde                                         = { workspace = true }
+tokio                                         = { workspace = true }
 
 [dev-dependencies]
-tokio = { workspace = true }
+tokio    = { workspace = true }
+tempfile = "3"
 
 [lints]
 workspace = true
