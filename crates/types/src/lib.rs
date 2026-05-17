@@ -1,10 +1,22 @@
 //! Shared primitives and CL/EL contract types.
 
+use std::fmt;
+
 use serde::{Deserialize, Serialize};
 
 /// 32-byte block hash, Ethereum convention.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub struct BlockHash(pub [u8; 32]);
+
+impl fmt::Display for BlockHash {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("0x")?;
+        for b in &self.0 {
+            write!(f, "{b:02x}")?;
+        }
+        Ok(())
+    }
+}
 
 /// Identifier returned by `build_payload`; used to retrieve the assembled block via `payload_ready`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]

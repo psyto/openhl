@@ -13,5 +13,11 @@ async-trait  = { workspace = true }
 thiserror    = { workspace = true }
 eyre         = { workspace = true }
 
+informalsystems-malachitebft-core-types      = { workspace = true }
+informalsystems-malachitebft-signing-ed25519 = { workspace = true, features = ["rand"] }
+
+[dev-dependencies]
+rand = "0.8"
+
 [lints]
 workspace = true
