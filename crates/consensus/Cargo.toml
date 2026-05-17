@@ -14,10 +14,13 @@ thiserror    = { workspace = true }
 eyre         = { workspace = true }
 
 informalsystems-malachitebft-core-types      = { workspace = true }
+informalsystems-malachitebft-core-driver     = { workspace = true }
 informalsystems-malachitebft-signing-ed25519 = { workspace = true, features = ["rand"] }
+rand                                          = "0.8"
+sha2                                          = "0.10"
 
 [dev-dependencies]
-rand = "0.8"
+tokio = { workspace = true }
 
 [lints]
 workspace = true

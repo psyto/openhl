@@ -1110,6 +1110,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "displaydoc"
+version = "0.2.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "97369cbbc041bc366949bc74d34658d6cda5621039731c6310521892a3a20ae0"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn 2.0.117",
+]
+
+[[package]]
 name = "dunce"
 version = "1.0.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1563,6 +1574,28 @@ dependencies = [
 ]
 
 [[package]]
+name = "informalsystems-malachitebft-core-driver"
+version = "0.5.0"
+source = "git+https://github.com/informalsystems/malachite?rev=9ef02b33c4ded5fe3e072631d86448658680fe55#8a64f82061690b70e0522b71f32152295ccb0df5"
+dependencies = [
+ "derive-where",
+ "informalsystems-malachitebft-core-state-machine",
+ "informalsystems-malachitebft-core-types",
+ "informalsystems-malachitebft-core-votekeeper",
+ "thiserror 2.0.18",
+]
+
+[[package]]
+name = "informalsystems-malachitebft-core-state-machine"
+version = "0.5.0"
+source = "git+https://github.com/informalsystems/malachite?rev=9ef02b33c4ded5fe3e072631d86448658680fe55#8a64f82061690b70e0522b71f32152295ccb0df5"
+dependencies = [
+ "derive-where",
+ "displaydoc",
+ "informalsystems-malachitebft-core-types",
+]
+
+[[package]]
 name = "informalsystems-malachitebft-core-types"
 version = "0.5.0"
 source = "git+https://github.com/informalsystems/malachite?rev=9ef02b33c4ded5fe3e072631d86448658680fe55#8a64f82061690b70e0522b71f32152295ccb0df5"
@@ -1570,6 +1603,16 @@ dependencies = [
  "bytes",
  "derive-where",
  "informalsystems-malachitebft-peer",
+ "thiserror 2.0.18",
+]
+
+[[package]]
+name = "informalsystems-malachitebft-core-votekeeper"
+version = "0.5.0"
+source = "git+https://github.com/informalsystems/malachite?rev=9ef02b33c4ded5fe3e072631d86448658680fe55#8a64f82061690b70e0522b71f32152295ccb0df5"
+dependencies = [
+ "derive-where",
+ "informalsystems-malachitebft-core-types",
  "thiserror 2.0.18",
 ]
 
@@ -1910,11 +1953,14 @@ version = "0.1.0"
 dependencies = [
  "async-trait",
  "eyre",
+ "informalsystems-malachitebft-core-driver",
  "informalsystems-malachitebft-core-types",
  "informalsystems-malachitebft-signing-ed25519",
  "openhl-types",
  "rand 0.8.6",
+ "sha2 0.10.9",
  "thiserror 1.0.69",
+ "tokio",
 ]
 
 [[package]]
