@@ -16,7 +16,17 @@ alloy-consensus          = { workspace = true }
 reth-ethereum-primitives = { workspace = true }
 
 [dev-dependencies]
-tokio = { workspace = true }
+tokio                = { workspace = true }
+reth-node-builder    = { workspace = true, features = ["test-utils"] }
+reth-node-ethereum   = { workspace = true, features = ["test-utils"] }
+reth-node-core       = { workspace = true }
+reth-tasks           = { workspace = true }
+reth-chainspec       = { workspace = true }
+reth-provider        = { workspace = true }
+alloy-genesis        = { workspace = true }
+serde_json           = { workspace = true }
+eyre                 = { workspace = true }
+tempfile             = "3"
 
 [lints]
 workspace = true
