@@ -1,28 +1,36 @@
 //! `LiveRethEvmBridge` — `ConsensusBridge` backed by a real Reth provider.
 //!
 //! Stage 7b: parent lookups go through the live node's provider via the
-//! `BlockNumReader` trait, so `build_payload` produces a child block whose
-//! `number` and `parent_hash` reflect actual chain state rather than the
-//! in-process synthesis of [`crate::engine::RethEvmBridge`].
+//! `BlockNumReader` trait.
 //!
-//! Still stubbed for now (each rolls into a later stage):
-//!   - `validate_payload` → Stage 7c: real `BlockExecutor` execution
+//! Stage 7c: `validate_payload` runs Reth's `EthBeaconConsensus::
+//! validate_header_against_parent` against the live parent — that's real
+//! header validation (number monotonicity, timestamp monotonicity, gas-limit
+//! drift, base-fee math) using production Reth code.
+//!
+//! Still stubbed:
+//!   - Full block execution + state-root verification (waits on block bodies
+//!     once the CLOB produces fills — Module 2)
 //!   - `commit` → Stage 7d: forkchoice via in-process Engine API
-//!
-//! Both stubs are visible markers of "what still needs the live node."
 
 use alloy_consensus::Header;
 use alloy_primitives::{Address, B256};
 use async_trait::async_trait;
 use openhl_consensus::bridge::{BridgeError, ConsensusBridge};
 use openhl_types::{BlockHash, ExecutedBlock, PayloadAttrs, PayloadId, PayloadStatus};
-use reth_storage_api::BlockNumReader;
+use reth_chainspec::{ChainSpec, EthChainSpec};
+use reth_consensus::HeaderValidator;
+use reth_ethereum_consensus::EthBeaconConsensus;
+use reth_primitives_traits::SealedHeader;
+use reth_storage_api::{BlockNumReader, HeaderProvider};
 use std::collections::HashMap;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 #[derive(Debug)]
 pub struct LiveRethEvmBridge<P> {
     provider: P,
+    chain_spec: Arc<ChainSpec>,
+    validator: EthBeaconConsensus<ChainSpec>,
     state: Mutex<State>,
 }
 
@@ -36,18 +44,26 @@ struct State {
 
 impl<P> LiveRethEvmBridge<P> {
     #[must_use]
-    pub fn new(provider: P) -> Self {
+    pub fn new(provider: P, chain_spec: Arc<ChainSpec>) -> Self {
+        let validator = EthBeaconConsensus::new(Arc::clone(&chain_spec));
         Self {
             provider,
+            chain_spec,
+            validator,
             state: Mutex::new(State::default()),
         }
+    }
+
+    #[must_use]
+    pub fn chain_spec(&self) -> &Arc<ChainSpec> {
+        &self.chain_spec
     }
 }
 
 #[async_trait]
 impl<P> ConsensusBridge for LiveRethEvmBridge<P>
 where
-    P: BlockNumReader + Clone + Sync + 'static,
+    P: BlockNumReader + HeaderProvider<Header = Header> + Clone + Sync + 'static,
 {
     async fn build_payload(
         &self,
@@ -56,27 +72,47 @@ where
     ) -> Result<PayloadId, BridgeError> {
         let parent_b256 = B256::from(parent.0);
 
-        // LIVE READ: parent's block number comes from the real provider, not
-        // an in-process HashMap. If the provider doesn't know this hash, we
-        // refuse to build a child on it.
-        let parent_number = self
+        // LIVE READ: pull the parent's full sealed header from the real
+        // provider so we can copy fields that EthBeaconConsensus will check
+        // against during validate_payload (gas_limit drift, EIP-1559 base
+        // fee, difficulty=0 post-merge).
+        let parent_sealed = self
             .provider
-            .block_number(parent_b256)
+            .sealed_header_by_hash(parent_b256)
             .map_err(|e| BridgeError::Internal(eyre::eyre!("provider error: {e}")))?
             .ok_or_else(|| {
                 BridgeError::Rejected(format!("provider has no block with hash {parent_b256}"))
             })?;
+        let parent_header = parent_sealed.header();
 
         let mut s = self.state.lock().expect("state mutex poisoned");
         let id = s.next_payload_id;
         s.next_payload_id += 1;
 
+        let our_timestamp = attrs.timestamp.max(parent_header.timestamp + 1);
+
+        // Compute the EIP-1559 base fee for our block via the chain spec —
+        // identical math to what EthBeaconConsensus's
+        // `validate_against_parent_eip1559_base_fee` will check against.
+        let next_base_fee = self
+            .chain_spec
+            .next_block_base_fee(parent_header, our_timestamp);
+
         let header = Header {
             parent_hash: parent_b256,
-            number: parent_number + 1,
-            timestamp: attrs.timestamp,
+            number: parent_header.number + 1,
+            // Timestamp must be strictly greater than parent's; force at least
+            // parent.timestamp + 1 even if attrs.timestamp came in stale.
+            timestamp: our_timestamp,
             beneficiary: Address::from(attrs.fee_recipient),
             mix_hash: B256::from(attrs.prev_randao),
+            // Keep gas_limit identical to parent so EthBeaconConsensus's
+            // 1/1024 drift check passes trivially. A real payload builder
+            // would tune this per network policy.
+            gas_limit: parent_header.gas_limit,
+            // Post-merge: difficulty must be 0.
+            difficulty: alloy_primitives::U256::ZERO,
+            base_fee_per_gas: next_base_fee,
             ..Default::default()
         };
         let hash = header.hash_slow();
@@ -102,10 +138,44 @@ where
 
     async fn validate_payload(
         &self,
-        _block: &ExecutedBlock,
+        block: &ExecutedBlock,
     ) -> Result<PayloadStatus, BridgeError> {
-        // Stage 7c: replace with real BlockExecutor execution + state-root check.
-        Ok(PayloadStatus::Valid)
+        let block_hash = B256::from(block.hash.0);
+        let parent_hash = B256::from(block.parent_hash.0);
+
+        // Find our header for this block. In single-validator mode we always
+        // built it, so it sits in pending (pre-commit) or chain (post-commit).
+        let header = {
+            let s = self.state.lock().expect("state mutex poisoned");
+            s.pending
+                .values()
+                .find(|(h, _)| *h == block_hash)
+                .map(|(_, h)| h.clone())
+                .or_else(|| s.chain.get(&block_hash).cloned())
+        };
+        let Some(header) = header else {
+            return Ok(PayloadStatus::Invalid);
+        };
+
+        // Fetch parent sealed header from the LIVE provider.
+        let Some(parent_sealed) = self
+            .provider
+            .sealed_header_by_hash(parent_hash)
+            .map_err(|e| BridgeError::Internal(eyre::eyre!("provider error: {e}")))?
+        else {
+            return Ok(PayloadStatus::Invalid);
+        };
+
+        // Run Reth's real header validator. EthBeaconConsensus checks number
+        // monotonicity, timestamp monotonicity, gas-limit drift, base-fee.
+        let our_sealed = SealedHeader::new(header, block_hash);
+        match self
+            .validator
+            .validate_header_against_parent(&our_sealed, &parent_sealed)
+        {
+            Ok(()) => Ok(PayloadStatus::Valid),
+            Err(_) => Ok(PayloadStatus::Invalid),
+        }
     }
 
     async fn commit(&self, block_hash: BlockHash) -> Result<(), BridgeError> {
@@ -179,7 +249,7 @@ mod tests {
     async fn live_bridge_builds_on_real_genesis() {
         let runtime = Runtime::test();
         let chain_spec = dev_chain_spec();
-        let node_config = NodeConfig::test().dev().with_chain(chain_spec);
+        let node_config = NodeConfig::test().dev().with_chain(chain_spec.clone());
 
         let NodeHandle {
             node,
@@ -198,8 +268,9 @@ mod tests {
             .expect("provider call failed")
             .expect("provider has no block 0 (genesis)");
 
-        // Construct the bridge against the live provider.
-        let bridge = LiveRethEvmBridge::new(node.provider.clone());
+        // Construct the bridge against the live provider AND chain_spec
+        // (chain_spec wires up EthBeaconConsensus for real header validation).
+        let bridge = LiveRethEvmBridge::new(node.provider.clone(), chain_spec.clone());
 
         // Build a payload on the real genesis.
         let attrs = PayloadAttrs {
@@ -217,6 +288,28 @@ mod tests {
         // header carries genesis as its parent and is at height 1.
         assert_eq!(block.parent_hash, BlockHash(genesis_hash_b256.0));
         assert_eq!(block.number, 1);
+
+        // Stage 7c: validate_payload runs Reth's EthBeaconConsensus against
+        // the live parent. A well-formed block we just built must validate.
+        let status = bridge
+            .validate_payload(&block)
+            .await
+            .expect("validate_payload failed");
+        assert_eq!(status, PayloadStatus::Valid);
+
+        // A block whose hash we don't know must be Invalid (we have no header
+        // to validate against).
+        let unknown_block = ExecutedBlock {
+            hash: BlockHash([0xddu8; 32]),
+            parent_hash: BlockHash(genesis_hash_b256.0),
+            number: 1,
+            state_root: [0u8; 32],
+        };
+        let status = bridge
+            .validate_payload(&unknown_block)
+            .await
+            .expect("validate_payload failed");
+        assert_eq!(status, PayloadStatus::Invalid);
 
         // Negative case: a fabricated parent hash must be rejected because
         // the live provider doesn't know it.
