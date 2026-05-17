@@ -15,7 +15,10 @@ eyre         = { workspace = true }
 
 informalsystems-malachitebft-core-types      = { workspace = true }
 informalsystems-malachitebft-core-driver     = { workspace = true }
+informalsystems-malachitebft-core-consensus  = { workspace = true }
+informalsystems-malachitebft-app             = { workspace = true }
 informalsystems-malachitebft-signing-ed25519 = { workspace = true, features = ["rand"] }
+bytes                                         = "1"
 rand                                          = "0.8"
 sha2                                          = "0.10"
 
