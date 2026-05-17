@@ -8,6 +8,12 @@ repository   = { workspace = true }
 authors      = { workspace = true }
 
 [dependencies]
+openhl-consensus = { workspace = true }
+openhl-types     = { workspace = true }
+async-trait      = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true }
 
 [lints]
 workspace = true
