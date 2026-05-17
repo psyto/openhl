@@ -15,8 +15,8 @@ use std::collections::HashMap;
 
 use informalsystems_malachitebft_core_driver::{Driver, Input, Output, ThresholdParams};
 use informalsystems_malachitebft_core_types::{
-    Context as _, Height as _, NilOrVal, Proposal as _, Round, SignedMessage, Validity,
-    Value as _, VotingPower,
+    Context as _, Height as _, NilOrVal, Proposal as _, Round, SignedMessage, SigningProvider as _,
+    Validity, Value as _, VotingPower,
 };
 use informalsystems_malachitebft_signing_ed25519::{PrivateKey, Signature};
 use openhl_types::{BlockHash, PayloadAttrs};
@@ -25,7 +25,8 @@ use thiserror::Error;
 
 use crate::bridge::{BridgeError, ConsensusBridge};
 use crate::context::OpenHlContext;
-use crate::signing::{sign_proposal, sign_vote};
+use crate::signing::sign_vote;
+use crate::signing_provider::OpenHlSigningProvider;
 use crate::types::{
     OpenHlAddress, OpenHlHeight, OpenHlValidator, OpenHlValidatorSet, OpenHlValue, OpenHlVote,
 };
@@ -160,7 +161,7 @@ where
         .collect();
 
     let our_address = entries[0].0;
-    let our_sk = entries[0].1.clone();
+    let our_provider = OpenHlSigningProvider::new(entries[0].1.clone());
     let validator_set = OpenHlValidatorSet::new(entries.iter().map(|(_, _, v)| v.clone()).collect());
 
     let signers: HashMap<OpenHlAddress, PrivateKey> = entries
@@ -201,10 +202,13 @@ where
             Round::Nil,
             proposer_address,
         );
-        let signed = sign_proposal(
-            proposal,
-            signers.get(&proposer_address).expect("proposer in signers"),
+        let proposer_provider = OpenHlSigningProvider::new(
+            signers
+                .get(&proposer_address)
+                .expect("proposer in signers")
+                .clone(),
         );
+        let signed = proposer_provider.sign_proposal(proposal);
         let batch = driver
             .process(Input::Proposal(signed, Validity::Valid))
             .map_err(|e| RunError::Driver(format!("{e:?}")))?;
@@ -218,7 +222,7 @@ where
         value,
         value_id_for_votes,
         our_address,
-        &our_sk,
+        &our_provider,
         &signers,
         &validator_set,
     )
@@ -233,7 +237,7 @@ async fn drive_loop_multi<B>(
     value: OpenHlValue,
     value_id_for_votes: NilOrVal<BlockHash>,
     our_address: OpenHlAddress,
-    our_sk: &PrivateKey,
+    our_provider: &OpenHlSigningProvider,
     signers: &HashMap<OpenHlAddress, PrivateKey>,
     validator_set: &OpenHlValidatorSet,
 ) -> Result<BlockHash, RunError>
@@ -249,11 +253,11 @@ where
                     next.push(Input::ProposeValue(r, value));
                 }
                 Output::Propose(proposal) => {
-                    let signed = sign_proposal(proposal, our_sk);
+                    let signed = our_provider.sign_proposal(proposal);
                     next.push(Input::Proposal(signed, Validity::Valid));
                 }
                 Output::Vote(our_vote) => {
-                    let signed_us = sign_vote(our_vote.clone(), our_sk);
+                    let signed_us = our_provider.sign_vote(our_vote.clone());
                     next.push(Input::Vote(signed_us));
 
                     for (addr, sk) in signers {
