@@ -17,7 +17,7 @@ members = [
 [workspace.package]
 version      = "0.1.0"
 edition      = "2024"
-rust-version = "1.85"
+rust-version = "1.95"
 license      = "MIT OR Apache-2.0"
 repository   = "https://github.com/psyto/openhl"
 authors      = ["psyto <saito.hiroyuki@gmail.com>"]
@@ -37,13 +37,15 @@ openhl-node        = { path = "crates/node" }
 
 # --- Reth (pinned to v2.2.0 release tag) ---
 # Bump in a dedicated PR. Always pin to a release-tag SHA, never main HEAD.
-reth-node-builder    = { git = "https://github.com/paradigmxyz/reth", rev = "88505c7fcbfdebfd3b56d88c86b62e950043c6c4" }
-reth-node-ethereum   = { git = "https://github.com/paradigmxyz/reth", rev = "88505c7fcbfdebfd3b56d88c86b62e950043c6c4" }
-reth-chainspec       = { git = "https://github.com/paradigmxyz/reth", rev = "88505c7fcbfdebfd3b56d88c86b62e950043c6c4" }
-reth-evm             = { git = "https://github.com/paradigmxyz/reth", rev = "88505c7fcbfdebfd3b56d88c86b62e950043c6c4" }
-reth-evm-ethereum    = { git = "https://github.com/paradigmxyz/reth", rev = "88505c7fcbfdebfd3b56d88c86b62e950043c6c4" }
-reth-primitives      = { git = "https://github.com/paradigmxyz/reth", rev = "88505c7fcbfdebfd3b56d88c86b62e950043c6c4" }
-reth-payload-builder = { git = "https://github.com/paradigmxyz/reth", rev = "88505c7fcbfdebfd3b56d88c86b62e950043c6c4" }
+reth-node-builder         = { git = "https://github.com/paradigmxyz/reth", rev = "88505c7fcbfdebfd3b56d88c86b62e950043c6c4" }
+reth-node-ethereum        = { git = "https://github.com/paradigmxyz/reth", rev = "88505c7fcbfdebfd3b56d88c86b62e950043c6c4" }
+reth-chainspec            = { git = "https://github.com/paradigmxyz/reth", rev = "88505c7fcbfdebfd3b56d88c86b62e950043c6c4" }
+reth-evm                  = { git = "https://github.com/paradigmxyz/reth", rev = "88505c7fcbfdebfd3b56d88c86b62e950043c6c4" }
+reth-evm-ethereum         = { git = "https://github.com/paradigmxyz/reth", rev = "88505c7fcbfdebfd3b56d88c86b62e950043c6c4" }
+reth-ethereum-primitives  = { git = "https://github.com/paradigmxyz/reth", rev = "88505c7fcbfdebfd3b56d88c86b62e950043c6c4" }
+reth-engine-primitives    = { git = "https://github.com/paradigmxyz/reth", rev = "88505c7fcbfdebfd3b56d88c86b62e950043c6c4" }
+reth-payload-primitives   = { git = "https://github.com/paradigmxyz/reth", rev = "88505c7fcbfdebfd3b56d88c86b62e950043c6c4" }
+reth-payload-builder      = { git = "https://github.com/paradigmxyz/reth", rev = "88505c7fcbfdebfd3b56d88c86b62e950043c6c4" }
 
 # --- Malachite BFT (pinned to v0.5.0 release tag) ---
 # Note: crate names in the malachite repo are prefixed `informalsystems-malachitebft-*`.
@@ -54,9 +56,10 @@ informalsystems-malachitebft-app             = { git = "https://github.com/infor
 informalsystems-malachitebft-codec           = { git = "https://github.com/informalsystems/malachite", rev = "9ef02b33c4ded5fe3e072631d86448658680fe55" }
 informalsystems-malachitebft-signing-ed25519 = { git = "https://github.com/informalsystems/malachite", rev = "9ef02b33c4ded5fe3e072631d86448658680fe55" }
 
-# --- Alloy primitives (crates.io) ---
-alloy-primitives = "0.8"
-alloy-rlp        = "0.3"
+# --- Alloy primitives (crates.io) — version-aligned with Reth v2.2.0 ---
+alloy-primitives = { version = "1.5", default-features = false }
+alloy-rlp        = { version = "0.3", default-features = false }
+alloy-consensus  = { version = "2.0", default-features = false }
 
 # --- Shared runtime / utilities (crates.io) ---
 tokio              = { version = "1", features = ["full"] }
