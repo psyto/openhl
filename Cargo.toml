@@ -1,0 +1,77 @@
+[workspace]
+resolver = "3"
+members = [
+    "bin/openhl",
+    "crates/types",
+    "crates/codec",
+    "crates/clob",
+    "crates/oracle",
+    "crates/funding",
+    "crates/liquidation",
+    "crates/vault",
+    "crates/evm",
+    "crates/consensus",
+    "crates/node",
+]
+
+[workspace.package]
+version      = "0.1.0"
+edition      = "2024"
+rust-version = "1.85"
+license      = "MIT OR Apache-2.0"
+repository   = "https://github.com/psyto/openhl"
+authors      = ["psyto <saito.hiroyuki@gmail.com>"]
+
+[workspace.dependencies]
+# --- Internal crates ---
+openhl-types       = { path = "crates/types" }
+openhl-codec       = { path = "crates/codec" }
+openhl-clob        = { path = "crates/clob" }
+openhl-oracle      = { path = "crates/oracle" }
+openhl-funding     = { path = "crates/funding" }
+openhl-liquidation = { path = "crates/liquidation" }
+openhl-vault       = { path = "crates/vault" }
+openhl-evm         = { path = "crates/evm" }
+openhl-consensus   = { path = "crates/consensus" }
+openhl-node        = { path = "crates/node" }
+
+# --- External (added per module as the course arc lands) ---
+# Module 1 (consensus): reth-*, revm, malachitebft-*  — pinned to SHAs
+# Module 3 (evm bridge): alloy-primitives, alloy-rlp
+# All crates: serde, tokio, tracing, thiserror, eyre, proptest
+#
+# Listed here only when a member crate actually consumes them, so
+# `cargo check` stays clean against an unresolved git pin.
+
+[workspace.lints.rust]
+unsafe_code                   = "forbid"
+missing_debug_implementations = "warn"
+unreachable_pub               = "warn"
+rust_2018_idioms              = { level = "warn", priority = -1 }
+
+[workspace.lints.clippy]
+all      = { level = "warn", priority = -1 }
+pedantic = { level = "warn", priority = -1 }
+module_name_repetitions = "allow"
+must_use_candidate      = "allow"
+missing_errors_doc      = "allow"
+missing_panics_doc      = "allow"
+
+[profile.release]
+opt-level     = 3
+lto           = "fat"
+codegen-units = 1
+strip         = "symbols"
+debug         = false
+panic         = "abort"
+
+[profile.dev]
+opt-level = 1
+debug     = true
+
+[profile.dev.package."*"]
+opt-level = 3
+
+[profile.bench]
+inherits = "release"
+debug    = true
