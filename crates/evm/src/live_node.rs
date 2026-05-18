@@ -40,7 +40,11 @@ pub struct LiveRethEvmBridge<P> {
     provider: P,
     chain_spec: Arc<ChainSpec>,
     validator: EthBeaconConsensus<ChainSpec>,
-    clob: Mutex<Book>,
+    /// `Arc<Mutex<Book>>` rather than `Mutex<Book>` so the bridge can share
+    /// its CLOB with the precompile module's process-global state. The bridge
+    /// writes via `submit_order`; smart contracts read via the
+    /// `clob_read_best_bid` precompile — both touch the same `Book`.
+    clob: Arc<Mutex<Book>>,
     pending_fills: Mutex<Vec<Fill>>,
     state: Mutex<State>,
 }
@@ -59,11 +63,18 @@ impl<P> LiveRethEvmBridge<P> {
     #[must_use]
     pub fn new(provider: P, chain_spec: Arc<ChainSpec>) -> Self {
         let validator = EthBeaconConsensus::new(Arc::clone(&chain_spec));
+        let clob = Arc::new(Mutex::new(Book::new()));
+
+        // Make our CLOB visible to the `clob_read_best_bid` precompile so
+        // smart contracts can query live orderbook state. The bridge writes
+        // (submit_order), the EVM reads (precompile); they share the same Arc.
+        crate::precompiles::install_clob(Arc::clone(&clob));
+
         Self {
             provider,
             chain_spec,
             validator,
-            clob: Mutex::new(Book::new()),
+            clob,
             pending_fills: Mutex::new(Vec::new()),
             state: Mutex::new(State::default()),
         }

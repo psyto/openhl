@@ -208,6 +208,26 @@ impl Book {
         self.asks.keys().next().copied()
     }
 
+    /// Best bid price + total qty resting at that price level (sum of every
+    /// resting order in the level's FIFO queue). Returns `None` if there
+    /// are no bids.
+    #[must_use]
+    pub fn best_bid_with_qty(&self) -> Option<(Price, Qty)> {
+        self.bids.iter().next().map(|(rev_price, queue)| {
+            let qty: u64 = queue.iter().map(|o| o.qty.0).sum();
+            (rev_price.0, Qty(qty))
+        })
+    }
+
+    /// Best ask price + total qty resting at that price level.
+    #[must_use]
+    pub fn best_ask_with_qty(&self) -> Option<(Price, Qty)> {
+        self.asks.iter().next().map(|(price, queue)| {
+            let qty: u64 = queue.iter().map(|o| o.qty.0).sum();
+            (*price, Qty(qty))
+        })
+    }
+
     #[must_use]
     pub fn depth_bid(&self) -> usize {
         self.bids.values().map(VecDeque::len).sum()
