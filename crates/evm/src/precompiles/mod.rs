@@ -62,3 +62,69 @@ pub fn openhl_precompiles(base: &Precompiles) -> Precompiles {
     )]);
     precompiles
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use alloy_primitives::U256;
+
+    /// Direct unit test of the precompile function: invoked with empty input,
+    /// it returns the hardcoded (price=100, qty=10) as 64 big-endian u256 bytes.
+    #[test]
+    fn read_best_bid_returns_hardcoded_price_and_qty() {
+        let result = read_best_bid(&[], 100_000, 0).expect("precompile must not error");
+        assert_eq!(result.bytes.len(), 64);
+        let price = U256::from_be_slice(&result.bytes[0..32]);
+        let qty = U256::from_be_slice(&result.bytes[32..64]);
+        assert_eq!(price, U256::from(100u64));
+        assert_eq!(qty, U256::from(10u64));
+        assert_eq!(result.gas_used, CLOB_BASE_GAS_COST);
+    }
+
+    /// Registry test: `openhl_precompiles()` extends a base precompile set
+    /// with our CLOB precompile at the well-known address. This is what the
+    /// Stage 9a `EvmFactory` plugs into every EVM instance Reth constructs.
+    #[test]
+    fn openhl_precompiles_registers_clob_address() {
+        let base = Precompiles::cancun();
+        let extended = openhl_precompiles(base);
+
+        // The CLOB address must be in the extended set.
+        assert!(
+            extended.contains(&CLOB_READ_BEST_BID),
+            "openhl_precompiles must register the CLOB_READ_BEST_BID address"
+        );
+
+        // The base Ethereum precompiles (e.g. ECDSA recover at 0x...01) must
+        // still be present — we EXTEND, not replace.
+        let ecrecover: Address = alloy_primitives::address!("0x0000000000000000000000000000000000000001");
+        assert!(
+            extended.contains(&ecrecover),
+            "extended set must retain base Ethereum precompiles"
+        );
+    }
+
+    /// Invoke the registered precompile end-to-end through the registry
+    /// (rather than calling `read_best_bid` directly). This proves the
+    /// registration is wired such that an EVM dispatch to the address hits
+    /// our function — the same path Reth's EVM uses on `staticcall` to
+    /// `CLOB_READ_BEST_BID`.
+    #[test]
+    fn registered_precompile_is_invokable_via_registry() {
+        let extended = openhl_precompiles(Precompiles::cancun());
+        let precompile = extended
+            .get(&CLOB_READ_BEST_BID)
+            .expect("CLOB precompile must be registered");
+
+        // Precompile::execute is the public dispatch method — same as what
+        // the EVM calls internally when a contract STATICCALLs the address.
+        let result = precompile
+            .execute(&[], 100_000, 0)
+            .expect("call must not error");
+        assert_eq!(result.bytes.len(), 64);
+        let price = U256::from_be_slice(&result.bytes[0..32]);
+        let qty = U256::from_be_slice(&result.bytes[32..64]);
+        assert_eq!(price, U256::from(100u64));
+        assert_eq!(qty, U256::from(10u64));
+    }
+}
