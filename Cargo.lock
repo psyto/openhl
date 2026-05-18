@@ -6252,6 +6252,7 @@ dependencies = [
  "alloy-primitives",
  "async-trait",
  "eyre",
+ "openhl-clob",
  "openhl-consensus",
  "openhl-types",
  "reth-chainspec",

@@ -10,6 +10,7 @@ authors      = { workspace = true }
 [dependencies]
 openhl-consensus         = { workspace = true }
 openhl-types             = { workspace = true }
+openhl-clob              = { workspace = true }
 async-trait              = { workspace = true }
 eyre                     = { workspace = true }
 alloy-primitives         = { workspace = true }

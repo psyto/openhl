@@ -8,14 +8,23 @@
 //! header validation (number monotonicity, timestamp monotonicity, gas-limit
 //! drift, base-fee math) using production Reth code.
 //!
+//! Stage 8d: the bridge now owns a CLOB matching engine. `submit_order` routes
+//! orders into the book and accumulates resulting fills in `pending_fills`.
+//! `build_payload` drains the pending fills and stores them alongside the
+//! synthesized header, so the payload carries real CLOB-generated content.
+//! Fills are not yet encoded as EVM transactions executable by Reth's
+//! `BlockExecutor` — that's the next stage (or Module 3). 8d proves the
+//! wiring exists; encoding is downstream.
+//!
 //! Still stubbed:
-//!   - Full block execution + state-root verification (waits on block bodies
-//!     once the CLOB produces fills — Module 2)
+//!   - Full block execution + state-root verification (waits on fills being
+//!     encoded as EVM-executable transactions)
 //!   - `commit` → Stage 7d: forkchoice via in-process Engine API
 
 use alloy_consensus::Header;
 use alloy_primitives::{Address, B256};
 use async_trait::async_trait;
+use openhl_clob::{Book, Fill, FillResult, Order};
 use openhl_consensus::bridge::{BridgeError, ConsensusBridge};
 use openhl_types::{BlockHash, ExecutedBlock, PayloadAttrs, PayloadId, PayloadStatus};
 use reth_chainspec::{ChainSpec, EthChainSpec};
@@ -31,13 +40,17 @@ pub struct LiveRethEvmBridge<P> {
     provider: P,
     chain_spec: Arc<ChainSpec>,
     validator: EthBeaconConsensus<ChainSpec>,
+    clob: Mutex<Book>,
+    pending_fills: Mutex<Vec<Fill>>,
     state: Mutex<State>,
 }
 
 #[derive(Debug, Default)]
 struct State {
     next_payload_id: u64,
-    pending: HashMap<u64, (B256, Header)>,
+    /// Pending payloads keyed by `PayloadId.0`. Value is (`block_hash`, `header`,
+    /// fills drained from the CLOB at `build_payload` time).
+    pending: HashMap<u64, (B256, Header, Vec<Fill>)>,
     chain: HashMap<B256, Header>,
     head: Option<B256>,
 }
@@ -50,6 +63,8 @@ impl<P> LiveRethEvmBridge<P> {
             provider,
             chain_spec,
             validator,
+            clob: Mutex::new(Book::new()),
+            pending_fills: Mutex::new(Vec::new()),
             state: Mutex::new(State::default()),
         }
     }
@@ -57,6 +72,39 @@ impl<P> LiveRethEvmBridge<P> {
     #[must_use]
     pub fn chain_spec(&self) -> &Arc<ChainSpec> {
         &self.chain_spec
+    }
+
+    /// Submit an order to the CLOB. Resulting fills are buffered in
+    /// `pending_fills` until the next `build_payload` drains them.
+    pub fn submit_order(&self, order: Order) -> FillResult {
+        let mut book = self.clob.lock().expect("clob mutex poisoned");
+        let result = book.submit(order);
+        if !result.fills.is_empty() {
+            self.pending_fills
+                .lock()
+                .expect("pending_fills mutex poisoned")
+                .extend(result.fills.iter().copied());
+        }
+        result
+    }
+
+    /// Inspect (read-only) the fills attached to a built payload. Returns
+    /// `None` if the payload id is unknown. Production code would encode
+    /// these as EVM-executable transactions before they reach the block
+    /// body; v0 keeps them as a parallel list for test inspection.
+    #[must_use]
+    pub fn payload_fills(&self, id: PayloadId) -> Option<Vec<Fill>> {
+        let s = self.state.lock().expect("state mutex poisoned");
+        s.pending.get(&id.0).map(|(_, _, fills)| fills.clone())
+    }
+
+    /// Number of fills currently buffered, waiting for the next `build_payload`.
+    #[must_use]
+    pub fn pending_fill_count(&self) -> usize {
+        self.pending_fills
+            .lock()
+            .expect("pending_fills mutex poisoned")
+            .len()
     }
 }
 
@@ -116,14 +164,27 @@ where
             ..Default::default()
         };
         let hash = header.hash_slow();
-        s.pending.insert(id, (hash, header));
+
+        // Drain whatever fills the CLOB has accumulated since the last
+        // build_payload call. The fills attach to this payload so the bridge
+        // can route them downstream (encode as EVM txs, return via
+        // payload_fills, etc.). 8d keeps them as a parallel list; future
+        // stages encode them into the block body.
+        let drained_fills = std::mem::take(
+            &mut *self
+                .pending_fills
+                .lock()
+                .expect("pending_fills mutex poisoned"),
+        );
+
+        s.pending.insert(id, (hash, header, drained_fills));
         Ok(PayloadId(id))
     }
 
     async fn payload_ready(&self, id: PayloadId) -> Result<ExecutedBlock, BridgeError> {
         let s = self.state.lock().expect("state mutex poisoned");
         let n = id.0;
-        let (hash, header) = s
+        let (hash, header, _fills) = s
             .pending
             .get(&n)
             .cloned()
@@ -149,8 +210,8 @@ where
             let s = self.state.lock().expect("state mutex poisoned");
             s.pending
                 .values()
-                .find(|(h, _)| *h == block_hash)
-                .map(|(_, h)| h.clone())
+                .find(|(h, _, _)| *h == block_hash)
+                .map(|(_, h, _)| h.clone())
                 .or_else(|| s.chain.get(&block_hash).cloned())
         };
         let Some(header) = header else {
@@ -185,8 +246,8 @@ where
         let header = s
             .pending
             .values()
-            .find(|(h, _)| *h == hash)
-            .map(|(_, h)| h.clone())
+            .find(|(h, _, _)| *h == hash)
+            .map(|(_, h, _)| h.clone())
             .ok_or_else(|| BridgeError::Rejected(format!("commit for unknown hash {hash}")))?;
         s.chain.insert(hash, header);
         s.head = Some(hash);
@@ -316,5 +377,104 @@ mod tests {
         let fake_parent = BlockHash([0xeeu8; 32]);
         let err = bridge.build_payload(fake_parent, attrs).await.unwrap_err();
         assert!(matches!(err, BridgeError::Rejected(_)));
+    }
+
+    /// Stage 8d end-to-end: CLOB → bridge → payload.
+    /// A maker rests, a taker crosses it, the fill flows into the next
+    /// `build_payload`'s stored fills. The empty-fill `build_payload` that
+    /// preceded the orders proves the drain semantics — fills accumulate
+    /// AFTER they're built, not retroactively included.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn clob_fills_flow_into_payload() {
+        use openhl_clob::{AccountId, OrderId, OrderType, Price, Qty, Side};
+
+        let runtime = Runtime::test();
+        let chain_spec = dev_chain_spec();
+        let node_config = NodeConfig::test().dev().with_chain(chain_spec.clone());
+
+        let NodeHandle {
+            node,
+            node_exit_future: _,
+        } = NodeBuilder::new(node_config)
+            .testing_node(runtime)
+            .node(EthereumNode::default())
+            .launch_with_debug_capabilities()
+            .await
+            .expect("launch failed");
+
+        let genesis_hash_b256 = node
+            .provider
+            .block_hash(0)
+            .expect("provider call failed")
+            .expect("provider has no genesis");
+
+        let bridge = LiveRethEvmBridge::new(node.provider.clone(), chain_spec);
+
+        // Empty initial state — no orders submitted, no fills pending.
+        assert_eq!(bridge.pending_fill_count(), 0);
+
+        // First payload built with no orders → no fills attached.
+        let attrs = PayloadAttrs {
+            timestamp: 1,
+            fee_recipient: [0u8; 20],
+            prev_randao: [0u8; 32],
+        };
+        let empty_id = bridge
+            .build_payload(BlockHash(genesis_hash_b256.0), attrs.clone())
+            .await
+            .expect("build_payload failed");
+        let empty_fills = bridge
+            .payload_fills(empty_id)
+            .expect("payload exists");
+        assert!(empty_fills.is_empty(), "no orders submitted yet, fills must be empty");
+
+        // Submit a resting limit BID @ 100 from account 1, then a crossing
+        // SELL @ 100 from account 2. This produces exactly one fill.
+        let maker = Order {
+            id: OrderId(1),
+            account: AccountId(1),
+            side: Side::Buy,
+            qty: Qty(10),
+            order_type: OrderType::Limit { price: Price(100) },
+        };
+        let taker = Order {
+            id: OrderId(2),
+            account: AccountId(2),
+            side: Side::Sell,
+            qty: Qty(10),
+            order_type: OrderType::Limit { price: Price(100) },
+        };
+
+        let maker_result = bridge.submit_order(maker);
+        assert!(maker_result.fills.is_empty(), "maker rests, no immediate fill");
+        assert_eq!(bridge.pending_fill_count(), 0);
+
+        let taker_result = bridge.submit_order(taker);
+        assert_eq!(taker_result.fills.len(), 1, "taker should cross the maker");
+        assert_eq!(bridge.pending_fill_count(), 1, "fill buffered in pending");
+
+        // Build the NEXT payload — it should drain the buffered fill.
+        let next_id = bridge
+            .build_payload(BlockHash(genesis_hash_b256.0), attrs)
+            .await
+            .expect("build_payload failed");
+        let next_fills = bridge
+            .payload_fills(next_id)
+            .expect("payload exists");
+        assert_eq!(next_fills.len(), 1, "fill must be attached to the payload");
+        assert_eq!(next_fills[0].price, Price(100));
+        assert_eq!(next_fills[0].qty, Qty(10));
+        assert_eq!(next_fills[0].maker_order_id, OrderId(1));
+        assert_eq!(next_fills[0].taker_order_id, OrderId(2));
+
+        // After draining, pending fills must be empty.
+        assert_eq!(bridge.pending_fill_count(), 0);
+
+        // The earlier (empty) payload's fills must still be empty —
+        // draining is forward-only, never retroactive.
+        let empty_fills_again = bridge
+            .payload_fills(empty_id)
+            .expect("earlier payload exists");
+        assert!(empty_fills_again.is_empty(), "earlier payload not retroactively filled");
     }
 }
