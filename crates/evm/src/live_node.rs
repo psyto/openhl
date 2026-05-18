@@ -488,4 +488,72 @@ mod tests {
             .expect("earlier payload exists");
         assert!(empty_fills_again.is_empty(), "earlier payload not retroactively filled");
     }
+
+    /// **Stage 9d**: bootstrap a Reth node WITH `OpenHlExecutorBuilder` (so its
+    /// EVM has our CLOB precompiles registered), construct a `LiveRethEvmBridge`
+    /// against that node's provider, submit an order via the bridge — verify
+    /// that the precompile module's process-global `CLOB_STATE` now reflects
+    /// the order. This proves the full bridge ↔ custom-EVM-node integration:
+    /// the same `Arc<Mutex<Book>>` that the bridge's `submit_order` writes to
+    /// is the one any smart contract calling `clob_read_best_bid` through this
+    /// node's EVM would see.
+    ///
+    /// Doesn't yet invoke the precompile via RPC `eth_call` — that's deferred
+    /// indefinitely (validates Reth's plumbing rather than openhl behavior).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn bridge_against_custom_evm_node_shares_clob_with_precompile() {
+        use crate::OpenHlExecutorBuilder;
+        use crate::precompiles::{current_best_bid, uninstall_clob};
+        use openhl_clob::{AccountId, OrderId, OrderType, Price, Qty, Side};
+        use reth_node_ethereum::node::EthereumAddOns;
+
+        // Start from a clean global state — other tests may have left a CLOB
+        // installed; that's fine for those tests but would mask bugs here.
+        uninstall_clob();
+
+        let runtime = Runtime::test();
+        let chain_spec = dev_chain_spec();
+        let node_config = NodeConfig::test().dev().with_chain(chain_spec.clone());
+
+        let handle = NodeBuilder::new(node_config)
+            .testing_node(runtime)
+            .with_types::<EthereumNode>()
+            .with_components(EthereumNode::components().executor(OpenHlExecutorBuilder))
+            .with_add_ons(EthereumAddOns::default())
+            .launch()
+            .await
+            .expect("launch of custom-EVM node failed");
+
+        // Build the bridge against the live custom-EVM node's provider.
+        // The bridge installs its CLOB as the precompile's global state
+        // (per the install_clob call inside LiveRethEvmBridge::new).
+        let bridge = LiveRethEvmBridge::new(handle.node.provider.clone(), chain_spec);
+
+        // Pre-condition: precompile sees an empty book.
+        assert_eq!(current_best_bid(), None);
+
+        // Submit a resting bid via the bridge. This goes through Book::submit
+        // under the same Arc<Mutex<Book>> the precompile reads from.
+        bridge.submit_order(Order {
+            id: OrderId(1),
+            account: AccountId(42),
+            side: Side::Buy,
+            qty: Qty(33),
+            order_type: OrderType::Limit { price: Price(200) },
+        });
+
+        // Post-condition: the precompile's view (which is what a smart
+        // contract calling `clob_read_best_bid` through this node would see)
+        // now reflects the order.
+        let best = current_best_bid().expect("CLOB has bids after submit_order");
+        assert_eq!(best.0, Price(200));
+        assert_eq!(best.1, Qty(33));
+
+        // Clean up the global so other tests can start clean.
+        uninstall_clob();
+
+        // Drop the node handle explicitly to make the lifecycle visible
+        // in the trace.
+        drop(handle);
+    }
 }
