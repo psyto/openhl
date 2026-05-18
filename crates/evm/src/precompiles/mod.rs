@@ -23,7 +23,7 @@ use alloy_evm::revm::precompile::{
     Precompile, PrecompileId, PrecompileOutput, PrecompileResult, Precompiles,
 };
 use alloy_primitives::{address, Address, Bytes};
-use openhl_clob::{AccountId, Book, Order, OrderId, OrderType, Price, Qty, Side};
+use openhl_clob::{AccountId, Book, Fill, Order, OrderId, OrderType, Price, Qty, Side};
 use std::sync::{
     atomic::{AtomicU64, Ordering},
     Arc, Mutex, RwLock,
@@ -87,6 +87,27 @@ pub fn uninstall_clob() {
     *CLOB_STATE.write().expect("CLOB_STATE rwlock poisoned") = None;
 }
 
+/// Process-global handle to the buffer where the precompile pushes fills.
+///
+/// Same lifecycle rules as `CLOB_STATE`: installed by `LiveRethEvmBridge::new`,
+/// none until set. When set, `place_order` extends this buffer with any fills
+/// produced by the matched order, so production-shape EVM-placed orders flow
+/// into the next `build_payload`'s drained fills exactly like bridge-side
+/// `submit_order` does.
+static FILL_SINK: RwLock<Option<Arc<Mutex<Vec<Fill>>>>> = RwLock::new(None);
+
+/// Install the `pending_fills` buffer the precompile should write to.
+/// Companion to `install_clob`. Calling this replaces any previously-installed
+/// sink.
+pub fn install_fill_sink(sink: Arc<Mutex<Vec<Fill>>>) {
+    *FILL_SINK.write().expect("FILL_SINK rwlock poisoned") = Some(sink);
+}
+
+/// Clear the installed fill sink. Test-only typical use; idempotent.
+pub fn uninstall_fill_sink() {
+    *FILL_SINK.write().expect("FILL_SINK rwlock poisoned") = None;
+}
+
 /// Read the currently-installed CLOB's best bid. Returns `None` if no CLOB
 /// is installed or if the book has no bids. Public so tests can verify
 /// install/uninstall without going through the precompile dispatch.
@@ -140,12 +161,14 @@ fn read_best_bid(_input: &[u8], _gas_limit: u64, _reservoir: u64) -> PrecompileR
 /// on rejection (no CLOB installed, malformed input, invalid side byte).
 /// Allocated IDs start at 1, so zero is unambiguously "rejected".
 ///
-/// Side note: the fills returned by `Book::submit` are discarded here.
-/// Production-shape integration would route them through the bridge's
-/// `pending_fills` so they reach the next `build_payload`. At v0 the
-/// precompile and the bridge are write-side independent.
+/// Stage 9c+ (this commit): any fills produced by the submit are pushed into
+/// the `FILL_SINK` global if installed. This is what makes EVM-placed orders
+/// flow into the bridge's `pending_fills` and out via `build_payload`,
+/// matching the bridge-side `submit_order` semantics. If no sink is
+/// installed the fills are still produced (visible via subsequent
+/// `read_best_bid`) but won't reach a payload.
 #[allow(clippy::unnecessary_wraps)]
-fn place_order(input: &[u8], _gas_limit: u64, _reservoir: u64) -> PrecompileResult {
+pub(crate) fn place_order(input: &[u8], _gas_limit: u64, _reservoir: u64) -> PrecompileResult {
     let mut out = vec![0u8; 32];
 
     // Need exactly 128 bytes of input (4 × ABI-padded fields).
@@ -179,7 +202,7 @@ fn place_order(input: &[u8], _gas_limit: u64, _reservoir: u64) -> PrecompileResu
     let order_id_val = NEXT_ORDER_ID.fetch_add(1, Ordering::Relaxed);
 
     let mut book = clob.lock().expect("clob mutex poisoned");
-    let _result = book.submit(Order {
+    let submit_result = book.submit(Order {
         id: OrderId(order_id_val),
         account: AccountId(account_id),
         side,
@@ -189,6 +212,18 @@ fn place_order(input: &[u8], _gas_limit: u64, _reservoir: u64) -> PrecompileResu
         },
     });
     drop(book);
+
+    // Stage 9c+: route any fills produced by this order through the bridge's
+    // pending_fills buffer so they reach the next `build_payload`. Drops
+    // silently if no sink is installed (consistent with no-CLOB → return 0).
+    if !submit_result.fills.is_empty() {
+        let sink_state = FILL_SINK.read().expect("FILL_SINK rwlock poisoned");
+        if let Some(sink) = sink_state.as_ref() {
+            sink.lock()
+                .expect("fill_sink mutex poisoned")
+                .extend(submit_result.fills.iter().copied());
+        }
+    }
 
     out[24..32].copy_from_slice(&order_id_val.to_be_bytes());
     Ok(PrecompileOutput::new(CLOB_BASE_GAS_COST, Bytes::from(out), 0))
@@ -411,6 +446,40 @@ mod tests {
         assert_eq!(price, U256::from(175u64), "best bid is the placed order's price");
         assert_eq!(qty, U256::from(12u64), "qty at best level matches placed qty");
 
+        uninstall_clob();
+    }
+
+    /// **Stage 9c+**: when a `FILL_SINK` is installed alongside the CLOB,
+    /// fills produced by a `place_order` call flow into the sink. This is the
+    /// hook the bridge relies on to surface EVM-placed fills in the next
+    /// `build_payload`. With no sink installed, fills are still produced but
+    /// silently dropped — verified by the round-trip test above (which never
+    /// installs a sink yet still observes book state changes).
+    #[test]
+    fn place_order_routes_fills_to_installed_sink() {
+        let _g = TEST_SERIALIZER.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let book = Arc::new(Mutex::new(Book::new()));
+        let sink: Arc<Mutex<Vec<Fill>>> = Arc::new(Mutex::new(Vec::new()));
+        install_clob(book);
+        install_fill_sink(Arc::clone(&sink));
+
+        // Maker: Buy @ 100, qty 10. Rests, no fill.
+        let maker = place_order_calldata(1, 0, 100, 10);
+        let r = place_order(&maker, 100_000, 0).unwrap();
+        assert!(U256::from_be_slice(&r.bytes[0..32]) > U256::ZERO);
+        assert!(sink.lock().unwrap().is_empty(), "no fills after resting maker");
+
+        // Taker: Sell @ 100, qty 10. Crosses the maker → exactly one fill.
+        let taker = place_order_calldata(2, 1, 100, 10);
+        let r = place_order(&taker, 100_000, 0).unwrap();
+        assert!(U256::from_be_slice(&r.bytes[0..32]) > U256::ZERO);
+
+        let fills = sink.lock().unwrap().clone();
+        assert_eq!(fills.len(), 1, "exactly one fill from the crossing taker");
+        assert_eq!(fills[0].price, Price(100));
+        assert_eq!(fills[0].qty, Qty(10));
+
+        uninstall_fill_sink();
         uninstall_clob();
     }
 }

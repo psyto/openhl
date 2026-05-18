@@ -45,7 +45,11 @@ pub struct LiveRethEvmBridge<P> {
     /// writes via `submit_order`; smart contracts read via the
     /// `clob_read_best_bid` precompile — both touch the same `Book`.
     clob: Arc<Mutex<Book>>,
-    pending_fills: Mutex<Vec<Fill>>,
+    /// Same shared-Arc pattern as `clob`: the precompile module's `FILL_SINK`
+    /// global points at this buffer too, so fills produced by EVM-placed
+    /// orders (via `clob_place_order`) flow into the same queue the bridge's
+    /// own `submit_order` writes to (Stage 9c+).
+    pending_fills: Arc<Mutex<Vec<Fill>>>,
     state: Mutex<State>,
 }
 
@@ -64,18 +68,24 @@ impl<P> LiveRethEvmBridge<P> {
     pub fn new(provider: P, chain_spec: Arc<ChainSpec>) -> Self {
         let validator = EthBeaconConsensus::new(Arc::clone(&chain_spec));
         let clob = Arc::new(Mutex::new(Book::new()));
+        let pending_fills = Arc::new(Mutex::new(Vec::new()));
 
         // Make our CLOB visible to the `clob_read_best_bid` precompile so
         // smart contracts can query live orderbook state. The bridge writes
         // (submit_order), the EVM reads (precompile); they share the same Arc.
         crate::precompiles::install_clob(Arc::clone(&clob));
 
+        // Route fills produced by the `clob_place_order` precompile into the
+        // same queue `submit_order` writes to. Without this, EVM-placed orders
+        // would match but their fills would be silently dropped (Stage 9c+).
+        crate::precompiles::install_fill_sink(Arc::clone(&pending_fills));
+
         Self {
             provider,
             chain_spec,
             validator,
             clob,
-            pending_fills: Mutex::new(Vec::new()),
+            pending_fills,
             state: Mutex::new(State::default()),
         }
     }
@@ -503,13 +513,17 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn bridge_against_custom_evm_node_shares_clob_with_precompile() {
         use crate::OpenHlExecutorBuilder;
-        use crate::precompiles::{current_best_bid, uninstall_clob};
+        use crate::precompiles::{
+            CLOB_PLACE_ORDER, current_best_bid, uninstall_clob, uninstall_fill_sink,
+        };
         use openhl_clob::{AccountId, OrderId, OrderType, Price, Qty, Side};
         use reth_node_ethereum::node::EthereumAddOns;
 
         // Start from a clean global state — other tests may have left a CLOB
-        // installed; that's fine for those tests but would mask bugs here.
+        // or fill sink installed; that's fine for those tests but would mask
+        // bugs here (especially the "sink was wired by bridge::new" assertion).
         uninstall_clob();
+        uninstall_fill_sink();
 
         let runtime = Runtime::test();
         let chain_spec = dev_chain_spec();
@@ -549,7 +563,49 @@ mod tests {
         assert_eq!(best.0, Price(200));
         assert_eq!(best.1, Qty(33));
 
-        // Clean up the global so other tests can start clean.
+        // === Stage 9c+ ===
+        // Now hit the WRITE precompile: place a crossing Sell @ 200 qty 33
+        // via `place_order`. The bridge's pending_fills should see the fill
+        // even though we never went through bridge.submit_order. This proves
+        // the FILL_SINK that LiveRethEvmBridge::new installed is the same
+        // Arc<Mutex<Vec<Fill>>> the bridge later drains in build_payload.
+        assert_eq!(
+            bridge.pending_fill_count(),
+            0,
+            "fills empty before crossing taker via precompile"
+        );
+
+        let mut calldata = [0u8; 128];
+        // account_id = 7 (last 8 bytes of slot 0)
+        calldata[24..32].copy_from_slice(&7u64.to_be_bytes());
+        // side = Sell (1) at byte 63
+        calldata[63] = 1;
+        // price = 200 (last 8 bytes of slot 2)
+        calldata[88..96].copy_from_slice(&200u64.to_be_bytes());
+        // qty = 33 (last 8 bytes of slot 3)
+        calldata[120..128].copy_from_slice(&33u64.to_be_bytes());
+
+        let r = crate::precompiles::place_order(&calldata, 100_000, 0)
+            .expect("place_order must not error");
+        let order_id_bytes = &r.bytes[24..32];
+        let order_id = u64::from_be_bytes(order_id_bytes.try_into().unwrap());
+        assert!(order_id > 0, "successful place_order returns nonzero id");
+
+        // The fill from the cross should have landed in bridge's pending_fills
+        // via the FILL_SINK install_fill_sink path inside LiveRethEvmBridge::new.
+        assert_eq!(
+            bridge.pending_fill_count(),
+            1,
+            "precompile-placed cross must populate bridge.pending_fills (Stage 9c+)"
+        );
+
+        // CLOB_PLACE_ORDER's address constant is part of the public surface
+        // (and registered into the precompiles set by `openhl_precompiles`);
+        // touch it here so the import resolves and the constant stays load-bearing.
+        let _ = CLOB_PLACE_ORDER;
+
+        // Clean up the globals so other tests can start clean.
+        uninstall_fill_sink();
         uninstall_clob();
 
         // Drop the node handle explicitly to make the lifecycle visible
