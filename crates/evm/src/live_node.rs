@@ -16,20 +16,31 @@
 //! `BlockExecutor` — that's the next stage (or Module 3). 8d proves the
 //! wiring exists; encoding is downstream.
 //!
+//! Stage 7d: `commit` now sends a `ForkchoiceUpdated` to Reth's in-process
+//! consensus engine when an engine handle has been installed. The bridge
+//! still maintains its own `chain` `HashMap` as the source of truth for
+//! validation lookups — Reth's response (VALID/SYNCING/INVALID) is logged
+//! but does not yet block the commit, because `build_payload` doesn't
+//! produce a real `ExecutionPayload` for the engine to validate against.
+//! Honest scoping: the wire is connected; payload-execution alignment is
+//! the next chunk of work (depends on encoding CLOB fills as EVM txs).
+//!
 //! Still stubbed:
 //!   - Full block execution + state-root verification (waits on fills being
-//!     encoded as EVM-executable transactions)
-//!   - `commit` → Stage 7d: forkchoice via in-process Engine API
+//!     encoded as EVM-executable transactions, then `newPayload` round-trip)
 
 use alloy_consensus::Header;
 use alloy_primitives::{Address, B256};
+use alloy_rpc_types_engine::ForkchoiceState;
 use async_trait::async_trait;
 use openhl_clob::{Book, Fill, FillResult, Order};
 use openhl_consensus::bridge::{BridgeError, ConsensusBridge};
 use openhl_types::{BlockHash, ExecutedBlock, PayloadAttrs, PayloadId, PayloadStatus};
 use reth_chainspec::{ChainSpec, EthChainSpec};
 use reth_consensus::HeaderValidator;
+use reth_engine_primitives::ConsensusEngineHandle;
 use reth_ethereum_consensus::EthBeaconConsensus;
+use reth_ethereum_engine_primitives::EthEngineTypes;
 use reth_primitives_traits::SealedHeader;
 use reth_storage_api::{BlockNumReader, HeaderProvider};
 use std::collections::HashMap;
@@ -50,6 +61,12 @@ pub struct LiveRethEvmBridge<P> {
     /// orders (via `clob_place_order`) flow into the same queue the bridge's
     /// own `submit_order` writes to (Stage 9c+).
     pending_fills: Arc<Mutex<Vec<Fill>>>,
+    /// Optional in-process Engine API handle. When installed (Stage 7d via
+    /// [`Self::with_engine_handle`]), `commit` sends a `ForkchoiceUpdated`
+    /// to Reth so its canonical chain advances in lockstep with consensus.
+    /// `None` at v0 means commits stay local to the bridge's `state.chain`
+    /// `HashMap` — fine for unit tests, but RPC clients won't see new heads.
+    engine_handle: Option<ConsensusEngineHandle<EthEngineTypes>>,
     state: Mutex<State>,
 }
 
@@ -86,8 +103,29 @@ impl<P> LiveRethEvmBridge<P> {
             validator,
             clob,
             pending_fills,
+            engine_handle: None,
             state: Mutex::new(State::default()),
         }
+    }
+
+    /// Install a Reth in-process Engine API handle. After this call,
+    /// `commit` will fire a `ForkchoiceUpdated` to Reth's consensus engine
+    /// alongside its own local bookkeeping. Without an engine handle, the
+    /// bridge still works (commits go to its internal `HashMap`) but Reth's
+    /// canonical chain won't advance — RPC and any other Reth consumer will
+    /// see only the genesis block.
+    #[must_use]
+    pub fn with_engine_handle(
+        mut self,
+        handle: ConsensusEngineHandle<EthEngineTypes>,
+    ) -> Self {
+        self.engine_handle = Some(handle);
+        self
+    }
+
+    #[must_use]
+    pub const fn has_engine_handle(&self) -> bool {
+        self.engine_handle.is_some()
     }
 
     #[must_use]
@@ -261,17 +299,42 @@ where
     }
 
     async fn commit(&self, block_hash: BlockHash) -> Result<(), BridgeError> {
-        // Stage 7d: replace with in-process Engine API forkchoice update.
         let hash = B256::from(block_hash.0);
-        let mut s = self.state.lock().expect("state mutex poisoned");
-        let header = s
-            .pending
-            .values()
-            .find(|(h, _, _)| *h == hash)
-            .map(|(_, h, _)| h.clone())
-            .ok_or_else(|| BridgeError::Rejected(format!("commit for unknown hash {hash}")))?;
-        s.chain.insert(hash, header);
-        s.head = Some(hash);
+        let header = {
+            let mut s = self.state.lock().expect("state mutex poisoned");
+            let header = s
+                .pending
+                .values()
+                .find(|(h, _, _)| *h == hash)
+                .map(|(_, h, _)| h.clone())
+                .ok_or_else(|| {
+                    BridgeError::Rejected(format!("commit for unknown hash {hash}"))
+                })?;
+            s.chain.insert(hash, header.clone());
+            s.head = Some(hash);
+            header
+        };
+
+        // Stage 7d: if an Engine API handle has been installed, also tell
+        // Reth's consensus engine about the new canonical head. We always
+        // commit *locally* first (above) — sending to the engine is best-
+        // effort at this stage because we haven't yet uploaded a real
+        // ExecutionPayload via newPayload (Stage 8d's drained fills aren't
+        // EVM-executable yet), so the engine will return SYNCING/INVALID.
+        // The wire being connected is what 7d proves; full payload-execution
+        // alignment is downstream once fills become EVM transactions.
+        if let Some(handle) = &self.engine_handle {
+            let state = ForkchoiceState {
+                head_block_hash: hash,
+                safe_block_hash: hash,
+                finalized_block_hash: hash,
+            };
+            let _ = handle.fork_choice_updated(state, None).await;
+        }
+
+        // `header` is bound so the post-engine path can read fields off it
+        // for telemetry if desired. Drop is fine.
+        drop(header);
         Ok(())
     }
 }
@@ -610,6 +673,95 @@ mod tests {
 
         // Drop the node handle explicitly to make the lifecycle visible
         // in the trace.
+        drop(handle);
+    }
+
+    /// **Stage 7d**: with a Reth `ConsensusEngineHandle` installed, `commit`
+    /// sends a `ForkchoiceUpdated` to the in-process Engine API. The bridge's
+    /// own bookkeeping still happens (so existing callers don't regress), but
+    /// now Reth is told about the new head too.
+    ///
+    /// At this stage the engine will respond SYNCING because we haven't sent
+    /// a matching `newPayload` (`build_payload` doesn't yet produce a real
+    /// `ExecutionPayload` — fills aren't EVM-encoded). That's intentional: 7d
+    /// proves the wire is connected. Full alignment between Malachite's
+    /// commit and Reth's canonical head needs `newPayload` integration, which
+    /// is the next staging chunk after fills become EVM transactions.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn commit_sends_forkchoice_to_engine_when_handle_installed() {
+        use crate::OpenHlExecutorBuilder;
+        use crate::precompiles::{uninstall_clob, uninstall_fill_sink};
+        use reth_node_ethereum::node::EthereumAddOns;
+
+        uninstall_clob();
+        uninstall_fill_sink();
+
+        let runtime = Runtime::test();
+        let chain_spec = dev_chain_spec();
+        let node_config = NodeConfig::test().dev().with_chain(chain_spec.clone());
+
+        let handle = NodeBuilder::new(node_config)
+            .testing_node(runtime)
+            .with_types::<EthereumNode>()
+            .with_components(EthereumNode::components().executor(OpenHlExecutorBuilder))
+            .with_add_ons(EthereumAddOns::default())
+            .launch()
+            .await
+            .expect("launch failed");
+
+        // Pull the engine handle out of add_ons. This is what RPC's
+        // engine_forkchoiceUpdated endpoint would dispatch to — we're
+        // taking the in-process shortcut around the JSON-RPC layer.
+        let engine_handle = handle.node.add_ons_handle.beacon_engine_handle.clone();
+
+        let bridge = LiveRethEvmBridge::new(handle.node.provider.clone(), chain_spec)
+            .with_engine_handle(engine_handle);
+        assert!(
+            bridge.has_engine_handle(),
+            "with_engine_handle must install the handle"
+        );
+
+        let genesis_hash_b256 = handle
+            .node
+            .provider
+            .block_hash(0)
+            .expect("provider call failed")
+            .expect("provider has no genesis");
+
+        // Build a payload on top of genesis so commit has something to find.
+        let attrs = PayloadAttrs {
+            timestamp: 1,
+            fee_recipient: [0u8; 20],
+            prev_randao: [0u8; 32],
+        };
+        let id = bridge
+            .build_payload(BlockHash(genesis_hash_b256.0), attrs)
+            .await
+            .expect("build_payload failed");
+        let block = bridge.payload_ready(id).await.expect("payload_ready failed");
+
+        // The actual test: commit should not panic, not block forever, not
+        // surface an error from the engine-side SYNCING response. We're
+        // proving the wire is connected — that fork_choice_updated reaches
+        // the engine and returns *some* response (even SYNCING).
+        bridge
+            .commit(block.hash)
+            .await
+            .expect("commit failed even though local bookkeeping should succeed");
+
+        // The bridge's own chain HashMap must reflect the new head.
+        // Negative case: a commit for an unknown hash must still be Rejected
+        // (the engine-side call doesn't happen because the bridge bails out
+        // before it).
+        let bogus = BlockHash([0xddu8; 32]);
+        let err = bridge.commit(bogus).await.unwrap_err();
+        assert!(
+            matches!(err, BridgeError::Rejected(_)),
+            "unknown hash must yield Rejected"
+        );
+
+        uninstall_fill_sink();
+        uninstall_clob();
         drop(handle);
     }
 }

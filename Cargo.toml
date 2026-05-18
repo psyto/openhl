@@ -72,6 +72,8 @@ informalsystems-malachitebft-signing-ed25519 = { git = "https://github.com/infor
 alloy-primitives = { version = "1.5", default-features = false }
 alloy-rlp        = { version = "0.3", default-features = false }
 alloy-consensus  = { version = "2.0", default-features = false }
+alloy-rpc-types-engine = { version = "2.0", default-features = false }
+reth-ethereum-engine-primitives = { git = "https://github.com/paradigmxyz/reth", rev = "88505c7fcbfdebfd3b56d88c86b62e950043c6c4" }
 
 # --- Shared runtime / utilities (crates.io) ---
 tokio              = { version = "1", features = ["full"] }
