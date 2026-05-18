@@ -27,9 +27,11 @@ mod tests {
     use reth_chainspec::ChainSpec;
     use reth_node_builder::{NodeBuilder, NodeHandle};
     use reth_node_core::node_config::NodeConfig;
-    use reth_node_ethereum::EthereumNode;
+    use reth_node_ethereum::{node::EthereumAddOns, EthereumNode};
     use reth_tasks::Runtime;
     use std::sync::Arc;
+
+    use crate::OpenHlExecutorBuilder;
 
     fn dev_chain_spec() -> Arc<ChainSpec> {
         // Minimal post-merge dev genesis. ChainID 2600 mirrors the upstream
@@ -100,6 +102,40 @@ mod tests {
     async fn reth_dev_node_bootstraps() {
         if let Err(e) = launch_and_check().await {
             panic!("Reth dev node bootstrap failed: {e:?}");
+        }
+    }
+
+    /// Stage 9a: prove that `NodeBuilder` accepts `OpenHlExecutorBuilder` in
+    /// place of Reth's default executor, and that the resulting node still
+    /// spawns cleanly with our custom precompile registered.
+    ///
+    /// Doesn't yet invoke the precompile (that requires deploying a
+    /// Solidity contract); just validates the `EvmFactory` + `ExecutorBuilder`
+    /// composition compiles, spawns, and tears down.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn reth_dev_node_with_openhl_executor() {
+        let runtime = Runtime::test();
+        let chain_spec = dev_chain_spec();
+        let expected_chain_id = chain_spec.chain.id();
+        let node_config = NodeConfig::test().dev().with_chain(chain_spec);
+
+        let result: Result<()> = async {
+            let _handle = NodeBuilder::new(node_config)
+                .testing_node(runtime)
+                .with_types::<EthereumNode>()
+                .with_components(EthereumNode::components().executor(OpenHlExecutorBuilder))
+                .with_add_ons(EthereumAddOns::default())
+                .launch()
+                .await?;
+            // The node spawned with our custom EVM. We don't need to inspect
+            // further — if the EvmFactory or ExecutorBuilder were broken,
+            // launch() would have failed.
+            let _ = expected_chain_id;
+            Ok(())
+        }
+        .await;
+        if let Err(e) = result {
+            panic!("Reth dev node bootstrap with OpenHl EVM failed: {e:?}");
         }
     }
 }

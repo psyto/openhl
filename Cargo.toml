@@ -54,6 +54,7 @@ reth-consensus            = { git = "https://github.com/paradigmxyz/reth", rev =
 reth-ethereum-consensus   = { git = "https://github.com/paradigmxyz/reth", rev = "88505c7fcbfdebfd3b56d88c86b62e950043c6c4" }
 reth-primitives-traits    = "0.3"
 alloy-genesis             = { version = "2.0", default-features = false }
+alloy-evm                 = { version = "0.34", default-features = false }
 
 # --- Malachite BFT (pinned to v0.5.0 release tag) ---
 # Note: crate names in the malachite repo are prefixed `informalsystems-malachitebft-*`.
