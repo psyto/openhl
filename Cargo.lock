@@ -6289,6 +6289,11 @@ dependencies = [
 [[package]]
 name = "openhl-liquidation"
 version = "0.1.0"
+dependencies = [
+ "openhl-clob",
+ "openhl-funding",
+ "proptest",
+]
 
 [[package]]
 name = "openhl-node"

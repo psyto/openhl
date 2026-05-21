@@ -8,6 +8,11 @@ repository   = { workspace = true }
 authors      = { workspace = true }
 
 [dependencies]
+openhl-clob    = { path = "../clob" }
+openhl-funding = { path = "../funding" }
+
+[dev-dependencies]
+proptest = { workspace = true }
 
 [lints]
 workspace = true
