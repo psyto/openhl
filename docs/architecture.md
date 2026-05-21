@@ -10,7 +10,7 @@ openhl is a single Rust binary composed of two cleanly-separated halves:
 Plus three pure state-machine subsystems that the EL composes:
 
 - **CLOB** (`crates/clob`) — orderbook matching engine. Pure, deterministic, replayable.
-- **Settlement** (`crates/funding`, `crates/oracle`, `crates/liquidation`) — funding rates, mark prices, liquidations.
+- **Settlement** (`crates/funding`, `crates/oracle`, `crates/liquidation`) — funding rates, mark prices, liquidations. `funding` is complete (Stage 8b); `liquidation` ships in three sub-stages — 10a (margin math, complete) → 10b (insurance fund, pending) → 10c (multi-account scanner, pending); `oracle` is still pending.
 - **Vault** (`crates/vault`) — protocol-native vault primitive for strategy products.
 
 ## The CL/EL contract
