@@ -137,6 +137,12 @@ pub struct OpenHlNode {
     pub validator_set: OpenHlValidatorSet,
     pub home_dir: PathBuf,
     pub moniker: String,
+    /// Optional libp2p listen multiaddr override (Stage 13k). When
+    /// `None`, defaults to `/ip4/127.0.0.1/tcp/0` (ephemeral local
+    /// port — the prior behavior, fine for single-validator devnets
+    /// and tests). When `Some`, must be a valid libp2p multiaddr such
+    /// as `/ip4/0.0.0.0/tcp/9000`.
+    pub listen_addr: Option<String>,
 }
 
 impl OpenHlNode {
@@ -152,7 +158,17 @@ impl OpenHlNode {
             validator_set,
             home_dir,
             moniker: moniker.into(),
+            listen_addr: None,
         }
+    }
+
+    /// Override the libp2p listen multiaddr. See
+    /// [`OpenHlNode::listen_addr`]; typical production deployments
+    /// pass `/ip4/0.0.0.0/tcp/<port>` so peers can dial in.
+    #[must_use]
+    pub fn with_listen_addr(mut self, multiaddr: impl Into<String>) -> Self {
+        self.listen_addr = Some(multiaddr.into());
+        self
     }
 }
 
@@ -171,11 +187,16 @@ impl Node for OpenHlNode {
 
     fn load_config(&self) -> eyre::Result<Self::Config> {
         let mut cfg = OpenHlConfig::new(&self.moniker);
-        // Bind to an ephemeral port on localhost so tests and devnets don't
-        // step on each other. Real deployments override this in their config.
-        cfg.consensus.p2p.listen_addr = "/ip4/127.0.0.1/tcp/0"
+        // listen_addr: ephemeral local port by default (fine for tests
+        // and single-validator devnets), explicit override via
+        // `OpenHlNode::with_listen_addr` for multi-validator deployments.
+        let raw = self
+            .listen_addr
+            .as_deref()
+            .unwrap_or("/ip4/127.0.0.1/tcp/0");
+        cfg.consensus.p2p.listen_addr = raw
             .parse()
-            .map_err(|e| eyre!("invalid listen_addr: {e}"))?;
+            .map_err(|e| eyre!("invalid listen_addr `{raw}`: {e}"))?;
         Ok(cfg)
     }
 
@@ -276,6 +297,32 @@ mod tests {
         assert!(
             listen_str.starts_with("/ip4/127.0.0.1/tcp/0"),
             "unexpected listen_addr: {listen_str}"
+        );
+    }
+
+    #[test]
+    fn with_listen_addr_overrides_default() {
+        let tmp = tempfile::tempdir().unwrap();
+        let node = single_validator_node(tmp.path().to_path_buf())
+            .with_listen_addr("/ip4/0.0.0.0/tcp/26656");
+        let cfg = node.load_config().unwrap();
+        let listen_str = cfg.consensus.p2p.listen_addr.to_string();
+        assert!(
+            listen_str.starts_with("/ip4/0.0.0.0/tcp/26656"),
+            "expected listen_addr override, got: {listen_str}"
+        );
+    }
+
+    #[test]
+    fn with_listen_addr_rejects_malformed_multiaddr() {
+        let tmp = tempfile::tempdir().unwrap();
+        let node = single_validator_node(tmp.path().to_path_buf())
+            .with_listen_addr("not-a-multiaddr");
+        let err = node.load_config().expect_err("malformed multiaddr should error");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("invalid listen_addr"),
+            "unexpected error message: {msg}"
         );
     }
 

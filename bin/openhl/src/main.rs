@@ -37,6 +37,7 @@
 //! (persistent across restarts, real network config, multi-validator)
 //! lands in Stage 13f.
 
+use std::net::IpAddr;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -137,10 +138,17 @@ enum Command {
         /// ```json
         /// {
         ///   "validators": [
-        ///     { "pubkey_hex": "<64 hex chars>", "voting_power": 1 }
+        ///     {
+        ///       "pubkey_hex": "<64 hex chars>",
+        ///       "voting_power": 1,
+        ///       "peer_multiaddr": "/ip4/10.0.0.5/tcp/9000"
+        ///     }
         ///   ]
         /// }
         /// ```
+        ///
+        /// `peer_multiaddr` is optional (Stage 13k) and currently
+        /// only logged — full vote relay wiring is a follow-up.
         ///
         /// When supplied, the locally-loaded validator key's public
         /// key must appear in the set, otherwise the node refuses to
@@ -148,6 +156,25 @@ enum Command {
         /// network doesn't recognize.
         #[arg(long)]
         validators: Option<PathBuf>,
+
+        /// libp2p listen multiaddr for this node's consensus engine
+        /// (Stage 13k). Default: `/ip4/127.0.0.1/tcp/0` (ephemeral
+        /// local port — single-validator devnet default). For
+        /// multi-validator deployments use `/ip4/0.0.0.0/tcp/<port>`
+        /// so peers can dial in.
+        #[arg(long)]
+        listen_addr: Option<String>,
+
+        /// Reth HTTP RPC server bind in `<addr>:<port>` form (Stage
+        /// 13k). Default: Reth's `RpcServerArgs::default()` which is
+        /// `127.0.0.1:8545`. Examples:
+        ///   `0.0.0.0:8545` (listen on all interfaces)
+        ///   `127.0.0.1:0` (let the OS pick a free port)
+        ///
+        /// Use IPv6 by wrapping the address in brackets:
+        /// `[::1]:8545`.
+        #[arg(long)]
+        rpc_bind: Option<String>,
     },
 }
 
@@ -164,6 +191,13 @@ struct ValidatorEntry {
     pubkey_hex: String,
     /// Voting power for this validator. Must be > 0.
     voting_power: u64,
+    /// libp2p multiaddr where peers can reach this validator
+    /// (Stage 13k). Optional; when present it's logged so operators
+    /// can sanity-check the network layout. Full vote relay wiring
+    /// remains a follow-up — the consensus engine doesn't yet
+    /// consume per-peer multiaddrs from the validator set.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    peer_multiaddr: Option<String>,
 }
 
 fn main() -> eyre::Result<()> {
@@ -180,8 +214,16 @@ fn main() -> eyre::Result<()> {
             data_dir,
             chain_spec,
             validators,
+            listen_addr,
+            rpc_bind,
         } => tokio_rt()?.block_on(run_reth_devnet(
-            rounds, moniker, data_dir, chain_spec, validators,
+            rounds,
+            moniker,
+            data_dir,
+            chain_spec,
+            validators,
+            listen_addr,
+            rpc_bind,
         )),
     }
 }
@@ -320,12 +362,15 @@ async fn run_devnet(rounds: u64) -> eyre::Result<()> {
 ///      to drive `rounds` decisions then exit.
 ///   7. Clean shutdown of the consensus node.
 #[allow(clippy::too_many_lines)] // 6-step boot ceremony — flat for readability
+#[allow(clippy::too_many_arguments)] // CLI surface — clap collects + forwards
 async fn run_reth_devnet(
     rounds: u64,
     moniker: String,
     data_dir: Option<PathBuf>,
     chain_spec_path: Option<PathBuf>,
     validators_path: Option<PathBuf>,
+    listen_addr: Option<String>,
+    rpc_bind: Option<String>,
 ) -> eyre::Result<()> {
     println!(
         "openhl v{} — driving {} reth-backed decision{}",
@@ -352,12 +397,29 @@ async fn run_reth_devnet(
         println!("      chain spec       = (embedded dev chain id 2600)");
         dev_chain_spec()
     };
-    let node_config = NodeConfig::test().dev().with_chain(chain_spec.clone()).with_datadir_args(
-        DatadirArgs {
+
+    // Stage 13k: optional `--rpc-bind <addr:port>` overrides Reth's
+    // default RPC bind (127.0.0.1:8545). Parse <ip>:<port>; supports
+    // IPv4 (e.g. `0.0.0.0:8545`) and bracketed IPv6 (e.g. `[::1]:8545`).
+    // `RpcServerArgs` exposes `http_addr`/`http_port` as public fields,
+    // so we mutate the default rather than using a builder method.
+    let mut rpc_args = reth_node_core::args::RpcServerArgs::default();
+    if let Some(spec) = rpc_bind.as_deref() {
+        let (ip, port) = parse_socket_spec(spec)?;
+        println!("      rpc bind         = {ip}:{port}");
+        rpc_args.http_addr = ip;
+        rpc_args.http_port = port;
+    } else {
+        println!("      rpc bind         = (Reth default 127.0.0.1:8545)");
+    }
+    let node_config = NodeConfig::test()
+        .dev()
+        .with_chain(chain_spec.clone())
+        .with_datadir_args(DatadirArgs {
             datadir: MaybePlatformPath::<DataDirPath>::from(reth_db_path.clone()),
             ..Default::default()
-        },
-    );
+        })
+        .with_rpc(rpc_args);
     let runtime = Runtime::test();
 
     // `init_db` opens an existing MDBX database at the path or creates
@@ -459,13 +521,23 @@ async fn run_reth_devnet(
     // construct single-validator set from the loaded key (preserves
     // pre-13j behavior).
     let validator_set = if let Some(path) = validators_path.as_deref() {
-        let set = load_validator_set(path, &public)?;
+        let (set, peer_multiaddrs) = load_validator_set(path, &public)?;
         println!(
             "      validator set    = {} ({} validator{})",
             path.display(),
             set.validators().len(),
             if set.validators().len() == 1 { "" } else { "s" }
         );
+        // Stage 13k: log advertised peer multiaddrs so operators can
+        // sanity-check the network layout before the (future) libp2p
+        // dialer consumes them. Empty list is fine — single-validator
+        // devnets never list peer addresses.
+        for (idx, addr) in peer_multiaddrs.iter().enumerate() {
+            match addr {
+                Some(a) => println!("        peer[{idx}].multiaddr = {a}"),
+                None => println!("        peer[{idx}].multiaddr = (unset)"),
+            }
+        }
         set
     } else {
         let digest = Sha256::digest(public.as_bytes());
@@ -483,12 +555,18 @@ async fn run_reth_devnet(
     let consensus_home = data_dir_path.join("consensus");
     std::fs::create_dir_all(&consensus_home)?;
     println!("      consensus home   = {}", consensus_home.display());
-    let consensus_node = openhl_consensus::OpenHlNode::new(
+    let mut consensus_node = openhl_consensus::OpenHlNode::new(
         private,
         validator_set.clone(),
         consensus_home,
         moniker.clone(),
     );
+    if let Some(ref multiaddr) = listen_addr {
+        consensus_node = consensus_node.with_listen_addr(multiaddr.clone());
+        println!("      listen addr      = {multiaddr}");
+    } else {
+        println!("      listen addr      = (ephemeral /ip4/127.0.0.1/tcp/0)");
+    }
     println!("      moniker          = {moniker}");
 
     // 4. Start the Malachite actor system.
@@ -597,7 +675,10 @@ fn load_chain_spec(path: &Path) -> eyre::Result<Arc<ChainSpec>> {
 fn load_validator_set(
     path: &Path,
     our_pubkey: &informalsystems_malachitebft_signing_ed25519::PublicKey,
-) -> eyre::Result<openhl_consensus::types::OpenHlValidatorSet> {
+) -> eyre::Result<(
+    openhl_consensus::types::OpenHlValidatorSet,
+    Vec<Option<String>>,
+)> {
     let bytes = std::fs::read(path)
         .map_err(|e| eyre::eyre!("failed to read validator set at {}: {e}", path.display()))?;
     let file: ValidatorSetFile = serde_json::from_slice(&bytes)
@@ -609,6 +690,7 @@ fn load_validator_set(
 
     let mut found_self = false;
     let mut built = Vec::with_capacity(file.validators.len());
+    let mut peer_multiaddrs = Vec::with_capacity(file.validators.len());
     for entry in &file.validators {
         if entry.voting_power == 0 {
             return Err(eyre::eyre!(
@@ -642,6 +724,7 @@ fn load_validator_set(
             pubkey,
             entry.voting_power,
         ));
+        peer_multiaddrs.push(entry.peer_multiaddr.clone());
     }
     if !found_self {
         return Err(eyre::eyre!(
@@ -650,7 +733,37 @@ fn load_validator_set(
             path.display()
         ));
     }
-    Ok(openhl_consensus::types::OpenHlValidatorSet::new(built))
+    Ok((
+        openhl_consensus::types::OpenHlValidatorSet::new(built),
+        peer_multiaddrs,
+    ))
+}
+
+/// Parse an `<addr>:<port>` socket spec for `--rpc-bind`. Accepts:
+///   `127.0.0.1:8545` (IPv4)
+///   `0.0.0.0:8545`   (IPv4 all-interfaces)
+///   `[::1]:8545`     (IPv6, brackets required to disambiguate `:` in addr)
+fn parse_socket_spec(spec: &str) -> eyre::Result<(IpAddr, u16)> {
+    let (addr_str, port_str) = if let Some(rest) = spec.strip_prefix('[') {
+        // Bracketed IPv6: `[<v6>]:<port>`
+        let (v6, after) = rest
+            .split_once(']')
+            .ok_or_else(|| eyre::eyre!("malformed IPv6 spec `{spec}`: missing closing `]`"))?;
+        let port = after
+            .strip_prefix(':')
+            .ok_or_else(|| eyre::eyre!("malformed IPv6 spec `{spec}`: expected `:` after `]`"))?;
+        (v6, port)
+    } else {
+        spec.rsplit_once(':')
+            .ok_or_else(|| eyre::eyre!("malformed socket spec `{spec}`: expected `<addr>:<port>`"))?
+    };
+    let addr: IpAddr = addr_str
+        .parse()
+        .map_err(|e| eyre::eyre!("invalid IP `{addr_str}` in `{spec}`: {e}"))?;
+    let port: u16 = port_str
+        .parse()
+        .map_err(|e| eyre::eyre!("invalid port `{port_str}` in `{spec}`: {e}"))?;
+    Ok((addr, port))
 }
 
 /// Minimal post-merge dev genesis. Chain ID 2600 mirrors the upstream
