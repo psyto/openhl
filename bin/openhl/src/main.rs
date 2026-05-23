@@ -37,12 +37,13 @@
 //! (persistent across restarts, real network config, multi-validator)
 //! lands in Stage 13f.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use alloy_genesis::Genesis;
 use clap::{Parser, Subcommand};
+use serde::{Deserialize, Serialize};
 use informalsystems_malachitebft_app::node::{Node, NodeHandle};
 use informalsystems_malachitebft_signing_ed25519::PrivateKey;
 use openhl_consensus::run_engine_app;
@@ -109,15 +110,60 @@ enum Command {
         /// (`reth_db::init_db` + `with_database` + `with_launch_context`),
         /// so the directory is now a real persistent MDBX database — it
         /// is **not** deleted at process exit. Re-running with the same
-        /// `--data-dir` opens the existing database.
-        ///
-        /// Cross-restart persistence of the openhl-side state (bridge's
-        /// chain map, consensus WAL) is still Stage 13g work; for now,
-        /// each run starts a fresh consensus instance even if Reth's DB
-        /// already has prior blocks.
+        /// `--data-dir` opens the existing database. Stages 13g–13i
+        /// added bridge snapshot, validator-key, and consensus-height
+        /// resume on top.
         #[arg(long)]
         data_dir: Option<PathBuf>,
+
+        /// Path to a JSON chain spec file (Stage 13j). If omitted, the
+        /// embedded dev chain spec (chain id 2600) is used — the same
+        /// one Reth uses in its `examples/custom-dev-node`. Real
+        /// deployments load a per-network spec.
+        ///
+        /// Format: the standard `alloy_genesis::Genesis` JSON
+        /// (`nonce` / `timestamp` / `extraData` / `gasLimit` /
+        /// `difficulty` / `mixHash` / `coinbase` / `alloc` / `number` /
+        /// `gasUsed` / `parentHash` / `config`).
+        #[arg(long)]
+        chain_spec: Option<PathBuf>,
+
+        /// Path to a JSON validator-set file (Stage 13j). If omitted,
+        /// a single-validator set is constructed from the loaded
+        /// (or freshly generated) validator key — the existing
+        /// behavior through Stage 13h.
+        ///
+        /// Format:
+        /// ```json
+        /// {
+        ///   "validators": [
+        ///     { "pubkey_hex": "<64 hex chars>", "voting_power": 1 }
+        ///   ]
+        /// }
+        /// ```
+        ///
+        /// When supplied, the locally-loaded validator key's public
+        /// key must appear in the set, otherwise the node refuses to
+        /// start — refusing to sign on behalf of an identity the
+        /// network doesn't recognize.
+        #[arg(long)]
+        validators: Option<PathBuf>,
     },
+}
+
+/// On-disk shape of `--validators <path>`. Stage 13j.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct ValidatorSetFile {
+    validators: Vec<ValidatorEntry>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct ValidatorEntry {
+    /// Hex-encoded 32-byte Ed25519 public key (no `0x` prefix, no
+    /// length-byte; just 64 hex chars).
+    pubkey_hex: String,
+    /// Voting power for this validator. Must be > 0.
+    voting_power: u64,
 }
 
 fn main() -> eyre::Result<()> {
@@ -132,7 +178,11 @@ fn main() -> eyre::Result<()> {
             rounds,
             moniker,
             data_dir,
-        } => tokio_rt()?.block_on(run_reth_devnet(rounds, moniker, data_dir)),
+            chain_spec,
+            validators,
+        } => tokio_rt()?.block_on(run_reth_devnet(
+            rounds, moniker, data_dir, chain_spec, validators,
+        )),
     }
 }
 
@@ -274,6 +324,8 @@ async fn run_reth_devnet(
     rounds: u64,
     moniker: String,
     data_dir: Option<PathBuf>,
+    chain_spec_path: Option<PathBuf>,
+    validators_path: Option<PathBuf>,
 ) -> eyre::Result<()> {
     println!(
         "openhl v{} — driving {} reth-backed decision{}",
@@ -293,7 +345,13 @@ async fn run_reth_devnet(
     println!("      data dir         = {}", data_dir_path.display());
     println!("      Reth MDBX dir    = {}", reth_db_path.display());
 
-    let chain_spec = dev_chain_spec();
+    let chain_spec = if let Some(path) = chain_spec_path.as_deref() {
+        println!("      chain spec       = {} (loaded)", path.display());
+        load_chain_spec(path)?
+    } else {
+        println!("      chain spec       = (embedded dev chain id 2600)");
+        dev_chain_spec()
+    };
     let node_config = NodeConfig::test().dev().with_chain(chain_spec.clone()).with_datadir_args(
         DatadirArgs {
             datadir: MaybePlatformPath::<DataDirPath>::from(reth_db_path.clone()),
@@ -396,14 +454,29 @@ async fn run_reth_devnet(
     };
     let public = private.public_key();
     println!("[3/6] {key_status} validator key from {}", key_path.display());
-    let digest = Sha256::digest(public.as_bytes());
-    let mut addr_bytes = [0u8; 20];
-    addr_bytes.copy_from_slice(&digest[12..32]);
-    let address = openhl_consensus::types::OpenHlAddress(addr_bytes);
-    let validator_set = openhl_consensus::types::OpenHlValidatorSet::new(vec![
-        openhl_consensus::types::OpenHlValidator::new(address, public, 1),
-    ]);
 
+    // Stage 13j: validator set — load from file if given, else
+    // construct single-validator set from the loaded key (preserves
+    // pre-13j behavior).
+    let validator_set = if let Some(path) = validators_path.as_deref() {
+        let set = load_validator_set(path, &public)?;
+        println!(
+            "      validator set    = {} ({} validator{})",
+            path.display(),
+            set.validators().len(),
+            if set.validators().len() == 1 { "" } else { "s" }
+        );
+        set
+    } else {
+        let digest = Sha256::digest(public.as_bytes());
+        let mut addr_bytes = [0u8; 20];
+        addr_bytes.copy_from_slice(&digest[12..32]);
+        let address = openhl_consensus::types::OpenHlAddress(addr_bytes);
+        println!("      validator set    = (single-validator default)");
+        openhl_consensus::types::OpenHlValidatorSet::new(vec![
+            openhl_consensus::types::OpenHlValidator::new(address, public, 1),
+        ])
+    };
     // Consensus home dir: a subdir of the resolved data dir. Persists
     // across restarts so the Malachite WAL has a stable location (real
     // WAL load/save remains Stage 13g work).
@@ -504,6 +577,80 @@ async fn run_reth_devnet(
     println!("reth-devnet teardown complete");
 
     Ok(())
+}
+
+/// Load a `ChainSpec` from a JSON file containing an
+/// `alloy_genesis::Genesis`. The file format is the same one the
+/// embedded `dev_chain_spec` uses inline.
+fn load_chain_spec(path: &Path) -> eyre::Result<Arc<ChainSpec>> {
+    let bytes = std::fs::read(path)
+        .map_err(|e| eyre::eyre!("failed to read chain spec at {}: {e}", path.display()))?;
+    let genesis: Genesis = serde_json::from_slice(&bytes)
+        .map_err(|e| eyre::eyre!("malformed chain spec at {}: {e}", path.display()))?;
+    Ok(Arc::new(genesis.into()))
+}
+
+/// Load a validator set from a JSON file. The locally-loaded validator
+/// key's public key MUST appear in the set — otherwise the node
+/// refuses to sign on behalf of an identity the network doesn't
+/// recognize.
+fn load_validator_set(
+    path: &Path,
+    our_pubkey: &informalsystems_malachitebft_signing_ed25519::PublicKey,
+) -> eyre::Result<openhl_consensus::types::OpenHlValidatorSet> {
+    let bytes = std::fs::read(path)
+        .map_err(|e| eyre::eyre!("failed to read validator set at {}: {e}", path.display()))?;
+    let file: ValidatorSetFile = serde_json::from_slice(&bytes)
+        .map_err(|e| eyre::eyre!("malformed validator set at {}: {e}", path.display()))?;
+    if file.validators.is_empty() {
+        return Err(eyre::eyre!("validator set at {} is empty", path.display()));
+    }
+    let our_pubkey_bytes = our_pubkey.as_bytes();
+
+    let mut found_self = false;
+    let mut built = Vec::with_capacity(file.validators.len());
+    for entry in &file.validators {
+        if entry.voting_power == 0 {
+            return Err(eyre::eyre!(
+                "validator with pubkey_hex={} has voting_power=0; must be > 0",
+                entry.pubkey_hex
+            ));
+        }
+        let raw = hex::decode(&entry.pubkey_hex)
+            .map_err(|e| eyre::eyre!("invalid hex in pubkey_hex={}: {e}", entry.pubkey_hex))?;
+        let bytes: [u8; 32] = raw
+            .try_into()
+            .map_err(|v: Vec<u8>| eyre::eyre!("pubkey_hex must decode to 32 bytes, got {}", v.len()))?;
+        // PublicKey::from_bytes panics on invalid Ed25519 points; go
+        // through `VerificationKey::try_from` so malformed entries
+        // surface as a graceful eyre error instead.
+        let vk = ed25519_consensus::VerificationKey::try_from(bytes).map_err(|e| {
+            eyre::eyre!(
+                "pubkey_hex={} is not a valid Ed25519 public key: {e}",
+                entry.pubkey_hex
+            )
+        })?;
+        let pubkey = informalsystems_malachitebft_signing_ed25519::PublicKey::new(vk);
+        if pubkey.as_bytes() == our_pubkey_bytes {
+            found_self = true;
+        }
+        let digest = Sha256::digest(pubkey.as_bytes());
+        let mut addr = [0u8; 20];
+        addr.copy_from_slice(&digest[12..32]);
+        built.push(openhl_consensus::types::OpenHlValidator::new(
+            openhl_consensus::types::OpenHlAddress(addr),
+            pubkey,
+            entry.voting_power,
+        ));
+    }
+    if !found_self {
+        return Err(eyre::eyre!(
+            "loaded validator key's public key does not appear in {}; \
+             refusing to start (won't sign as an unrecognized identity)",
+            path.display()
+        ));
+    }
+    Ok(openhl_consensus::types::OpenHlValidatorSet::new(built))
 }
 
 /// Minimal post-merge dev genesis. Chain ID 2600 mirrors the upstream
