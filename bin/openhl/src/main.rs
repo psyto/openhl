@@ -336,9 +336,10 @@ async fn run_reth_devnet(
         hex_suffix(&genesis_hash_bytes, 4),
     );
 
-    // Stage 13g: load any prior bridge state from disk.
+    // Stage 13g+13i: load any prior bridge state and derive both the
+    // initial parent hash AND the initial consensus height.
     let bridge_state_path = data_dir_path.join("bridge").join("state.json");
-    let resume_parent = if bridge_state_path.exists() {
+    let (resume_parent, prior_decisions) = if bridge_state_path.exists() {
         let bytes = std::fs::read(&bridge_state_path)?;
         let snapshot: BridgeSnapshot = serde_json::from_slice(&bytes)
             .map_err(|e| eyre::eyre!("malformed bridge snapshot at {bridge_state_path:?}: {e}"))?;
@@ -348,18 +349,22 @@ async fn run_reth_devnet(
         println!(
             "      loaded snapshot  = {} block(s); head = {}",
             chain_len,
-            head_for_print
-                .map_or_else(|| "(none)".to_string(), |h| short_b256(&h)),
+            head_for_print.map_or_else(|| "(none)".to_string(), |h| short_b256(&h)),
         );
-        // If we have a prior head, resume consensus on top of it instead
-        // of from genesis. The bridge's chain map already knows the
-        // header for that hash, so build_payload will succeed.
-        head_for_print.map(|b| BlockHash(b.into()))
+        (
+            head_for_print.map(|b| BlockHash(b.into())),
+            u64::try_from(chain_len).unwrap_or(u64::MAX),
+        )
     } else {
         println!("      no prior snapshot (fresh chain)");
-        None
+        (None, 0)
     };
     let initial_parent_for_consensus = resume_parent.unwrap_or(genesis_parent);
+    // Stage 13i: consensus height = prior decisions + 1, so log lines
+    // and (future) multi-validator peers see a continuous height
+    // sequence rather than restarting at 1 every run.
+    let initial_height_for_consensus =
+        openhl_consensus::types::OpenHlHeight(prior_decisions.saturating_add(1));
 
     // 3. Consensus node with single-validator set.
     //    Stage 13h: load the validator key from disk if present,
@@ -427,7 +432,10 @@ async fn run_reth_devnet(
     // 6. Drive run_engine_app for N decisions, seeded with Reth's
     //    actual genesis hash so the first `build_payload` finds its
     //    parent block in the database.
-    println!("[6/6] driving run_engine_app for {rounds} decision(s)…");
+    println!(
+        "[6/6] driving run_engine_app for {rounds} decision(s) starting at height {}…",
+        initial_height_for_consensus.0
+    );
     let bridge_for_engine = bridge.clone();
     let validator_set_for_engine = validator_set.clone();
     let rounds_usize = usize::try_from(rounds)
@@ -438,6 +446,7 @@ async fn run_reth_devnet(
             channels,
             validator_set_for_engine,
             initial_parent_for_consensus,
+            initial_height_for_consensus,
             rounds_usize,
         )
         .await

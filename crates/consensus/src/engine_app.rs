@@ -34,12 +34,20 @@ const APP_REPLY_WAIT_LOG: &str = "engine_app: peer replied unsuccessfully (chann
 /// bridges that don't validate parent hashes (e.g., in unit tests) can
 /// pass `BlockHash([0u8; 32])` and the engine will happily build on the
 /// zero hash.
+///
+/// `initial_height` is the consensus height for the **first** decision
+/// this engine produces. Fresh chains start at `OpenHlHeight::INITIAL`
+/// (height 1). For a restart resuming from a prior committed chain
+/// (Stage 13i), callers pass `OpenHlHeight(prior_decisions + 1)` so
+/// consensus log lines and any future multi-validator peers see a
+/// height that continues the prior chain instead of restarting at 1.
 #[allow(clippy::too_many_lines)] // 12 AppMsg arms — laid out flat for lesson L11's match-by-match walk
 pub async fn run_engine_app<B>(
     bridge: Arc<B>,
     mut channels: Channels<OpenHlContext>,
     validator_set: OpenHlValidatorSet,
     initial_parent: BlockHash,
+    initial_height: OpenHlHeight,
     stop_after_decisions: usize,
 ) -> eyre::Result<Vec<BlockHash>>
 where
@@ -47,7 +55,7 @@ where
 {
     let mut decided: Vec<BlockHash> = Vec::new();
     let mut current_parent = initial_parent;
-    let mut current_height = OpenHlHeight::INITIAL;
+    let mut current_height = initial_height;
 
     while let Some(msg) = channels.consensus.recv().await {
         match msg {
@@ -272,6 +280,7 @@ mod tests {
             channels,
             validator_set,
             BlockHash([0u8; 32]),
+            OpenHlHeight::INITIAL,
             1,
         ));
 
