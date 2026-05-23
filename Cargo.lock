@@ -6207,6 +6207,9 @@ checksum = "c08d65885ee38876c4f86fa503fb49d7b507c2b62552df7c70b2fce627e06381"
 [[package]]
 name = "openhl"
 version = "0.1.0"
+dependencies = [
+ "openhl-node",
+]
 
 [[package]]
 name = "openhl-clob"
@@ -6298,6 +6301,14 @@ dependencies = [
 [[package]]
 name = "openhl-node"
 version = "0.1.0"
+dependencies = [
+ "openhl-clob",
+ "openhl-funding",
+ "openhl-liquidation",
+ "openhl-oracle",
+ "openhl-vault",
+ "proptest",
+]
 
 [[package]]
 name = "openhl-oracle"
@@ -6318,6 +6329,9 @@ dependencies = [
 [[package]]
 name = "openhl-vault"
 version = "0.1.0"
+dependencies = [
+ "proptest",
+]
 
 [[package]]
 name = "openssl-probe"

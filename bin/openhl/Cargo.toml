@@ -12,6 +12,7 @@ name = "openhl"
 path = "src/main.rs"
 
 [dependencies]
+openhl-node = { path = "../../crates/node" }
 
 [lints]
 workspace = true
