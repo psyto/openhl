@@ -6209,6 +6209,7 @@ name = "openhl"
 version = "0.1.0"
 dependencies = [
  "alloy-genesis",
+ "alloy-primitives",
  "clap",
  "eyre",
  "informalsystems-malachitebft-app",
@@ -6296,6 +6297,7 @@ dependencies = [
  "reth-provider",
  "reth-storage-api",
  "reth-tasks",
+ "serde",
  "serde_json",
  "tempfile",
  "tokio",

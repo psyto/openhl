@@ -165,6 +165,67 @@ impl<P> LiveRethEvmBridge<P> {
             .expect("pending_fills mutex poisoned")
             .len()
     }
+
+    /// Snapshot of the bridge's committed-chain state (Stage 13g).
+    ///
+    /// Captures only the load-bearing fields for cross-restart resume:
+    ///   - `chain`: every block consensus has committed so far.
+    ///   - `head`: the most recent committed block hash, if any.
+    ///
+    /// Deliberately excludes:
+    ///   - `next_payload_id`: a monotonic counter for in-flight
+    ///     payloads. Resets to 0 on restart (in-flight builds don't
+    ///     survive shutdown).
+    ///   - `pending`: in-flight payloads. Ephemeral by definition;
+    ///     consensus reissues them on restart.
+    ///   - `pending_fills`: the CLOB's drained-but-unattached fills.
+    ///     Same reasoning — ephemeral.
+    ///
+    /// JSON-serializable for human-inspectable on-disk snapshots.
+    #[must_use]
+    pub fn snapshot(&self) -> BridgeSnapshot {
+        let s = self.state.lock().expect("state mutex poisoned");
+        BridgeSnapshot {
+            chain: s.chain.clone(),
+            head: s.head,
+        }
+    }
+
+    /// Replace the bridge's committed-chain state with `snapshot`
+    /// (Stage 13g). Pending payloads and the fill buffer are NOT
+    /// touched — they remain whatever the caller's bridge was holding
+    /// before the load. Typical use is to call this immediately after
+    /// `LiveRethEvmBridge::new` and before consensus starts.
+    pub fn load_snapshot(&self, snapshot: BridgeSnapshot) {
+        let mut s = self.state.lock().expect("state mutex poisoned");
+        s.chain = snapshot.chain;
+        s.head = snapshot.head;
+    }
+}
+
+/// On-disk snapshot of the bridge's committed-chain state.
+///
+/// Stage 13g extracts this from
+/// [`LiveRethEvmBridge::snapshot`] and writes JSON to
+/// `<data-dir>/bridge/state.json`; subsequent runs load it via
+/// [`LiveRethEvmBridge::load_snapshot`] before starting consensus.
+/// `Option<B256>` for `head` is `None` on a fresh chain (no blocks
+/// committed yet).
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct BridgeSnapshot {
+    pub chain: HashMap<B256, Header>,
+    pub head: Option<B256>,
+}
+
+impl BridgeSnapshot {
+    /// Empty snapshot — no blocks committed, no head.
+    #[must_use]
+    pub fn empty() -> Self {
+        Self {
+            chain: HashMap::new(),
+            head: None,
+        }
+    }
 }
 
 #[async_trait]

@@ -47,7 +47,7 @@ use informalsystems_malachitebft_app::node::{Node, NodeHandle};
 use informalsystems_malachitebft_signing_ed25519::PrivateKey;
 use openhl_consensus::run_engine_app;
 use openhl_consensus::run_single_validator;
-use openhl_evm::{InMemoryEvmBridge, LiveRethEvmBridge, OpenHlExecutorBuilder};
+use openhl_evm::{BridgeSnapshot, InMemoryEvmBridge, LiveRethEvmBridge, OpenHlExecutorBuilder};
 use openhl_funding::MarkPrice;
 use openhl_node::{OpenHlNode, OpenHlNodeConfig, TickInput, TickReport};
 use openhl_types::BlockHash;
@@ -330,10 +330,35 @@ async fn run_reth_devnet(
     let genesis_parent = BlockHash(genesis_hash_bytes);
     let bridge = Arc::new(LiveRethEvmBridge::new(node.provider.clone(), chain_spec));
     println!(
-        "      genesis hash = 0x{}…{}",
+        "      genesis hash     = 0x{}…{}",
         hex_prefix(&genesis_hash_bytes, 4),
         hex_suffix(&genesis_hash_bytes, 4),
     );
+
+    // Stage 13g: load any prior bridge state from disk.
+    let bridge_state_path = data_dir_path.join("bridge").join("state.json");
+    let resume_parent = if bridge_state_path.exists() {
+        let bytes = std::fs::read(&bridge_state_path)?;
+        let snapshot: BridgeSnapshot = serde_json::from_slice(&bytes)
+            .map_err(|e| eyre::eyre!("malformed bridge snapshot at {bridge_state_path:?}: {e}"))?;
+        let head_for_print = snapshot.head;
+        let chain_len = snapshot.chain.len();
+        bridge.load_snapshot(snapshot);
+        println!(
+            "      loaded snapshot  = {} block(s); head = {}",
+            chain_len,
+            head_for_print
+                .map_or_else(|| "(none)".to_string(), |h| short_b256(&h)),
+        );
+        // If we have a prior head, resume consensus on top of it instead
+        // of from genesis. The bridge's chain map already knows the
+        // header for that hash, so build_payload will succeed.
+        head_for_print.map(|b| BlockHash(b.into()))
+    } else {
+        println!("      no prior snapshot (fresh chain)");
+        None
+    };
+    let initial_parent_for_consensus = resume_parent.unwrap_or(genesis_parent);
 
     // 3. Consensus node with single-validator set (fresh keypair).
     println!("[3/6] generating Ed25519 keypair + single-validator set…");
@@ -385,7 +410,7 @@ async fn run_reth_devnet(
             bridge_for_engine,
             channels,
             validator_set_for_engine,
-            genesis_parent,
+            initial_parent_for_consensus,
             rounds_usize,
         )
         .await
@@ -417,8 +442,27 @@ async fn run_reth_devnet(
         }
     }
 
-    // Clean shutdown regardless of the result above — proves the
-    // teardown path works even when block production stops short.
+    // Stage 13g: persist the bridge's final committed-chain state so
+    // the next run can resume from it. Saved as JSON for easy
+    // inspection (e.g., `jq < state.json '.head'`).
+    let final_snapshot = bridge.snapshot();
+    let chain_len = final_snapshot.chain.len();
+    if let Some(parent) = bridge_state_path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    std::fs::write(
+        &bridge_state_path,
+        serde_json::to_vec_pretty(&final_snapshot)?,
+    )?;
+    println!(
+        "persisted bridge snapshot ({} block(s)) → {}",
+        chain_len,
+        bridge_state_path.display()
+    );
+
+    // Clean shutdown regardless of the run_engine_app result above —
+    // proves the teardown path works even when block production stops
+    // short.
     println!("shutting down consensus actor system…");
     handle.kill(None).await?;
     println!("reth-devnet teardown complete");
@@ -495,6 +539,16 @@ fn hex_suffix(bytes: &[u8; 32], n: usize) -> String {
     for b in &bytes[32 - n..] {
         let _ = write!(s, "{b:02x}");
     }
+    s
+}
+
+fn short_b256(h: &alloy_primitives::B256) -> String {
+    use std::fmt::Write as _;
+    let mut s = String::with_capacity(10);
+    for b in &h.0[..4] {
+        let _ = write!(s, "{b:02x}");
+    }
+    s.push('…');
     s
 }
 

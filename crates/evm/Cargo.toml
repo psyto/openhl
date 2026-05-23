@@ -13,8 +13,10 @@ openhl-types             = { workspace = true }
 openhl-clob              = { workspace = true }
 async-trait              = { workspace = true }
 eyre                     = { workspace = true }
-alloy-primitives         = { workspace = true }
-alloy-consensus          = { workspace = true }
+alloy-primitives         = { workspace = true, features = ["serde"] }
+alloy-consensus          = { workspace = true, features = ["serde"] }
+serde                    = { workspace = true }
+serde_json               = { workspace = true }
 reth-ethereum-primitives = { workspace = true }
 reth-storage-api         = { workspace = true }
 reth-consensus           = { workspace = true }
@@ -38,7 +40,6 @@ reth-node-core       = { workspace = true }
 reth-tasks           = { workspace = true }
 reth-provider        = { workspace = true }
 alloy-genesis        = { workspace = true }
-serde_json           = { workspace = true }
 tempfile             = "3"
 
 [lints]

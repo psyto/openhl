@@ -34,6 +34,7 @@ reth-tasks         = { workspace = true }
 reth-chainspec     = { workspace = true }
 reth-db            = { workspace = true }
 alloy-genesis      = { workspace = true }
+alloy-primitives   = { workspace = true }
 serde_json         = { workspace = true }
 informalsystems-malachitebft-app             = { workspace = true }
 informalsystems-malachitebft-signing-ed25519 = { workspace = true, features = ["rand"] }
