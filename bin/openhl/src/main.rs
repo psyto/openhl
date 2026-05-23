@@ -13,21 +13,15 @@
 //!     consensus `OpenHlNode::start`, then `run_engine_app` to drive
 //!     consensus decisions. Stage 13c.
 //!
-//!     Stage 13d closes the genesis-hash gap: `run_engine_app` now
-//!     takes an `initial_parent: BlockHash`, so `reth-devnet` passes
-//!     Reth's actual `ChainSpec::genesis_hash()` through and the
-//!     first `build_payload` finds its parent block in Reth's
-//!     provider. `openhl reth-devnet 1` produces one real
-//!     Reth-committed block end-to-end.
-//!
-//!     `reth-devnet N` for `N > 1` still halts after the first block.
-//!     The block-2 `build_payload` looks up block-1's hash via
-//!     `provider.sealed_header_by_hash`, but `LiveRethEvmBridge::commit`
-//!     doesn't yet upload the committed block to Reth's database
-//!     (the bridge keeps it in its own internal `chain` map). Closing
-//!     that gap is Stage 13e (or a Stage 8e in the bridge itself):
-//!     bridge.commit needs to submit `engine_newPayload` +
-//!     `engine_forkchoiceUpdated` so Reth's provider sees the block.
+//!     Stage 13d + 8e make `reth-devnet N` produce N real blocks
+//!     end-to-end. 13d plumbed Reth's `ChainSpec::genesis_hash()` as
+//!     the consensus engine's initial parent. 8e made the bridge's
+//!     `build_payload` consult its own internal `chain` map for parent
+//!     lookup before falling back to Reth's provider — the bridge's
+//!     `commit` doesn't upload an `ExecutionPayload` to Reth (the
+//!     synthetic headers have placeholder state_roots that Reth would
+//!     reject), but consensus only needs the bridge to be
+//!     self-consistent, which it now is.
 //!
 //! Examples:
 //!   $ openhl                        # equivalent to `openhl info`

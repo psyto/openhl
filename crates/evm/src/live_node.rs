@@ -179,18 +179,46 @@ where
     ) -> Result<PayloadId, BridgeError> {
         let parent_b256 = B256::from(parent.0);
 
-        // LIVE READ: pull the parent's full sealed header from the real
-        // provider so we can copy fields that EthBeaconConsensus will check
-        // against during validate_payload (gas_limit drift, EIP-1559 base
-        // fee, difficulty=0 post-merge).
-        let parent_sealed = self
-            .provider
-            .sealed_header_by_hash(parent_b256)
-            .map_err(|e| BridgeError::Internal(eyre::eyre!("provider error: {e}")))?
-            .ok_or_else(|| {
-                BridgeError::Rejected(format!("provider has no block with hash {parent_b256}"))
-            })?;
-        let parent_header = parent_sealed.header();
+        // Look up the parent header. Two sources:
+        //
+        //   (a) Bridge's internal `chain` map — populated by `commit()`
+        //       for every block consensus has decided. Source of truth
+        //       for blocks the bridge has committed.
+        //   (b) Reth's provider — source of truth for blocks Reth has
+        //       persisted (genesis at chain bootstrap, plus any blocks
+        //       the engine has successfully executed via `newPayload`).
+        //
+        // We check (a) first because the bridge's `commit` does not yet
+        // upload an executable `ExecutionPayload` to Reth (the synthetic
+        // headers produced here have placeholder state_roots — Reth's
+        // newPayload would reject them as INVALID, see the doc on
+        // `commit`). Without this internal fallback, `build_payload` for
+        // block N+1 fails because Reth's provider never saw block N.
+        // Stage 8e closes that gap by treating the bridge as the
+        // committed-chain source of truth.
+        //
+        // Provider is the fallback path — exercised exclusively for the
+        // chain's first block (parent = genesis), where Reth IS the
+        // source of truth.
+        let parent_header_from_chain = {
+            let s = self.state.lock().expect("state mutex poisoned");
+            s.chain.get(&parent_b256).cloned()
+        };
+        let (parent_header, _parent_sealed_opt) = if let Some(h) = parent_header_from_chain {
+            (h, None)
+        } else {
+            let sealed = self
+                .provider
+                .sealed_header_by_hash(parent_b256)
+                .map_err(|e| BridgeError::Internal(eyre::eyre!("provider error: {e}")))?
+                .ok_or_else(|| {
+                    BridgeError::Rejected(format!(
+                        "neither bridge.chain nor provider has block {parent_b256}"
+                    ))
+                })?;
+            (sealed.header().clone(), Some(sealed))
+        };
+        let parent_header = &parent_header;
 
         let mut s = self.state.lock().expect("state mutex poisoned");
         let id = s.next_payload_id;
