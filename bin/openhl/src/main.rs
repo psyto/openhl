@@ -47,6 +47,7 @@ use informalsystems_malachitebft_app::node::{Node, NodeHandle};
 use informalsystems_malachitebft_signing_ed25519::PrivateKey;
 use openhl_consensus::run_engine_app;
 use openhl_consensus::run_single_validator;
+use openhl_consensus::OpenHlPrivateKeyFile;
 use openhl_evm::{BridgeSnapshot, InMemoryEvmBridge, LiveRethEvmBridge, OpenHlExecutorBuilder};
 use openhl_funding::MarkPrice;
 use openhl_node::{OpenHlNode, OpenHlNodeConfig, TickInput, TickReport};
@@ -360,10 +361,36 @@ async fn run_reth_devnet(
     };
     let initial_parent_for_consensus = resume_parent.unwrap_or(genesis_parent);
 
-    // 3. Consensus node with single-validator set (fresh keypair).
-    println!("[3/6] generating Ed25519 keypair + single-validator set…");
-    let private = PrivateKey::generate(OsRng);
+    // 3. Consensus node with single-validator set.
+    //    Stage 13h: load the validator key from disk if present,
+    //    otherwise generate fresh and write it. With this in place
+    //    consecutive runs use the same validator identity, which is
+    //    a prerequisite for Malachite WAL reuse (Stage 13h+).
+    let key_path = data_dir_path.join("validator-key.json");
+    let (private, key_status) = if key_path.exists() {
+        let bytes = std::fs::read(&key_path)?;
+        let file: OpenHlPrivateKeyFile = serde_json::from_slice(&bytes)
+            .map_err(|e| eyre::eyre!("malformed validator key at {key_path:?}: {e}"))?;
+        (file.into_private_key(), "loaded")
+    } else {
+        let fresh = PrivateKey::generate(OsRng);
+        let file = OpenHlPrivateKeyFile::from_private_key(&fresh);
+        if let Some(parent) = key_path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        std::fs::write(&key_path, serde_json::to_vec_pretty(&file)?)?;
+        // Make the key file owner-readable only — minor hardening so a
+        // shared-filesystem mishap doesn't surface the validator's
+        // secret to other users on the host.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            std::fs::set_permissions(&key_path, std::fs::Permissions::from_mode(0o600))?;
+        }
+        (fresh, "generated")
+    };
     let public = private.public_key();
+    println!("[3/6] {key_status} validator key from {}", key_path.display());
     let digest = Sha256::digest(public.as_bytes());
     let mut addr_bytes = [0u8; 20];
     addr_bytes.copy_from_slice(&digest[12..32]);
