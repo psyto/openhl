@@ -15,7 +15,8 @@
 //! pathological inputs has to be bounded behavior.
 
 use crate::types::{
-    AccountSnapshot, CloseOrderSpec, LiquidationParams, MarginHealth, MarginRatio, MARGIN_SCALE,
+    AccountSnapshot, CloseOrderSpec, LiquidationParams, MarginHealth, MarginRatio, SolventClose,
+    UnderwaterClose, MARGIN_SCALE,
 };
 use openhl_clob::{Qty, Side};
 use openhl_funding::MarkPrice;
@@ -145,6 +146,108 @@ pub fn close_order_spec(snapshot: &AccountSnapshot) -> CloseOrderSpec {
 /// would be a worse failure mode.
 fn saturate_i128_to_i64(v: i128) -> i64 {
     i64::try_from(v).unwrap_or(if v > 0 { i64::MAX } else { i64::MIN })
+}
+
+// ─── Stage 10b: fee computation + close-outcome decomposition ───
+
+/// Liquidation fee on a closed notional, in quote units.
+///
+/// `fee = notional × fee_bps / MARGIN_SCALE`, saturating on overflow.
+/// Pure math — the caller (Stage 10c scanner / bridge) supplies the
+/// actual fill notional from the matching engine.
+///
+/// Returns `0` for a zero notional (flat positions; should never reach
+/// the engine but symbol-completeness pays off in proptest).
+#[must_use]
+pub fn liquidation_fee(closed_notional: u64, params: &LiquidationParams) -> i64 {
+    if closed_notional == 0 {
+        return 0;
+    }
+    let bps = i128::from(params.liquidation_fee_bps);
+    let n = i128::from(closed_notional);
+    let scaled = n.saturating_mul(bps);
+    let fee = scaled / i128::from(MARGIN_SCALE);
+    saturate_i128_to_i64(fee)
+}
+
+/// Solvent-close outcome — the trader's collateral plus realized `PnL`
+/// covers the liquidation fee in full, with positive residual returning
+/// to the account.
+///
+/// **Precondition** (debug-asserted): the account is Liquidatable AND the
+/// post-close equity (= collateral + realized `PnL` at `close_price`)
+/// covers the desired fee. If the precondition is violated, the result
+/// has `residual_to_account ≤ 0` — caller should have routed to
+/// [`underwater_close_outcome`] instead.
+///
+/// Stage 10b never mutates state — this is pure compute that produces
+/// the credit/debit pair for the caller (Stage 10c scanner) to apply
+/// against [`crate::insurance::InsuranceFund`] and the trader's balance.
+#[must_use]
+pub fn solvent_close_outcome(
+    snapshot: &AccountSnapshot,
+    close_price: MarkPrice,
+    params: &LiquidationParams,
+) -> SolventClose {
+    let notional = notional_value(snapshot, close_price);
+    let fee = liquidation_fee(notional, params);
+    let post_close_equity = account_equity(snapshot, close_price);
+    debug_assert!(
+        post_close_equity >= fee,
+        "solvent_close_outcome called with post_close_equity={post_close_equity} < fee={fee}; \
+         caller should route to underwater_close_outcome instead",
+    );
+    SolventClose {
+        fee_to_fund: fee,
+        residual_to_account: post_close_equity.saturating_sub(fee),
+    }
+}
+
+/// Underwater-close outcome — the account's post-close equity cannot
+/// cover the liquidation fee, so the insurance fund must absorb the
+/// shortfall.
+///
+/// Handles both sub-cases under one shape:
+///   - Positive but insufficient post-close equity (Liquidatable account
+///     whose close + fee turned underwater): the equity is paid as a
+///     partial fee, the rest becomes the shortfall.
+///   - Negative post-close equity (Underwater account before fee): no
+///     fee is collected, the entire fee plus `|equity|` becomes the
+///     shortfall.
+///
+/// **Precondition** (debug-asserted): `post_close_equity < fee_desired` —
+/// otherwise the close is solvent and the caller should have routed to
+/// [`solvent_close_outcome`].
+#[must_use]
+pub fn underwater_close_outcome(
+    snapshot: &AccountSnapshot,
+    close_price: MarkPrice,
+    params: &LiquidationParams,
+) -> UnderwaterClose {
+    let notional = notional_value(snapshot, close_price);
+    let fee = liquidation_fee(notional, params);
+    let post_close_equity = account_equity(snapshot, close_price);
+    debug_assert!(
+        post_close_equity < fee,
+        "underwater_close_outcome called with post_close_equity={post_close_equity} ≥ fee={fee}; \
+         caller should route to solvent_close_outcome instead",
+    );
+
+    if post_close_equity > 0 {
+        // Partial fee: equity covers some but not all of the desired fee.
+        UnderwaterClose {
+            fee_to_fund: post_close_equity,
+            shortfall_to_fund: fee.saturating_sub(post_close_equity),
+        }
+    } else {
+        // Already underwater (equity ≤ 0). No fee collected; fund covers
+        // the full fee plus the negative equity. `fee - negative_equity`
+        // is `fee + |equity|` via saturating_sub semantics.
+        UnderwaterClose {
+            fee_to_fund: 0,
+            shortfall_to_fund: fee.saturating_sub(post_close_equity),
+        }
+    }
 }
 
 #[cfg(test)]
@@ -334,6 +437,134 @@ mod tests {
         let s = snapshot(0, 100, 1_000);
         let order = close_order_spec(&s);
         assert_eq!(order.qty, Qty(0));
+    }
+
+    // ─── Stage 10b: liquidation_fee ────────────────────────────────
+
+    #[test]
+    fn fee_basic() {
+        // 1.5% of $80,400 = $1,206 — matches the Perp Primer L3 example.
+        let params = LiquidationParams::hyperliquid_default();
+        assert_eq!(liquidation_fee(80_400, &params), 1_206);
+    }
+
+    #[test]
+    fn fee_zero_notional() {
+        let params = LiquidationParams::hyperliquid_default();
+        assert_eq!(liquidation_fee(0, &params), 0);
+    }
+
+    #[test]
+    fn fee_zero_bps() {
+        // No fee if the network params zero it out.
+        let params = LiquidationParams {
+            initial_margin_bps: 1_000,
+            maintenance_margin_bps: 200,
+            liquidation_fee_bps: 0,
+        };
+        assert_eq!(liquidation_fee(1_000_000, &params), 0);
+    }
+
+    #[test]
+    fn fee_saturates_on_pathological_input() {
+        // notional × bps would overflow i64 but saturates inside i128.
+        let params = LiquidationParams {
+            initial_margin_bps: 1_000,
+            maintenance_margin_bps: 200,
+            liquidation_fee_bps: u32::MAX,
+        };
+        let fee = liquidation_fee(u64::MAX, &params);
+        assert_eq!(fee, i64::MAX);
+    }
+
+    // ─── Stage 10b: solvent_close_outcome ──────────────────────────
+
+    #[test]
+    fn solvent_close_typical_liquidatable() {
+        // 1 BTC long, entry $100k, $10k collateral, close at $95k.
+        //   notional = 95_000; fee = 95_000 × 150 / 10_000 = 1_425
+        //   realized_pnl = (95_000 − 100_000) × 1 = −5_000
+        //   post_close_equity = 10_000 − 5_000 = 5_000
+        //   residual = 5_000 − 1_425 = 3_575
+        let s = snapshot(1, 100_000, 10_000);
+        let params = LiquidationParams::hyperliquid_default();
+        let outcome = solvent_close_outcome(&s, MarkPrice(95_000), &params);
+        assert_eq!(outcome.fee_to_fund, 1_425);
+        assert_eq!(outcome.residual_to_account, 3_575);
+    }
+
+    #[test]
+    fn solvent_close_short_profit() {
+        // Short −1, entry $100k, $10k collateral, close at $90k (favorable!).
+        //   notional = 1 × 90_000 = 90_000; fee = 1_350
+        //   realized_pnl = (90_000 − 100_000) × (−1) = +10_000
+        //   post_close_equity = 10_000 + 10_000 = 20_000
+        //   residual = 20_000 − 1_350 = 18_650
+        let s = snapshot(-1, 100_000, 10_000);
+        let params = LiquidationParams::hyperliquid_default();
+        let outcome = solvent_close_outcome(&s, MarkPrice(90_000), &params);
+        assert_eq!(outcome.fee_to_fund, 1_350);
+        assert_eq!(outcome.residual_to_account, 18_650);
+    }
+
+    #[test]
+    fn solvent_close_fee_consumes_all_residual() {
+        // Edge: post_close_equity exactly equals fee. residual = 0.
+        // Construct: size=1, entry=10_000, collateral=10, mark=10_000.
+        //   notional = 10_000; fee = 150
+        //   pnl = 0; post_close_equity = 10 (collateral only)
+        // For fee == equity exactly: need fee = collateral when pnl = 0.
+        //   fee = notional × 150 / 10_000 = notional × 0.015
+        //   notional = collateral / 0.015
+        // Pick collateral=150, then notional must be 10_000.
+        let s = snapshot(1, 10_000, 150);
+        let params = LiquidationParams::hyperliquid_default();
+        let outcome = solvent_close_outcome(&s, MarkPrice(10_000), &params);
+        assert_eq!(outcome.fee_to_fund, 150);
+        assert_eq!(outcome.residual_to_account, 0);
+    }
+
+    // ─── Stage 10b: underwater_close_outcome ────────────────────────
+
+    #[test]
+    fn underwater_close_already_underwater_pre_fee() {
+        // Perp Primer L3 scenario: 1 BTC long, entry $100k, $10k collateral,
+        // close at $80,500. Realized PnL = −$19,500, post_close_equity = −$9,500.
+        // Notional = $80,500; fee = 1_207 (80_500 × 150 / 10_000)
+        // shortfall = fee − post_close_equity = 1_207 − (−9_500) = $10,707
+        let s = snapshot(1, 100_000, 10_000);
+        let params = LiquidationParams::hyperliquid_default();
+        let outcome = underwater_close_outcome(&s, MarkPrice(80_500), &params);
+        assert_eq!(outcome.fee_to_fund, 0);
+        assert_eq!(outcome.shortfall_to_fund, 1_207 + 9_500);
+    }
+
+    #[test]
+    fn underwater_close_partial_fee_collection() {
+        // Liquidatable account whose close + fee just barely turns underwater.
+        // 1 BTC long, entry $100k, $10k collateral, close at $90,500.
+        //   notional = $90,500; fee = 1_357 (90_500 × 150 / 10_000)
+        //   realized_pnl = −$9,500; post_close_equity = $500
+        //   post_close_equity (500) < fee (1357) → underwater branch
+        //   fee_to_fund = 500 (partial fee from positive equity)
+        //   shortfall = 1_357 − 500 = 857
+        let s = snapshot(1, 100_000, 10_000);
+        let params = LiquidationParams::hyperliquid_default();
+        let outcome = underwater_close_outcome(&s, MarkPrice(90_500), &params);
+        assert_eq!(outcome.fee_to_fund, 500);
+        assert_eq!(outcome.shortfall_to_fund, 1_357 - 500);
+    }
+
+    #[test]
+    fn underwater_close_zero_equity_at_fee() {
+        // Edge: post_close_equity exactly 0 (collateral fully eaten by losses).
+        // 1 BTC long, entry $100k, $10k collateral, close at $90k → pnl = −10k,
+        // equity = 0. fee = 1_350. shortfall = full fee.
+        let s = snapshot(1, 100_000, 10_000);
+        let params = LiquidationParams::hyperliquid_default();
+        let outcome = underwater_close_outcome(&s, MarkPrice(90_000), &params);
+        assert_eq!(outcome.fee_to_fund, 0);
+        assert_eq!(outcome.shortfall_to_fund, 1_350);
     }
 
     // ─── proptest: margin-ratio monotonicity ───────────────────────

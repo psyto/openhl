@@ -135,3 +135,44 @@ pub struct CloseOrderSpec {
     pub side: Side,
     pub qty: Qty,
 }
+
+/// Solvent-close outcome (Stage 10b).
+///
+/// Produced by [`crate::compute::solvent_close_outcome`] for a Liquidatable
+/// account whose post-close equity covers the liquidation fee in full.
+/// Both fields are non-negative.
+///
+/// `fee_to_fund` is credited to the insurance fund; `residual_to_account`
+/// is returned to the trader's collateral balance.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SolventClose {
+    /// Fee deducted from collateral and credited to the insurance fund.
+    pub fee_to_fund: i64,
+    /// What's returned to the trader's collateral after the close + fee.
+    pub residual_to_account: i64,
+}
+
+/// Underwater-close outcome (Stage 10b).
+///
+/// Produced by [`crate::compute::underwater_close_outcome`] when the
+/// account's post-close equity cannot cover the full liquidation fee.
+/// Covers two sub-cases under one shape:
+///   - Post-close equity is positive but smaller than the desired fee
+///     (Liquidatable account whose close + fee turned underwater): the
+///     remaining equity is paid as a partial fee, the uncollected portion
+///     becomes the shortfall.
+///   - Post-close equity is already negative (Underwater account): no fee
+///     is collected, the full desired fee plus the negative equity becomes
+///     the shortfall.
+///
+/// Both fields are non-negative; `fee_to_fund` may be `0` in the
+/// negative-equity case.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct UnderwaterClose {
+    /// Partial fee collected from any positive post-close equity, credited
+    /// to the insurance fund. May be `0`.
+    pub fee_to_fund: i64,
+    /// What the insurance fund must absorb so the close completes. The
+    /// caller hands this to [`crate::insurance::InsuranceFund::withdraw_shortfall`].
+    pub shortfall_to_fund: i64,
+}
