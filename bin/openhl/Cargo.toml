@@ -12,7 +12,14 @@ name = "openhl"
 path = "src/main.rs"
 
 [dependencies]
-openhl-node = { path = "../../crates/node" }
+openhl-consensus = { path = "../../crates/consensus" }
+openhl-evm       = { path = "../../crates/evm" }
+openhl-funding   = { path = "../../crates/funding" }
+openhl-node      = { path = "../../crates/node" }
+openhl-types     = { path = "../../crates/types" }
+
+eyre  = { workspace = true }
+tokio = { workspace = true }
 
 [lints]
 workspace = true
