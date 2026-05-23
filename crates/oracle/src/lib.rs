@@ -26,24 +26,40 @@
 //! - [`state::OracleState`] — per-feed observation table + cached
 //!   `current` [`AggregatedPrice`], updated by `ingest` and `refresh`.
 //!
+//! ### Stage 11b additions
+//!
+//! - **Signed observations** ([`crate::verify::verify_observation`]) —
+//!   each [`PriceObservation`] now carries a 64-byte fixed-format
+//!   ECDSA signature (secp256k1) over the canonical
+//!   `feed_id || price || timestamp` byte sequence.
+//! - **Publisher registry** — [`OracleState`] holds a
+//!   `BTreeMap<FeedId, PublisherKey>` populated via
+//!   [`OracleState::register_publisher`]. [`OracleState::ingest_signed`]
+//!   verifies each observation against the registered key before any
+//!   staleness / replay checks; unverified observations are rejected
+//!   with [`ObservationError::InvalidSignature`].
+//! - **Two ingest paths** — [`OracleState::ingest`] remains for
+//!   trusted-bridge deployments and tests (signature field ignored);
+//!   [`OracleState::ingest_signed`] is the production path. Both paths
+//!   can coexist in one [`OracleState`] instance — some feeds signed,
+//!   others trusted.
+//!
 //! ### Out of scope (future work)
 //!
-//! - **Signed observations.** Stage 11 v0 trusts the bridge to drop
-//!   unauthenticated observations before ingestion. A future Stage 11b
-//!   will add a publisher-key registry and ECDSA verification per
-//!   observation. The wire format chosen here can be extended without
-//!   breaking existing callers — add a `signature: [u8; 65]` field to
-//!   [`PriceObservation`] and a `pubkey: BTreeMap<FeedId, [u8; 33]>`
-//!   to [`OracleParams`].
 //! - **Weighted mean.** Production oracle services often use a
 //!   per-feed-weighted mean rather than median. Median is the v0 choice
 //!   because (a) it's robust to single-feed manipulation by design and
 //!   (b) it needs no per-feed-weight parameters. Adding a `weights`
-//!   field to [`OracleParams`] and a `aggregate_weighted_mean` function
-//!   is a forward-compatible extension.
+//!   field to [`OracleParams`] and an `aggregate_weighted_mean`
+//!   function is a forward-compatible extension.
 //! - **Per-market scoping.** [`OracleState`] is implicitly per-market.
 //!   Multi-market deployments instantiate one state per market and the
 //!   bridge owns the `(MarketId, OracleState)` mapping.
+//! - **Key rotation policy.** [`OracleState::register_publisher`]
+//!   replaces the prior key for a feed in one call, supporting
+//!   manual rotation. Automated rotation cadence (timestamps,
+//!   overlapping validity windows for graceful key handoff) is a
+//!   future hardening item.
 //!
 //! ### Why fixed-point integers, not floats
 //!
@@ -55,10 +71,12 @@
 pub mod compute;
 pub mod state;
 pub mod types;
+pub mod verify;
 
 pub use compute::{aggregate_index, compute_median, deviation_bps, filter_by_deviation};
 pub use state::{FeedRecord, OracleState};
 pub use types::{
     AggregatedPrice, AggregationError, FeedId, ObservationError, OracleParams, PriceObservation,
-    DEVIATION_SCALE,
+    PublisherKey, Signature, DEVIATION_SCALE,
 };
+pub use verify::verify_observation;

@@ -27,7 +27,9 @@
 use crate::compute::aggregate_index;
 use crate::types::{
     AggregatedPrice, AggregationError, FeedId, ObservationError, OracleParams, PriceObservation,
+    PublisherKey,
 };
+use crate::verify::verify_observation;
 use openhl_funding::IndexPrice;
 use std::collections::BTreeMap;
 
@@ -43,32 +45,46 @@ pub struct FeedRecord {
 /// Oracle state machine.
 ///
 /// Lifecycle:
-///   1. `new(params)` — empty feeds, no current price.
-///   2. `ingest(obs, now)` once per inbound observation. Updates the
-///      per-feed record, returns `Err` if the observation is stale or
-///      malformed.
-///   3. `refresh(now)` once per block (or per oracle tick). Drops stale
+///   1. `new(params)` — empty feeds, empty publisher registry, no
+///      current price.
+///   2. `register_publisher(feed, key)` — for every feed that will be
+///      ingested via the signed path ([`Self::ingest_signed`]).
+///      Required only for the signed path; the unsigned path
+///      ([`Self::ingest`]) ignores the registry.
+///   3. `ingest(obs, now)` (unsigned/trusted) or `ingest_signed(obs,
+///      now)` (verifies ECDSA signature against the registered key)
+///      once per inbound observation. Updates the per-feed record,
+///      returns `Err` if the observation is stale, malformed, or fails
+///      signature verification.
+///   4. `refresh(now)` once per block (or per oracle tick). Drops stale
 ///      feeds, aggregates the rest, updates `current` on success.
-///   4. `current_price()` / `current()` — read the cached aggregate.
+///   5. `current_price()` / `current()` — read the cached aggregate.
 ///
-/// `ingest` accepts duplicate `FeedId` — later observations replace
-/// earlier ones from the same publisher. Out-of-order timestamps (older
-/// observations arriving after newer ones from the same feed) are
-/// rejected; the bridge should order observations before submitting.
+/// `ingest` and `ingest_signed` both accept duplicate `FeedId` — later
+/// observations replace earlier ones from the same publisher.
+/// Out-of-order timestamps (older observations arriving after newer
+/// ones from the same feed) are rejected; the bridge should order
+/// observations before submitting.
 #[derive(Clone, Debug)]
 pub struct OracleState {
     params: OracleParams,
     feeds: BTreeMap<FeedId, FeedRecord>,
+    /// Per-feed publisher key registry, used by [`Self::ingest_signed`]
+    /// to verify each observation. Empty by default; populated via
+    /// [`Self::register_publisher`].
+    publishers: BTreeMap<FeedId, PublisherKey>,
     current: Option<AggregatedPrice>,
 }
 
 impl OracleState {
-    /// Construct an oracle with no feeds and no current price.
+    /// Construct an oracle with no feeds, no registered publishers,
+    /// and no current price.
     #[must_use]
     pub const fn new(params: OracleParams) -> Self {
         Self {
             params,
             feeds: BTreeMap::new(),
+            publishers: BTreeMap::new(),
             current: None,
         }
     }
@@ -77,6 +93,40 @@ impl OracleState {
     #[must_use]
     pub const fn params(&self) -> &OracleParams {
         &self.params
+    }
+
+    /// Register a publisher's secp256k1 public key for a feed.
+    ///
+    /// Required for [`Self::ingest_signed`] to verify observations from
+    /// this feed. Calling this for a feed that already has a key
+    /// **replaces** the prior key — supports key rotation as a
+    /// single-call operation. Stage 11b does not include a separate
+    /// rotation policy; the bridge enforces whatever rotation cadence
+    /// suits the deployment.
+    pub fn register_publisher(&mut self, feed: FeedId, key: PublisherKey) {
+        self.publishers.insert(feed, key);
+    }
+
+    /// Remove a publisher's key. Subsequent [`Self::ingest_signed`]
+    /// calls for this feed will fail with
+    /// [`ObservationError::UnknownFeed`]. Existing stored observations
+    /// from this feed are NOT purged — they remain in the feed table
+    /// and continue contributing to aggregates until they age out via
+    /// the staleness window.
+    pub fn revoke_publisher(&mut self, feed: FeedId) {
+        self.publishers.remove(&feed);
+    }
+
+    /// Look up the registered publisher key for a feed.
+    #[must_use]
+    pub fn publisher(&self, feed: FeedId) -> Option<&PublisherKey> {
+        self.publishers.get(&feed)
+    }
+
+    /// Number of feeds with a registered publisher key.
+    #[must_use]
+    pub fn publisher_count(&self) -> usize {
+        self.publishers.len()
     }
 
     /// Total number of distinct feeds that have ever submitted an
@@ -108,15 +158,57 @@ impl OracleState {
         self.current.map(|c| c.index)
     }
 
-    /// Validate and store one observation. Returns an [`ObservationError`]
-    /// if the observation is stale, from the future, or has a zero
-    /// price.
+    /// Validate and store one observation **without** verifying its
+    /// signature. The `signature` field is ignored entirely.
     ///
-    /// On success, replaces the prior observation from the same feed.
-    /// An observation older than the stored one for that feed is
-    /// rejected as [`ObservationError::Stale`] — this defends against
-    /// replay/reordering attacks at the bridge layer.
+    /// Use for trusted-bridge deployments (the bridge has already
+    /// verified upstream) and for tests. Production callers expecting
+    /// the chain to authenticate publishers must use
+    /// [`Self::ingest_signed`] instead.
+    ///
+    /// Returns an [`ObservationError`] if the observation is stale,
+    /// from the future, has a zero price, or replays an older
+    /// timestamp from the same feed.
     pub fn ingest(
+        &mut self,
+        obs: PriceObservation,
+        now: u64,
+    ) -> Result<(), ObservationError> {
+        self.validate_and_store(obs, now)
+    }
+
+    /// Validate, verify the ECDSA signature against the registered
+    /// publisher key, and store one observation.
+    ///
+    /// All the checks of [`Self::ingest`] run, plus:
+    ///   - The feed must have a registered publisher (see
+    ///     [`Self::register_publisher`]). Otherwise returns
+    ///     [`ObservationError::UnknownFeed`].
+    ///   - The observation's [`crate::types::Signature`] must verify
+    ///     against the registered key over
+    ///     [`PriceObservation::signed_bytes`]. Otherwise returns
+    ///     [`ObservationError::InvalidSignature`].
+    ///
+    /// Signature verification happens **before** the timestamp /
+    /// zero-price / replay checks — so a malformed signature short-
+    /// circuits and avoids any work on attacker-controlled payload
+    /// fields.
+    pub fn ingest_signed(
+        &mut self,
+        obs: PriceObservation,
+        now: u64,
+    ) -> Result<(), ObservationError> {
+        let pubkey = self
+            .publishers
+            .get(&obs.feed)
+            .ok_or(ObservationError::UnknownFeed { feed: obs.feed })?;
+        if !verify_observation(&obs, pubkey) {
+            return Err(ObservationError::InvalidSignature { feed: obs.feed });
+        }
+        self.validate_and_store(obs, now)
+    }
+
+    fn validate_and_store(
         &mut self,
         obs: PriceObservation,
         now: u64,
@@ -209,11 +301,7 @@ mod tests {
     use proptest::prelude::*;
 
     fn obs(feed: u32, price: u64, ts: u64) -> PriceObservation {
-        PriceObservation {
-            feed: FeedId(feed),
-            price: IndexPrice(price),
-            timestamp: ts,
-        }
+        PriceObservation::unsigned(FeedId(feed), IndexPrice(price), ts)
     }
 
     fn default_params() -> OracleParams {
@@ -382,6 +470,137 @@ mod tests {
             result,
             Err(AggregationError::TooFewFreshFeeds { fresh: 0, required: 2 })
         ));
+    }
+
+    // ─── Stage 11b: signed-path ingestion ──────────────────────────
+
+    #[test]
+    fn register_publisher_stores_key() {
+        use crate::verify::test_signing::test_publisher_key;
+        let mut o = OracleState::new(default_params());
+        let pk = test_publisher_key(1);
+        o.register_publisher(FeedId(1), pk);
+        assert_eq!(o.publisher_count(), 1);
+        assert_eq!(o.publisher(FeedId(1)), Some(&pk));
+    }
+
+    #[test]
+    fn register_publisher_replaces_prior_key_for_same_feed() {
+        use crate::verify::test_signing::test_publisher_key;
+        let mut o = OracleState::new(default_params());
+        let pk1 = test_publisher_key(1);
+        let pk2 = test_publisher_key(2);
+        o.register_publisher(FeedId(1), pk1);
+        o.register_publisher(FeedId(1), pk2);
+        assert_eq!(o.publisher_count(), 1, "rotation replaces, doesn't duplicate");
+        assert_eq!(o.publisher(FeedId(1)), Some(&pk2));
+    }
+
+    #[test]
+    fn revoke_publisher_removes_key_but_keeps_stored_observations() {
+        use crate::verify::test_signing::test_publisher_key;
+        let mut o = OracleState::new(default_params());
+        o.register_publisher(FeedId(1), test_publisher_key(1));
+        // Ingest an unsigned observation so there's a feed record to leave behind.
+        o.ingest(obs(1, 100, 1000), 1000).unwrap();
+        o.revoke_publisher(FeedId(1));
+        assert_eq!(o.publisher_count(), 0);
+        // The feed record persists; only the publisher key is gone.
+        assert_eq!(o.feed_count(), 1);
+    }
+
+    #[test]
+    fn ingest_signed_accepts_valid_signature() {
+        use crate::verify::test_signing::{sign_observation, test_publisher_key, test_signing_key};
+        let mut o = OracleState::new(default_params());
+        o.register_publisher(FeedId(1), test_publisher_key(1));
+        let sk = test_signing_key(1);
+        let signed = sign_observation(FeedId(1), IndexPrice(100), 1000, &sk);
+        assert!(o.ingest_signed(signed, 1000).is_ok());
+        assert_eq!(o.feed_count(), 1);
+    }
+
+    #[test]
+    fn ingest_signed_rejects_unknown_feed() {
+        use crate::verify::test_signing::{sign_observation, test_signing_key};
+        let mut o = OracleState::new(default_params());
+        // No publisher registered for FeedId(1).
+        let sk = test_signing_key(1);
+        let signed = sign_observation(FeedId(1), IndexPrice(100), 1000, &sk);
+        let err = o.ingest_signed(signed, 1000).unwrap_err();
+        assert_eq!(err, ObservationError::UnknownFeed { feed: FeedId(1) });
+    }
+
+    #[test]
+    fn ingest_signed_rejects_wrong_signer() {
+        use crate::verify::test_signing::{sign_observation, test_publisher_key, test_signing_key};
+        let mut o = OracleState::new(default_params());
+        // Registry holds the pubkey for seed=1, but the observation
+        // was signed with seed=2.
+        o.register_publisher(FeedId(1), test_publisher_key(1));
+        let sk_attacker = test_signing_key(2);
+        let signed = sign_observation(FeedId(1), IndexPrice(100), 1000, &sk_attacker);
+        let err = o.ingest_signed(signed, 1000).unwrap_err();
+        assert_eq!(err, ObservationError::InvalidSignature { feed: FeedId(1) });
+    }
+
+    #[test]
+    fn ingest_signed_rejects_tampered_payload() {
+        use crate::verify::test_signing::{sign_observation, test_publisher_key, test_signing_key};
+        let mut o = OracleState::new(default_params());
+        o.register_publisher(FeedId(1), test_publisher_key(1));
+        let sk = test_signing_key(1);
+        let mut signed = sign_observation(FeedId(1), IndexPrice(100), 1000, &sk);
+        // Mutate the price after signing — the signature now signs a
+        // stale payload, verification must fail.
+        signed.price = IndexPrice(999);
+        let err = o.ingest_signed(signed, 1000).unwrap_err();
+        assert_eq!(err, ObservationError::InvalidSignature { feed: FeedId(1) });
+    }
+
+    #[test]
+    fn ingest_signed_runs_timestamp_checks_after_signature_passes() {
+        // A valid signature on a stale observation still fails staleness.
+        // This confirms the signature gate doesn't bypass the freshness gate.
+        use crate::verify::test_signing::{sign_observation, test_publisher_key, test_signing_key};
+        let mut o = OracleState::new(default_params());
+        o.register_publisher(FeedId(1), test_publisher_key(1));
+        let sk = test_signing_key(1);
+        // ts=900, now=1000, window=60 → stale.
+        let signed = sign_observation(FeedId(1), IndexPrice(100), 900, &sk);
+        let err = o.ingest_signed(signed, 1000).unwrap_err();
+        assert!(matches!(err, ObservationError::Stale { .. }));
+    }
+
+    #[test]
+    fn ingest_signed_rejects_zero_signature_sentinel() {
+        // The unsigned() path's all-zero signature must not pass
+        // ingest_signed even if the feed is registered.
+        use crate::verify::test_signing::test_publisher_key;
+        let mut o = OracleState::new(default_params());
+        o.register_publisher(FeedId(1), test_publisher_key(1));
+        let unsigned = obs(1, 100, 1000); // signature = Signature::ZERO
+        let err = o.ingest_signed(unsigned, 1000).unwrap_err();
+        assert_eq!(err, ObservationError::InvalidSignature { feed: FeedId(1) });
+    }
+
+    #[test]
+    fn signed_and_unsigned_paths_coexist() {
+        // Stage 11b doesn't make the unsigned path go away — the bridge
+        // can mix authenticated and trusted feeds in one OracleState.
+        use crate::verify::test_signing::{sign_observation, test_publisher_key, test_signing_key};
+        let mut o = OracleState::new(default_params());
+        // Feed 1 is signed.
+        o.register_publisher(FeedId(1), test_publisher_key(1));
+        let sk = test_signing_key(1);
+        let signed = sign_observation(FeedId(1), IndexPrice(100), 1000, &sk);
+        o.ingest_signed(signed, 1000).unwrap();
+        // Feed 2 is unsigned (trusted-bridge).
+        o.ingest(obs(2, 101, 1000), 1000).unwrap();
+        assert_eq!(o.feed_count(), 2);
+        // Refresh succeeds on the combined set.
+        let agg = o.refresh(1000).unwrap();
+        assert_eq!(agg.feeds_used, 2);
     }
 
     // ─── proptest: invariants ─────────────────────────────────────

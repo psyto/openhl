@@ -31,13 +31,47 @@ pub const DEVIATION_SCALE: u32 = 10_000;
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct FeedId(pub u32);
 
+/// SEC1-compressed secp256k1 public key (33 bytes).
+///
+/// Registered against a [`FeedId`] in [`crate::state::OracleState`].
+/// Stage 11b verifies each [`PriceObservation::signature`] against the
+/// registered key for that feed.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct PublisherKey(pub [u8; 33]);
+
+/// IEEE P1363 fixed-format ECDSA signature: `r || s` concatenated, 64
+/// bytes. `Signature::ZERO` is the placeholder for unsigned observations
+/// (those ingested via [`crate::state::OracleState::ingest`], the
+/// unsigned-trust path — production callers should use
+/// [`crate::state::OracleState::ingest_signed`] which verifies the
+/// signature against the publisher registry).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct Signature(pub [u8; 64]);
+
+impl Signature {
+    /// All-zero signature, used as the placeholder in unsigned
+    /// observations and as a default for serialization round-trips.
+    pub const ZERO: Self = Self([0u8; 64]);
+}
+
+impl Default for Signature {
+    fn default() -> Self {
+        Self::ZERO
+    }
+}
+
 /// One price observation from one publisher, at one timestamp.
 ///
-/// Stage 11 v0 does not carry an ECDSA signature — the bridge is
-/// trusted to drop unauthenticated observations before ingestion. A
-/// future Stage 11b will add a signed-message variant and a
-/// publisher-key registry. The wire format chosen here can be extended
-/// without breaking existing callers.
+/// The `signature` field is verified against the registered
+/// [`PublisherKey`] for the feed by
+/// [`crate::state::OracleState::ingest_signed`] (Stage 11b). The
+/// unsigned path ([`crate::state::OracleState::ingest`]) ignores the
+/// field entirely — useful for tests and trusted-bridge deployments.
+///
+/// The bytes the publisher signs are the canonical big-endian
+/// concatenation of `(feed_id, price, timestamp)`, hashed by the ECDSA
+/// implementation's configured digest (SHA-256 with k256's default).
+/// See [`Self::signed_bytes`] for the exact byte layout.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct PriceObservation {
     pub feed: FeedId,
@@ -45,6 +79,43 @@ pub struct PriceObservation {
     /// Publisher-reported unix seconds. The oracle uses this against
     /// its own `now` parameter to detect staleness.
     pub timestamp: u64,
+    /// ECDSA signature over [`Self::signed_bytes`]. Use
+    /// [`Signature::ZERO`] for the unsigned/trusted-bridge path.
+    pub signature: Signature,
+}
+
+impl PriceObservation {
+    /// Construct an observation with [`Signature::ZERO`], for the
+    /// unsigned/trusted-bridge ingest path and for tests.
+    #[must_use]
+    pub const fn unsigned(feed: FeedId, price: IndexPrice, timestamp: u64) -> Self {
+        Self {
+            feed,
+            price,
+            timestamp,
+            signature: Signature::ZERO,
+        }
+    }
+
+    /// The exact bytes the publisher signs.
+    ///
+    /// Layout (20 bytes total):
+    /// ```text
+    ///   [ 0..  4]  feed_id   (u32, big-endian)
+    ///   [ 4.. 12]  price     (u64, big-endian)
+    ///   [12.. 20]  timestamp (u64, big-endian)
+    /// ```
+    ///
+    /// Big-endian and fixed-width so every validator computes the
+    /// same digest from the same inputs.
+    #[must_use]
+    pub fn signed_bytes(&self) -> [u8; 20] {
+        let mut buf = [0u8; 20];
+        buf[0..4].copy_from_slice(&self.feed.0.to_be_bytes());
+        buf[4..12].copy_from_slice(&self.price.0.to_be_bytes());
+        buf[12..20].copy_from_slice(&self.timestamp.to_be_bytes());
+        buf
+    }
 }
 
 /// The aggregator's output — one canonical index price plus the
@@ -99,7 +170,8 @@ impl OracleParams {
 }
 
 /// Why a single observation was rejected at ingestion. Returned by
-/// [`crate::state::OracleState::ingest`].
+/// [`crate::state::OracleState::ingest`] and
+/// [`crate::state::OracleState::ingest_signed`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ObservationError {
     /// The observation's timestamp is older than `now -
@@ -116,6 +188,17 @@ pub enum ObservationError {
     /// The observation reports a zero price. Always a publisher error
     /// (zero spot price is non-physical for any tradable asset).
     ZeroPrice,
+    /// `ingest_signed` was called for a feed that has no
+    /// [`PublisherKey`] registered. The bridge needs to call
+    /// [`crate::state::OracleState::register_publisher`] before this
+    /// feed can be ingested via the signed path.
+    UnknownFeed { feed: FeedId },
+    /// The observation's signature did not verify against the
+    /// registered publisher key for its feed. Either the signature is
+    /// malformed (not a valid encoding of `(r, s)`), the signed message
+    /// doesn't match, or the publisher's private key has been swapped
+    /// without a registry update.
+    InvalidSignature { feed: FeedId },
 }
 
 /// Why an aggregation attempt failed. Returned by

@@ -6303,6 +6303,7 @@ version = "0.1.0"
 name = "openhl-oracle"
 version = "0.1.0"
 dependencies = [
+ "k256",
  "openhl-funding",
  "proptest",
 ]
