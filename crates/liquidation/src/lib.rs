@@ -29,20 +29,23 @@
 //!
 //!   - **Stage 10a** — margin math, per-account classification,
 //!     single-account close-order generation. Pure compute, no state.
-//!   - **Stage 10b (this commit)** — insurance fund state machine
-//!     ([`InsuranceFund`]), deficit absorption, fee credit. Adds
-//!     [`compute::liquidation_fee`], [`compute::solvent_close_outcome`],
-//!     and [`compute::underwater_close_outcome`] for the per-close
-//!     credit/debit decomposition the scanner consumes.
-//!   - **Stage 10c** — multi-account scanner that iterates over
-//!     `&[AccountSnapshot]`, batches close orders for the CLOB, and
-//!     records insurance-fund movements.
+//!   - **Stage 10b** — insurance fund state machine ([`InsuranceFund`]),
+//!     deficit absorption, fee credit. Adds [`compute::liquidation_fee`],
+//!     [`compute::solvent_close_outcome`], and
+//!     [`compute::underwater_close_outcome`] for the per-close
+//!     credit/debit decomposition.
+//!   - **Stage 10c (this commit)** — multi-account scanner
+//!     ([`LiquidationScanner`]) that iterates over `&[AccountSnapshot]`,
+//!     classifies each, generates close orders for the CLOB, applies
+//!     insurance-fund deposits / withdraws, and surfaces any unfilled
+//!     deficit via [`ScanReport::unfilled_deficit`].
 //!
 //! Auto-deleveraging (ADL), the fallback path when the insurance fund is
 //! exhausted, is intentionally out of scope. The
 //! [`WithdrawOutcome::PartiallyDrained`] and [`WithdrawOutcome::Depleted`]
-//! variants surface the unfilled deficit so Stage 10c (or a later Stage
-//! 10d) can escalate.
+//! variants surface the unfilled deficit at the fund layer;
+//! [`ScanReport::unfilled_deficit`] aggregates it at the scan layer. A
+//! later Stage 10d would consume that to drive ADL ranking.
 //!
 //! ### Why fixed-point integers, not floats
 //!
@@ -53,6 +56,7 @@
 
 pub mod compute;
 pub mod insurance;
+pub mod scanner;
 pub mod types;
 
 pub use compute::{
@@ -60,6 +64,7 @@ pub use compute::{
     notional_value, solvent_close_outcome, underwater_close_outcome, unrealized_pnl,
 };
 pub use insurance::{InsuranceFund, WithdrawOutcome};
+pub use scanner::{CloseOutcomeKind, LiquidationRecord, LiquidationScanner, ScanReport};
 pub use types::{
     AccountSnapshot, CloseOrderSpec, LiquidationParams, MarginHealth, MarginRatio, SolventClose,
     UnderwaterClose, MARGIN_SCALE,
