@@ -6220,6 +6220,7 @@ dependencies = [
  "openhl-types",
  "rand 0.8.6",
  "reth-chainspec",
+ "reth-db",
  "reth-node-builder",
  "reth-node-core",
  "reth-node-ethereum",

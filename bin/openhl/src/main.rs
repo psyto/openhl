@@ -53,8 +53,13 @@ use openhl_node::{OpenHlNode, OpenHlNodeConfig, TickInput, TickReport};
 use openhl_types::BlockHash;
 use rand::rngs::OsRng;
 use reth_chainspec::ChainSpec;
+use reth_db::{init_db, mdbx::DatabaseArguments};
 use reth_node_builder::{NodeBuilder, NodeHandle as RethNodeHandle};
-use reth_node_core::node_config::NodeConfig;
+use reth_node_core::{
+    args::DatadirArgs,
+    dirs::{DataDirPath, MaybePlatformPath},
+    node_config::NodeConfig,
+};
 use reth_node_ethereum::{node::EthereumAddOns, EthereumNode};
 use reth_tasks::Runtime;
 use sha2::{Digest, Sha256};
@@ -96,15 +101,19 @@ enum Command {
         #[arg(long, default_value = "openhl-reth-devnet")]
         moniker: String,
 
-        /// Data directory for Reth's MDBX database and the consensus home
-        /// dir. Defaults to a tempdir (cleaned up at process exit).
+        /// Data directory for Reth's MDBX database and the consensus
+        /// home dir. Defaults to `$HOME/.openhl/data`.
         ///
-        /// **Caveat**: even when set, the underlying `testing_node`
-        /// runtime still cleans up the datadir when the node handle drops.
-        /// True cross-restart persistence requires Stage 13f's production
-        /// `NodeBuilder` path. Until then, `--data-dir` is mostly useful for
-        /// observing what Reth writes during a single run, or for running
-        /// inside a tmpfs.
+        /// Stage 13f swapped this to the production `NodeBuilder` path
+        /// (`reth_db::init_db` + `with_database` + `with_launch_context`),
+        /// so the directory is now a real persistent MDBX database — it
+        /// is **not** deleted at process exit. Re-running with the same
+        /// `--data-dir` opens the existing database.
+        ///
+        /// Cross-restart persistence of the openhl-side state (bridge's
+        /// chain map, consensus WAL) is still Stage 13g work; for now,
+        /// each run starts a fresh consensus instance even if Reth's DB
+        /// already has prior blocks.
         #[arg(long)]
         data_dir: Option<PathBuf>,
     },
@@ -131,6 +140,18 @@ fn tokio_rt() -> eyre::Result<tokio::runtime::Runtime> {
         .enable_all()
         .build()
         .map_err(Into::into)
+}
+
+/// Resolve the effective `--data-dir` path. If the user passed one
+/// explicitly we use it as-is; otherwise we default to
+/// `$HOME/.openhl/data`. Errors if neither is available (no HOME).
+fn resolve_data_dir(user_supplied: Option<&PathBuf>) -> eyre::Result<PathBuf> {
+    if let Some(p) = user_supplied {
+        return Ok(p.clone());
+    }
+    let home = std::env::var("HOME")
+        .map_err(|_| eyre::eyre!("--data-dir not supplied and $HOME is not set"))?;
+    Ok(PathBuf::from(home).join(".openhl").join("data"))
 }
 
 fn print_info() {
@@ -260,28 +281,36 @@ async fn run_reth_devnet(
         if rounds == 1 { "" } else { "s" }
     );
 
-    // 1. Reth boot.
-    let chain_spec = dev_chain_spec();
-    let node_config = NodeConfig::test().dev().with_chain(chain_spec.clone());
-    let runtime = Runtime::test();
+    // 1. Reth boot — production path (`init_db` + `with_database` +
+    //    `with_launch_context`, no `test-utils` feature).
+    let data_dir_path = resolve_data_dir(data_dir.as_ref())?;
+    std::fs::create_dir_all(&data_dir_path)?;
+    let reth_db_path = data_dir_path.join("reth");
+    std::fs::create_dir_all(&reth_db_path)?;
 
     println!("[1/6] booting Reth EthereumNode with OpenHlExecutorBuilder…");
-    if let Some(ref path) = data_dir {
-        println!("      Reth data dir = {}", path.display());
-    }
-    // testing_node_with_datadir lets callers control where MDBX data lives
-    // during this run. testing_node (no datadir) uses an OS tempdir. Both
-    // paths are still test-utils flavored — true cross-process persistence
-    // requires Stage 13f's production NodeBuilder path.
-    let launch_context = if let Some(ref path) = data_dir {
-        NodeBuilder::new(node_config).testing_node_with_datadir(runtime, path.clone())
-    } else {
-        NodeBuilder::new(node_config).testing_node(runtime)
-    };
+    println!("      data dir         = {}", data_dir_path.display());
+    println!("      Reth MDBX dir    = {}", reth_db_path.display());
+
+    let chain_spec = dev_chain_spec();
+    let node_config = NodeConfig::test().dev().with_chain(chain_spec.clone()).with_datadir_args(
+        DatadirArgs {
+            datadir: MaybePlatformPath::<DataDirPath>::from(reth_db_path.clone()),
+            ..Default::default()
+        },
+    );
+    let runtime = Runtime::test();
+
+    // `init_db` opens an existing MDBX database at the path or creates
+    // a fresh one if none exists — idempotent across restarts.
+    let db = Arc::new(init_db(&reth_db_path, DatabaseArguments::default())?);
+
     let RethNodeHandle {
         node,
         node_exit_future: _,
-    } = launch_context
+    } = NodeBuilder::new(node_config)
+        .with_database(db)
+        .with_launch_context(runtime)
         .with_types::<EthereumNode>()
         .with_components(EthereumNode::components().executor(OpenHlExecutorBuilder::default()))
         .with_add_ons(EthereumAddOns::default())
@@ -318,26 +347,19 @@ async fn run_reth_devnet(
         openhl_consensus::types::OpenHlValidator::new(address, public, 1),
     ]);
 
-    // Consensus home dir: if the user gave --data-dir, use a subdir under
-    // it for consensus state (separate from Reth's MDBX directory). If not,
-    // fall back to a tempdir that drops at process exit.
-    let (consensus_home, _home_tmp_guard) = if let Some(ref base) = data_dir {
-        let path = base.join("consensus");
-        std::fs::create_dir_all(&path)?;
-        (path, None)
-    } else {
-        let tmp = tempfile::tempdir()?;
-        let path = tmp.path().to_path_buf();
-        (path, Some(tmp))
-    };
-    println!("      consensus home dir = {}", consensus_home.display());
+    // Consensus home dir: a subdir of the resolved data dir. Persists
+    // across restarts so the Malachite WAL has a stable location (real
+    // WAL load/save remains Stage 13g work).
+    let consensus_home = data_dir_path.join("consensus");
+    std::fs::create_dir_all(&consensus_home)?;
+    println!("      consensus home   = {}", consensus_home.display());
     let consensus_node = openhl_consensus::OpenHlNode::new(
         private,
         validator_set.clone(),
         consensus_home,
         moniker.clone(),
     );
-    println!("      moniker = {moniker}");
+    println!("      moniker          = {moniker}");
 
     // 4. Start the Malachite actor system.
     println!("[4/6] starting Malachite actor system…");

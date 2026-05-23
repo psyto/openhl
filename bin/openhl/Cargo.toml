@@ -22,15 +22,17 @@ clap  = { version = "4.6", features = ["derive"] }
 eyre  = { workspace = true }
 tokio = { workspace = true }
 
-# Stage 13c: Reth + Malachite runtime boot.
-# test-utils features expose `testing_node` for dev/devnet usage. A
-# production-bootable openhl node would replace these with the
-# persistent NodeBuilder path; out of scope for Stage 13c.
-reth-node-builder  = { workspace = true, features = ["test-utils"] }
+# Stage 13c-f: Reth + Malachite runtime boot.
+#
+# Stage 13f drops the `test-utils` feature in favor of the production
+# NodeBuilder path: `reth_db::init_db` for the MDBX database,
+# `with_database` + `with_launch_context` for the launch surface.
+reth-node-builder  = { workspace = true }
 reth-node-core     = { workspace = true }
-reth-node-ethereum = { workspace = true, features = ["test-utils"] }
+reth-node-ethereum = { workspace = true }
 reth-tasks         = { workspace = true }
 reth-chainspec     = { workspace = true }
+reth-db            = { workspace = true }
 alloy-genesis      = { workspace = true }
 serde_json         = { workspace = true }
 informalsystems-malachitebft-app             = { workspace = true }
