@@ -6209,6 +6209,7 @@ name = "openhl"
 version = "0.1.0"
 dependencies = [
  "alloy-genesis",
+ "clap",
  "eyre",
  "informalsystems-malachitebft-app",
  "informalsystems-malachitebft-signing-ed25519",

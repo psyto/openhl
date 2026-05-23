@@ -19,24 +19,32 @@
 //!     `build_payload` consult its own internal `chain` map for parent
 //!     lookup before falling back to Reth's provider — the bridge's
 //!     `commit` doesn't upload an `ExecutionPayload` to Reth (the
-//!     synthetic headers have placeholder state_roots that Reth would
+//!     synthetic headers have placeholder `state_root`s that Reth would
 //!     reject), but consensus only needs the bridge to be
 //!     self-consistent, which it now is.
 //!
 //! Examples:
-//!   $ openhl                        # equivalent to `openhl info`
+//!   $ openhl                                      # equivalent to `openhl info`
 //!   $ openhl info
-//!   $ openhl devnet                 # one in-memory round
-//!   $ openhl devnet 5               # five in-memory rounds
-//!   $ openhl reth-devnet            # one Reth-backed decision
-//!   $ openhl reth-devnet 3          # three Reth-backed decisions
+//!   $ openhl devnet                               # one in-memory round
+//!   $ openhl devnet --rounds 5                    # five in-memory rounds
+//!   $ openhl reth-devnet                          # one Reth-backed decision
+//!   $ openhl reth-devnet --rounds 3
+//!   $ openhl reth-devnet --moniker alice --data-dir ~/.openhl/data
+//!
+//! Stage 13e (this commit) introduces clap-based subcommands and the
+//! `--moniker` / `--data-dir` flags. Full production `NodeBuilder` path
+//! (persistent across restarts, real network config, multi-validator)
+//! lands in Stage 13f.
 
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use alloy_genesis::Genesis;
-use informalsystems_malachitebft_signing_ed25519::PrivateKey;
+use clap::{Parser, Subcommand};
 use informalsystems_malachitebft_app::node::{Node, NodeHandle};
+use informalsystems_malachitebft_signing_ed25519::PrivateKey;
 use openhl_consensus::run_engine_app;
 use openhl_consensus::run_single_validator;
 use openhl_evm::{InMemoryEvmBridge, LiveRethEvmBridge, OpenHlExecutorBuilder};
@@ -51,28 +59,70 @@ use reth_node_ethereum::{node::EthereumAddOns, EthereumNode};
 use reth_tasks::Runtime;
 use sha2::{Digest, Sha256};
 
-fn main() -> eyre::Result<()> {
-    let mut args = std::env::args().skip(1);
-    let subcommand = args.next();
+#[derive(Debug, Parser)]
+#[command(
+    name = "openhl",
+    version,
+    about = "Hyperliquid-shape L1 reference implementation",
+    long_about = None
+)]
+struct Cli {
+    #[command(subcommand)]
+    command: Option<Command>,
+}
 
-    match subcommand.as_deref() {
-        None | Some("info") => {
+#[derive(Debug, Subcommand)]
+enum Command {
+    /// Print the node's static config and initial state (default).
+    Info,
+
+    /// Drive single-validator consensus rounds through an in-memory bridge,
+    /// calling `OpenHlNode::tick` between blocks. Stage 13b demo path.
+    Devnet {
+        /// Number of consensus rounds to drive.
+        #[arg(long, default_value_t = 1)]
+        rounds: u64,
+    },
+
+    /// Drive consensus decisions through Reth-backed `LiveRethEvmBridge` +
+    /// the Malachite actor engine. Stage 13c-e production-shape boot.
+    RethDevnet {
+        /// Number of consensus decisions to drive.
+        #[arg(long, default_value_t = 1)]
+        rounds: u64,
+
+        /// Moniker for the consensus node identity (used in logs / network
+        /// p2p discovery when wired). Default: openhl-reth-devnet.
+        #[arg(long, default_value = "openhl-reth-devnet")]
+        moniker: String,
+
+        /// Data directory for Reth's MDBX database and the consensus home
+        /// dir. Defaults to a tempdir (cleaned up at process exit).
+        ///
+        /// **Caveat**: even when set, the underlying `testing_node`
+        /// runtime still cleans up the datadir when the node handle drops.
+        /// True cross-restart persistence requires Stage 13f's production
+        /// `NodeBuilder` path. Until then, `--data-dir` is mostly useful for
+        /// observing what Reth writes during a single run, or for running
+        /// inside a tmpfs.
+        #[arg(long)]
+        data_dir: Option<PathBuf>,
+    },
+}
+
+fn main() -> eyre::Result<()> {
+    let cli = Cli::parse();
+    match cli.command.unwrap_or(Command::Info) {
+        Command::Info => {
             print_info();
             Ok(())
         }
-        Some("devnet") => {
-            let rounds = parse_rounds(args.next())?;
-            tokio_rt()?.block_on(run_devnet(rounds))
-        }
-        Some("reth-devnet") => {
-            let rounds = parse_rounds(args.next())?;
-            tokio_rt()?.block_on(run_reth_devnet(rounds))
-        }
-        Some(other) => {
-            eprintln!("openhl: unknown subcommand `{other}`");
-            eprintln!("usage: openhl [info | devnet [N] | reth-devnet [N]]");
-            std::process::exit(2);
-        }
+        Command::Devnet { rounds } => tokio_rt()?.block_on(run_devnet(rounds)),
+        Command::RethDevnet {
+            rounds,
+            moniker,
+            data_dir,
+        } => tokio_rt()?.block_on(run_reth_devnet(rounds, moniker, data_dir)),
     }
 }
 
@@ -81,13 +131,6 @@ fn tokio_rt() -> eyre::Result<tokio::runtime::Runtime> {
         .enable_all()
         .build()
         .map_err(Into::into)
-}
-
-fn parse_rounds(arg: Option<String>) -> eyre::Result<u64> {
-    arg.map(|s| s.parse())
-        .transpose()
-        .map_err(|e: std::num::ParseIntError| eyre::eyre!("invalid rounds: {e}"))
-        .map(|opt| opt.unwrap_or(1))
 }
 
 fn print_info() {
@@ -205,7 +248,11 @@ async fn run_devnet(rounds: u64) -> eyre::Result<()> {
 ///      to drive `rounds` decisions then exit.
 ///   7. Clean shutdown of the consensus node.
 #[allow(clippy::too_many_lines)] // 6-step boot ceremony — flat for readability
-async fn run_reth_devnet(rounds: u64) -> eyre::Result<()> {
+async fn run_reth_devnet(
+    rounds: u64,
+    moniker: String,
+    data_dir: Option<PathBuf>,
+) -> eyre::Result<()> {
     println!(
         "openhl v{} — driving {} reth-backed decision{}",
         env!("CARGO_PKG_VERSION"),
@@ -219,11 +266,22 @@ async fn run_reth_devnet(rounds: u64) -> eyre::Result<()> {
     let runtime = Runtime::test();
 
     println!("[1/6] booting Reth EthereumNode with OpenHlExecutorBuilder…");
+    if let Some(ref path) = data_dir {
+        println!("      Reth data dir = {}", path.display());
+    }
+    // testing_node_with_datadir lets callers control where MDBX data lives
+    // during this run. testing_node (no datadir) uses an OS tempdir. Both
+    // paths are still test-utils flavored — true cross-process persistence
+    // requires Stage 13f's production NodeBuilder path.
+    let launch_context = if let Some(ref path) = data_dir {
+        NodeBuilder::new(node_config).testing_node_with_datadir(runtime, path.clone())
+    } else {
+        NodeBuilder::new(node_config).testing_node(runtime)
+    };
     let RethNodeHandle {
         node,
         node_exit_future: _,
-    } = NodeBuilder::new(node_config)
-        .testing_node(runtime)
+    } = launch_context
         .with_types::<EthereumNode>()
         .with_components(EthereumNode::components().executor(OpenHlExecutorBuilder::default()))
         .with_add_ons(EthereumAddOns::default())
@@ -260,13 +318,26 @@ async fn run_reth_devnet(rounds: u64) -> eyre::Result<()> {
         openhl_consensus::types::OpenHlValidator::new(address, public, 1),
     ]);
 
-    let home_tmp = tempfile::tempdir()?;
+    // Consensus home dir: if the user gave --data-dir, use a subdir under
+    // it for consensus state (separate from Reth's MDBX directory). If not,
+    // fall back to a tempdir that drops at process exit.
+    let (consensus_home, _home_tmp_guard) = if let Some(ref base) = data_dir {
+        let path = base.join("consensus");
+        std::fs::create_dir_all(&path)?;
+        (path, None)
+    } else {
+        let tmp = tempfile::tempdir()?;
+        let path = tmp.path().to_path_buf();
+        (path, Some(tmp))
+    };
+    println!("      consensus home dir = {}", consensus_home.display());
     let consensus_node = openhl_consensus::OpenHlNode::new(
         private,
         validator_set.clone(),
-        home_tmp.path().to_path_buf(),
-        "openhl-reth-devnet",
+        consensus_home,
+        moniker.clone(),
     );
+    println!("      moniker = {moniker}");
 
     // 4. Start the Malachite actor system.
     println!("[4/6] starting Malachite actor system…");
