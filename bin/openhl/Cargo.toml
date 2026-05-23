@@ -21,5 +21,22 @@ openhl-types     = { path = "../../crates/types" }
 eyre  = { workspace = true }
 tokio = { workspace = true }
 
+# Stage 13c: Reth + Malachite runtime boot.
+# test-utils features expose `testing_node` for dev/devnet usage. A
+# production-bootable openhl node would replace these with the
+# persistent NodeBuilder path; out of scope for Stage 13c.
+reth-node-builder  = { workspace = true, features = ["test-utils"] }
+reth-node-core     = { workspace = true }
+reth-node-ethereum = { workspace = true, features = ["test-utils"] }
+reth-tasks         = { workspace = true }
+reth-chainspec     = { workspace = true }
+alloy-genesis      = { workspace = true }
+serde_json         = { workspace = true }
+informalsystems-malachitebft-app             = { workspace = true }
+informalsystems-malachitebft-signing-ed25519 = { workspace = true, features = ["rand"] }
+rand               = "0.8"
+sha2               = "0.10"
+tempfile           = "3"
+
 [lints]
 workspace = true

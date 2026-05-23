@@ -1,29 +1,55 @@
 //! openhl — Hyperliquid-shape L1 reference implementation.
 //!
-//! Two subcommands:
+//! Three subcommands:
 //!
 //!   - `info` (default) — print the node's static config + initial state.
-//!   - `devnet [N]` — drive `N` single-validator consensus rounds through an
+//!   - `devnet [N]` — `N` single-validator consensus rounds through an
 //!     in-memory EVM bridge, calling `OpenHlNode::tick` between blocks.
-//!     This is the smallest runnable demo of the full per-block flow at the
-//!     binary level. Full Reth + actor-engine integration (Stage 13c) will
-//!     replace `InMemoryEvmBridge` with `LiveRethEvmBridge` and
-//!     `run_single_validator` with `run_engine_app`.
+//!     Stage 13b. The smallest runnable demo of the full per-block flow
+//!     at the binary level.
+//!   - `reth-devnet [N]` — Boots the production-shape stack: Reth via
+//!     `NodeBuilder` + `OpenHlExecutorBuilder`, then `LiveRethEvmBridge`
+//!     against its provider, then the Malachite actor engine via
+//!     consensus `OpenHlNode::start`, then `run_engine_app` to drive
+//!     consensus decisions. Stage 13c.
+//!
+//!     **Known limitation (resolved in Stage 13d):** the consensus
+//!     engine's hard-coded initial parent (`BlockHash([0u8; 32])`)
+//!     does not match Reth's actual genesis hash. The first
+//!     `build_payload` against `LiveRethEvmBridge` therefore fails
+//!     with "provider has no block with hash 0x0…0". The boot
+//!     ceremony itself works end-to-end (steps 1-5 below); only
+//!     step 6 surfaces the parent-hash mismatch. Stage 13d will
+//!     extend the consensus crate's API to accept a seed parent from
+//!     the bridge (`provider.canonical_head()`), closing the gap.
 //!
 //! Examples:
-//!   $ openhl                       # equivalent to `openhl info`
+//!   $ openhl                        # equivalent to `openhl info`
 //!   $ openhl info
-//!   $ openhl devnet                # one consensus round
-//!   $ openhl devnet 5              # five consensus rounds
+//!   $ openhl devnet                 # one in-memory round
+//!   $ openhl devnet 5               # five in-memory rounds
+//!   $ openhl reth-devnet            # one Reth-backed decision
+//!   $ openhl reth-devnet 3          # three Reth-backed decisions
 
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use alloy_genesis::Genesis;
+use informalsystems_malachitebft_signing_ed25519::PrivateKey;
+use informalsystems_malachitebft_app::node::{Node, NodeHandle};
+use openhl_consensus::run_engine_app;
 use openhl_consensus::run_single_validator;
-use openhl_evm::InMemoryEvmBridge;
+use openhl_evm::{InMemoryEvmBridge, LiveRethEvmBridge, OpenHlExecutorBuilder};
 use openhl_funding::MarkPrice;
 use openhl_node::{OpenHlNode, OpenHlNodeConfig, TickInput, TickReport};
 use openhl_types::BlockHash;
+use rand::rngs::OsRng;
+use reth_chainspec::ChainSpec;
+use reth_node_builder::{NodeBuilder, NodeHandle as RethNodeHandle};
+use reth_node_core::node_config::NodeConfig;
+use reth_node_ethereum::{node::EthereumAddOns, EthereumNode};
+use reth_tasks::Runtime;
+use sha2::{Digest, Sha256};
 
 fn main() -> eyre::Result<()> {
     let mut args = std::env::args().skip(1);
@@ -35,23 +61,33 @@ fn main() -> eyre::Result<()> {
             Ok(())
         }
         Some("devnet") => {
-            let rounds: u64 = args
-                .next()
-                .map(|s| s.parse())
-                .transpose()
-                .map_err(|e: std::num::ParseIntError| eyre::eyre!("invalid rounds: {e}"))?
-                .unwrap_or(1);
-            let rt = tokio::runtime::Builder::new_multi_thread()
-                .enable_all()
-                .build()?;
-            rt.block_on(run_devnet(rounds))
+            let rounds = parse_rounds(args.next())?;
+            tokio_rt()?.block_on(run_devnet(rounds))
+        }
+        Some("reth-devnet") => {
+            let rounds = parse_rounds(args.next())?;
+            tokio_rt()?.block_on(run_reth_devnet(rounds))
         }
         Some(other) => {
             eprintln!("openhl: unknown subcommand `{other}`");
-            eprintln!("usage: openhl [info | devnet [N]]");
+            eprintln!("usage: openhl [info | devnet [N] | reth-devnet [N]]");
             std::process::exit(2);
         }
     }
+}
+
+fn tokio_rt() -> eyre::Result<tokio::runtime::Runtime> {
+    tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .map_err(Into::into)
+}
+
+fn parse_rounds(arg: Option<String>) -> eyre::Result<u64> {
+    arg.map(|s| s.parse())
+        .transpose()
+        .map_err(|e: std::num::ParseIntError| eyre::eyre!("invalid rounds: {e}"))
+        .map(|opt| opt.unwrap_or(1))
 }
 
 fn print_info() {
@@ -111,24 +147,13 @@ fn print_info() {
     );
 }
 
-/// Drive `rounds` single-validator consensus rounds, calling
-/// `OpenHlNode::tick` between blocks.
-///
-/// Uses [`InMemoryEvmBridge`] as the EL side — no Reth boot needed.
-/// Each round:
-///   1. `run_single_validator` drives one consensus round to a decision
-///      (commits a fresh `ExecutedBlock` through the bridge).
-///   2. We extract the chain's wall-clock-style "block time" and call
-///      `OpenHlNode::tick` with empty account snapshots and a dummy
-///      mark. The point is to **demonstrate composition**, not to
-///      simulate a market — full simulation lives in the crate-level
-///      proptest harnesses, not in this binary.
+/// Drive `rounds` single-validator consensus rounds through an
+/// **in-memory** EVM bridge, calling `OpenHlNode::tick` between each.
+/// Stage 13b path — no Reth boot.
 async fn run_devnet(rounds: u64) -> eyre::Result<()> {
     let mut coordinator = OpenHlNode::new(OpenHlNodeConfig::hyperliquid_default());
     let bridge = Arc::new(InMemoryEvmBridge::new());
 
-    // First "parent" is the all-zero genesis hash. The single-validator
-    // runner produces a real `BlockHash` we feed into the next round.
     let mut parent = BlockHash([0u8; 32]);
 
     println!(
@@ -140,15 +165,8 @@ async fn run_devnet(rounds: u64) -> eyre::Result<()> {
 
     for round in 0..rounds {
         let block_height = round + 1;
-        let block_time = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map_or(0, |d| d.as_secs())
-            // Add `round` so consecutive rounds advance time by at least
-            // a second — keeps the oracle-refresh cadence test happy in
-            // tight loops.
-            .saturating_add(round);
+        let block_time = wallclock_secs().saturating_add(round);
 
-        // 1. One consensus round: produce + decide + commit a block.
         let decided = run_single_validator(bridge.as_ref(), parent).await?;
         println!(
             "round {}: decided {} via in-memory bridge",
@@ -156,10 +174,6 @@ async fn run_devnet(rounds: u64) -> eyre::Result<()> {
             short_hash(&decided)
         );
 
-        // 2. Run the coordinator's per-block tick. Empty snapshots and a
-        // dummy mark — this binary is the composition demo, not a market
-        // simulator. The Stage 13 tests exercise the real liquidation +
-        // ADL paths with synthetic snapshots.
         let report = coordinator.tick(TickInput {
             block_height,
             block_time,
@@ -173,6 +187,195 @@ async fn run_devnet(rounds: u64) -> eyre::Result<()> {
     }
 
     Ok(())
+}
+
+/// Drive `rounds` consensus decisions through the **production-shape**
+/// actor-engine loop with a Reth-backed [`LiveRethEvmBridge`].
+/// Stage 13c path — the real boot ceremony.
+///
+/// Flow:
+///   1. Spin up a Reth `EthereumNode` with `OpenHlExecutorBuilder`
+///      (so the EVM has our custom CLOB precompiles registered).
+///   2. Construct a [`LiveRethEvmBridge`] against the node's provider.
+///   3. Bootstrap a consensus [`openhl_consensus::OpenHlNode`] with a
+///      fresh Ed25519 keypair and a single-validator set.
+///   4. `node.start().await` — spawns the Malachite actor system.
+///   5. `take_channels().await` — get the engine's `AppMsg` channels.
+///   6. Spawn `run_engine_app(bridge, channels, validator_set, rounds)`
+///      to drive `rounds` decisions then exit.
+///   7. Clean shutdown of the consensus node.
+async fn run_reth_devnet(rounds: u64) -> eyre::Result<()> {
+    println!(
+        "openhl v{} — driving {} reth-backed decision{}",
+        env!("CARGO_PKG_VERSION"),
+        rounds,
+        if rounds == 1 { "" } else { "s" }
+    );
+
+    // 1. Reth boot.
+    let chain_spec = dev_chain_spec();
+    let node_config = NodeConfig::test().dev().with_chain(chain_spec.clone());
+    let runtime = Runtime::test();
+
+    println!("[1/6] booting Reth EthereumNode with OpenHlExecutorBuilder…");
+    let RethNodeHandle {
+        node,
+        node_exit_future: _,
+    } = NodeBuilder::new(node_config)
+        .testing_node(runtime)
+        .with_types::<EthereumNode>()
+        .with_components(EthereumNode::components().executor(OpenHlExecutorBuilder::default()))
+        .with_add_ons(EthereumAddOns::default())
+        .launch()
+        .await?;
+    println!(
+        "      Reth up; chain id = {}",
+        node.chain_spec().chain.id()
+    );
+
+    // 2. LiveRethEvmBridge against the live node's provider.
+    println!("[2/6] constructing LiveRethEvmBridge against node provider…");
+    let bridge = Arc::new(LiveRethEvmBridge::new(node.provider.clone(), chain_spec));
+
+    // 3. Consensus node with single-validator set (fresh keypair).
+    println!("[3/6] generating Ed25519 keypair + single-validator set…");
+    let private = PrivateKey::generate(OsRng);
+    let public = private.public_key();
+    let digest = Sha256::digest(public.as_bytes());
+    let mut addr_bytes = [0u8; 20];
+    addr_bytes.copy_from_slice(&digest[12..32]);
+    let address = openhl_consensus::types::OpenHlAddress(addr_bytes);
+    let validator_set = openhl_consensus::types::OpenHlValidatorSet::new(vec![
+        openhl_consensus::types::OpenHlValidator::new(address, public, 1),
+    ]);
+
+    let home_tmp = tempfile::tempdir()?;
+    let consensus_node = openhl_consensus::OpenHlNode::new(
+        private,
+        validator_set.clone(),
+        home_tmp.path().to_path_buf(),
+        "openhl-reth-devnet",
+    );
+
+    // 4. Start the Malachite actor system.
+    println!("[4/6] starting Malachite actor system…");
+    let handle = consensus_node.start().await?;
+
+    // 5. Take the engine's AppMsg channels.
+    println!("[5/6] taking engine AppMsg channels…");
+    let channels = handle
+        .take_channels()
+        .await
+        .ok_or_else(|| eyre::eyre!("channels already taken"))?;
+
+    // 6. Drive run_engine_app for N decisions.
+    //
+    // NOTE: at the moment the consensus engine's `current_parent`
+    // starts as `BlockHash([0u8; 32])` (hard-coded in `run_engine_app`),
+    // which does not match Reth's runtime-computed genesis hash. The
+    // first `build_payload` therefore fails with "provider has no
+    // block with hash 0x0…0". Stage 13d will plumb the actual genesis
+    // hash through. For Stage 13c we surface the error as a known
+    // boot-ceremony milestone rather than masking it.
+    println!("[6/6] driving run_engine_app for {rounds} decision(s)…");
+    let bridge_for_engine = bridge.clone();
+    let validator_set_for_engine = validator_set.clone();
+    let rounds_usize = usize::try_from(rounds)
+        .map_err(|_| eyre::eyre!("rounds value too large for usize on this target"))?;
+    let app_task = tokio::spawn(async move {
+        run_engine_app(
+            bridge_for_engine,
+            channels,
+            validator_set_for_engine,
+            rounds_usize,
+        )
+        .await
+    });
+
+    #[allow(clippy::duration_suboptimal_units)]
+    let timeout = std::time::Duration::from_secs(60);
+    let app_result = tokio::time::timeout(timeout, app_task)
+        .await
+        .map_err(|_| eyre::eyre!("run_engine_app timed out after 60s"))?
+        .map_err(|e| eyre::eyre!("run_engine_app task panicked: {e}"))?;
+
+    match app_result {
+        Ok(decisions) => {
+            for (idx, hash) in decisions.iter().enumerate() {
+                println!(
+                    "decision {}: {} via reth-backed bridge",
+                    idx + 1,
+                    short_hash(hash)
+                );
+            }
+            println!(
+                "reth-devnet complete: {} decision(s) committed",
+                decisions.len()
+            );
+        }
+        Err(e) => {
+            // Expected at Stage 13c — see the NOTE above and the
+            // module-level doc. Surface as a structured message,
+            // not a panic.
+            println!("run_engine_app halted: {e}");
+            println!(
+                "(this is the expected Stage 13c boundary — boot ceremony \
+                  through step 5 succeeded; block production awaits Stage 13d)"
+            );
+        }
+    }
+
+    // Clean shutdown regardless of the result above — proves the
+    // teardown path works even when block production stops short.
+    println!("shutting down consensus actor system…");
+    handle.kill(None).await?;
+    println!("reth-devnet teardown complete");
+
+    Ok(())
+}
+
+/// Minimal post-merge dev genesis. Chain ID 2600 mirrors the upstream
+/// reth custom-dev-node example so behaviour can be compared 1:1 if
+/// needed. Same shape `crates/evm` uses in its integration tests.
+fn dev_chain_spec() -> Arc<ChainSpec> {
+    let genesis_json = r#"{
+        "nonce": "0x42",
+        "timestamp": "0x0",
+        "extraData": "0x5343",
+        "gasLimit": "0x5208",
+        "difficulty": "0x400000000",
+        "mixHash": "0x0000000000000000000000000000000000000000000000000000000000000000",
+        "coinbase": "0x0000000000000000000000000000000000000000",
+        "alloc": {},
+        "number": "0x0",
+        "gasUsed": "0x0",
+        "parentHash": "0x0000000000000000000000000000000000000000000000000000000000000000",
+        "config": {
+            "ethash": {},
+            "chainId": 2600,
+            "homesteadBlock": 0,
+            "eip150Block": 0,
+            "eip155Block": 0,
+            "eip158Block": 0,
+            "byzantiumBlock": 0,
+            "constantinopleBlock": 0,
+            "petersburgBlock": 0,
+            "istanbulBlock": 0,
+            "berlinBlock": 0,
+            "londonBlock": 0,
+            "terminalTotalDifficulty": 0,
+            "terminalTotalDifficultyPassed": true,
+            "shanghaiTime": 0
+        }
+    }"#;
+    let genesis: Genesis = serde_json::from_str(genesis_json).expect("dev genesis parses");
+    Arc::new(genesis.into())
+}
+
+fn wallclock_secs() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs())
 }
 
 fn short_hash(h: &BlockHash) -> String {

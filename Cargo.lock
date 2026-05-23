@@ -6208,12 +6208,24 @@ checksum = "c08d65885ee38876c4f86fa503fb49d7b507c2b62552df7c70b2fce627e06381"
 name = "openhl"
 version = "0.1.0"
 dependencies = [
+ "alloy-genesis",
  "eyre",
+ "informalsystems-malachitebft-app",
+ "informalsystems-malachitebft-signing-ed25519",
  "openhl-consensus",
  "openhl-evm",
  "openhl-funding",
  "openhl-node",
  "openhl-types",
+ "rand 0.8.6",
+ "reth-chainspec",
+ "reth-node-builder",
+ "reth-node-core",
+ "reth-node-ethereum",
+ "reth-tasks",
+ "serde_json",
+ "sha2 0.10.9",
+ "tempfile",
  "tokio",
 ]
 
