@@ -6,8 +6,10 @@
 //! reach the same [`MarginHealth`] from the same inputs; if two validators
 //! classify the same account differently, the chain forks. Stage 10b adds
 //! a single stateful primitive — [`InsuranceFund`] — that the bridge owns
-//! and mutates on liquidation events; deterministic by construction (no
-//! floats, saturating integer math).
+//! and mutates on liquidation events; Stage 10c adds the
+//! [`LiquidationScanner`] orchestrator; Stage 10d adds [`execute_adl`] as
+//! the Layer-3 fallback when the insurance fund can't cover everything.
+//! All deterministic by construction (no floats, saturating integer math).
 //!
 //! ### Hyperliquid-shape liquidation, in one paragraph
 //!
@@ -34,18 +36,28 @@
 //!     [`compute::solvent_close_outcome`], and
 //!     [`compute::underwater_close_outcome`] for the per-close
 //!     credit/debit decomposition.
-//!   - **Stage 10c (this commit)** — multi-account scanner
-//!     ([`LiquidationScanner`]) that iterates over `&[AccountSnapshot]`,
-//!     classifies each, generates close orders for the CLOB, applies
-//!     insurance-fund deposits / withdraws, and surfaces any unfilled
-//!     deficit via [`ScanReport::unfilled_deficit`].
+//!   - **Stage 10c** — multi-account scanner ([`LiquidationScanner`])
+//!     that iterates over `&[AccountSnapshot]`, classifies each,
+//!     generates close orders for the CLOB, applies insurance-fund
+//!     deposits / withdraws, and surfaces any unfilled deficit via
+//!     [`ScanReport::unfilled_deficit`].
+//!   - **Stage 10d (this commit)** — auto-deleveraging
+//!     ([`execute_adl`]) as the Layer-3 fallback when the insurance
+//!     fund can't absorb the entire shortfall. Ranks profitable
+//!     counter-positions by `(pnl_pct × leverage)`, force-closes them
+//!     in order, applies a haircut to each winner's unrealized `PnL`
+//!     until the deficit is absorbed.
 //!
-//! Auto-deleveraging (ADL), the fallback path when the insurance fund is
-//! exhausted, is intentionally out of scope. The
-//! [`WithdrawOutcome::PartiallyDrained`] and [`WithdrawOutcome::Depleted`]
-//! variants surface the unfilled deficit at the fund layer;
-//! [`ScanReport::unfilled_deficit`] aggregates it at the scan layer. A
-//! later Stage 10d would consume that to drive ADL ranking.
+//! The composition pattern the bridge follows each block:
+//!   1. `scanner.scan(&accounts, mark)` → `ScanReport`.
+//!   2. Apply each `record.close_order` against the CLOB.
+//!   3. If `report.unfilled_deficit > 0`, call
+//!      `execute_adl(&remaining_accounts, mark, report.unfilled_deficit)`
+//!      and apply each [`AdlRecord`] as a bookkeeping mutation (NOT
+//!      orderbook; ADL bypasses matching).
+//!   4. If the [`AdlReport::deficit_remaining`] is still positive, the
+//!      chain has reached an unresolvable state — halt or accept the
+//!      residual as protocol loss per the deployment's policy.
 //!
 //! ### Why fixed-point integers, not floats
 //!
@@ -54,11 +66,13 @@
 //! ratios, and the `i64 + saturating arithmetic` discipline from the
 //! funding crate for all intermediate products.
 
+pub mod adl;
 pub mod compute;
 pub mod insurance;
 pub mod scanner;
 pub mod types;
 
+pub use adl::{adl_score, execute_adl, AdlRecord, AdlReport, AdlScore};
 pub use compute::{
     account_equity, close_order_spec, liquidation_fee, margin_health, margin_ratio,
     notional_value, solvent_close_outcome, underwater_close_outcome, unrealized_pnl,

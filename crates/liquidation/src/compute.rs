@@ -144,7 +144,10 @@ pub fn close_order_spec(snapshot: &AccountSnapshot) -> CloseOrderSpec {
 /// product can exceed `i64::MAX` at network-pathological inputs.
 /// Saturation, not wrapping — see the module-doc note on why panicking
 /// would be a worse failure mode.
-fn saturate_i128_to_i64(v: i128) -> i64 {
+///
+/// `pub(crate)` so the `adl` module can reuse it for ADL-score
+/// computation (Stage 10d).
+pub(crate) fn saturate_i128_to_i64(v: i128) -> i64 {
     i64::try_from(v).unwrap_or(if v > 0 { i64::MAX } else { i64::MIN })
 }
 
