@@ -6302,6 +6302,10 @@ version = "0.1.0"
 [[package]]
 name = "openhl-oracle"
 version = "0.1.0"
+dependencies = [
+ "openhl-funding",
+ "proptest",
+]
 
 [[package]]
 name = "openhl-types"

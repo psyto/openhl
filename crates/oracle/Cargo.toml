@@ -8,6 +8,10 @@ repository   = { workspace = true }
 authors      = { workspace = true }
 
 [dependencies]
+openhl-funding = { path = "../funding" }
+
+[dev-dependencies]
+proptest = { workspace = true }
 
 [lints]
 workspace = true
