@@ -13,15 +13,21 @@
 //!     consensus `OpenHlNode::start`, then `run_engine_app` to drive
 //!     consensus decisions. Stage 13c.
 //!
-//!     **Known limitation (resolved in Stage 13d):** the consensus
-//!     engine's hard-coded initial parent (`BlockHash([0u8; 32])`)
-//!     does not match Reth's actual genesis hash. The first
-//!     `build_payload` against `LiveRethEvmBridge` therefore fails
-//!     with "provider has no block with hash 0x0…0". The boot
-//!     ceremony itself works end-to-end (steps 1-5 below); only
-//!     step 6 surfaces the parent-hash mismatch. Stage 13d will
-//!     extend the consensus crate's API to accept a seed parent from
-//!     the bridge (`provider.canonical_head()`), closing the gap.
+//!     Stage 13d closes the genesis-hash gap: `run_engine_app` now
+//!     takes an `initial_parent: BlockHash`, so `reth-devnet` passes
+//!     Reth's actual `ChainSpec::genesis_hash()` through and the
+//!     first `build_payload` finds its parent block in Reth's
+//!     provider. `openhl reth-devnet 1` produces one real
+//!     Reth-committed block end-to-end.
+//!
+//!     `reth-devnet N` for `N > 1` still halts after the first block.
+//!     The block-2 `build_payload` looks up block-1's hash via
+//!     `provider.sealed_header_by_hash`, but `LiveRethEvmBridge::commit`
+//!     doesn't yet upload the committed block to Reth's database
+//!     (the bridge keeps it in its own internal `chain` map). Closing
+//!     that gap is Stage 13e (or a Stage 8e in the bridge itself):
+//!     bridge.commit needs to submit `engine_newPayload` +
+//!     `engine_forkchoiceUpdated` so Reth's provider sees the block.
 //!
 //! Examples:
 //!   $ openhl                        # equivalent to `openhl info`
@@ -204,6 +210,7 @@ async fn run_devnet(rounds: u64) -> eyre::Result<()> {
 ///   6. Spawn `run_engine_app(bridge, channels, validator_set, rounds)`
 ///      to drive `rounds` decisions then exit.
 ///   7. Clean shutdown of the consensus node.
+#[allow(clippy::too_many_lines)] // 6-step boot ceremony — flat for readability
 async fn run_reth_devnet(rounds: u64) -> eyre::Result<()> {
     println!(
         "openhl v{} — driving {} reth-backed decision{}",
@@ -235,7 +242,17 @@ async fn run_reth_devnet(rounds: u64) -> eyre::Result<()> {
 
     // 2. LiveRethEvmBridge against the live node's provider.
     println!("[2/6] constructing LiveRethEvmBridge against node provider…");
+    // Capture the genesis hash *before* moving chain_spec into the bridge —
+    // run_engine_app needs it as the initial parent of its first decision
+    // (Stage 13d gap closure).
+    let genesis_hash_bytes: [u8; 32] = chain_spec.genesis_hash().into();
+    let genesis_parent = BlockHash(genesis_hash_bytes);
     let bridge = Arc::new(LiveRethEvmBridge::new(node.provider.clone(), chain_spec));
+    println!(
+        "      genesis hash = 0x{}…{}",
+        hex_prefix(&genesis_hash_bytes, 4),
+        hex_suffix(&genesis_hash_bytes, 4),
+    );
 
     // 3. Consensus node with single-validator set (fresh keypair).
     println!("[3/6] generating Ed25519 keypair + single-validator set…");
@@ -268,15 +285,9 @@ async fn run_reth_devnet(rounds: u64) -> eyre::Result<()> {
         .await
         .ok_or_else(|| eyre::eyre!("channels already taken"))?;
 
-    // 6. Drive run_engine_app for N decisions.
-    //
-    // NOTE: at the moment the consensus engine's `current_parent`
-    // starts as `BlockHash([0u8; 32])` (hard-coded in `run_engine_app`),
-    // which does not match Reth's runtime-computed genesis hash. The
-    // first `build_payload` therefore fails with "provider has no
-    // block with hash 0x0…0". Stage 13d will plumb the actual genesis
-    // hash through. For Stage 13c we surface the error as a known
-    // boot-ceremony milestone rather than masking it.
+    // 6. Drive run_engine_app for N decisions, seeded with Reth's
+    //    actual genesis hash so the first `build_payload` finds its
+    //    parent block in the database.
     println!("[6/6] driving run_engine_app for {rounds} decision(s)…");
     let bridge_for_engine = bridge.clone();
     let validator_set_for_engine = validator_set.clone();
@@ -287,6 +298,7 @@ async fn run_reth_devnet(rounds: u64) -> eyre::Result<()> {
             bridge_for_engine,
             channels,
             validator_set_for_engine,
+            genesis_parent,
             rounds_usize,
         )
         .await
@@ -314,14 +326,7 @@ async fn run_reth_devnet(rounds: u64) -> eyre::Result<()> {
             );
         }
         Err(e) => {
-            // Expected at Stage 13c — see the NOTE above and the
-            // module-level doc. Surface as a structured message,
-            // not a panic.
-            println!("run_engine_app halted: {e}");
-            println!(
-                "(this is the expected Stage 13c boundary — boot ceremony \
-                  through step 5 succeeded; block production awaits Stage 13d)"
-            );
+            println!("run_engine_app halted with error: {e}");
         }
     }
 
@@ -385,6 +390,24 @@ fn short_hash(h: &BlockHash) -> String {
         let _ = write!(s, "{b:02x}");
     }
     s.push('…');
+    s
+}
+
+fn hex_prefix(bytes: &[u8; 32], n: usize) -> String {
+    use std::fmt::Write as _;
+    let mut s = String::with_capacity(n * 2);
+    for b in &bytes[..n] {
+        let _ = write!(s, "{b:02x}");
+    }
+    s
+}
+
+fn hex_suffix(bytes: &[u8; 32], n: usize) -> String {
+    use std::fmt::Write as _;
+    let mut s = String::with_capacity(n * 2);
+    for b in &bytes[32 - n..] {
+        let _ = write!(s, "{b:02x}");
+    }
     s
 }
 

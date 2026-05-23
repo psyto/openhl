@@ -25,18 +25,28 @@ const APP_REPLY_WAIT_LOG: &str = "engine_app: peer replied unsuccessfully (chann
 ///
 /// Returns the `BlockHash`es that were decided, in order. Single-validator mode
 /// uses this with `stop_after_decisions = 1` to exit after the first block.
+///
+/// `initial_parent` is the `BlockHash` of the block this engine should
+/// build on top of for its first decision. For a fresh chain, this is
+/// the execution-layer's genesis hash — `bin/openhl reth-devnet` queries
+/// it from `ChainSpec::genesis_hash()` (Stage 13d). For a chain restart,
+/// callers pass the last decided hash from prior consensus state. Stub
+/// bridges that don't validate parent hashes (e.g., in unit tests) can
+/// pass `BlockHash([0u8; 32])` and the engine will happily build on the
+/// zero hash.
 #[allow(clippy::too_many_lines)] // 12 AppMsg arms — laid out flat for lesson L11's match-by-match walk
 pub async fn run_engine_app<B>(
     bridge: Arc<B>,
     mut channels: Channels<OpenHlContext>,
     validator_set: OpenHlValidatorSet,
+    initial_parent: BlockHash,
     stop_after_decisions: usize,
 ) -> eyre::Result<Vec<BlockHash>>
 where
     B: ConsensusBridge + 'static,
 {
     let mut decided: Vec<BlockHash> = Vec::new();
-    let mut current_parent = BlockHash([0u8; 32]);
+    let mut current_parent = initial_parent;
     let mut current_height = OpenHlHeight::INITIAL;
 
     while let Some(msg) = channels.consensus.recv().await {
@@ -257,7 +267,13 @@ mod tests {
         let bridge = Arc::new(StubBridge::default());
         let bridge_for_check = bridge.clone();
 
-        let app_task = tokio::spawn(run_engine_app(bridge, channels, validator_set, 1));
+        let app_task = tokio::spawn(run_engine_app(
+            bridge,
+            channels,
+            validator_set,
+            BlockHash([0u8; 32]),
+            1,
+        ));
 
         let decisions = tokio::time::timeout(Duration::from_secs(15), app_task)
             .await
