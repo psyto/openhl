@@ -54,6 +54,9 @@ cargo test
 
 Requires Rust 1.85+ (pinned via `rust-toolchain.toml`).
 
+For environment-sensitive diagnostics and manual integration checks, see
+[`docs/testing.md`](docs/testing.md).
+
 ## License
 
 Dual-licensed under [MIT](LICENSE-MIT) and [Apache-2.0](LICENSE-APACHE), at your option.

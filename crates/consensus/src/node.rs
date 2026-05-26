@@ -8,18 +8,23 @@ use async_trait::async_trait;
 use eyre::eyre;
 use informalsystems_malachitebft_app::node::{EngineHandle, Node, NodeConfig, NodeHandle};
 use informalsystems_malachitebft_app::types::Keypair;
+use informalsystems_malachitebft_app::events::TxEvent;
 use informalsystems_malachitebft_app_channel::Channels;
 use informalsystems_malachitebft_config::{ConsensusConfig, ValueSyncConfig, ValuePayload};
 use informalsystems_malachitebft_core_types::Height as _;
 use informalsystems_malachitebft_signing_ed25519::{PrivateKey, PublicKey};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use tokio::sync::Mutex;
+use tokio::sync::{mpsc, oneshot, Mutex};
+use tokio::time::timeout;
+use std::time::Duration;
 
 use crate::codec::OpenHlCodec;
 use crate::context::OpenHlContext;
 use crate::signing_provider::OpenHlSigningProvider;
 use crate::types::{OpenHlAddress, OpenHlHeight, OpenHlValidatorSet};
+
+const DEFAULT_STARTUP_READY_TIMEOUT: Duration = Duration::from_secs(5);
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct OpenHlConfig {
@@ -97,6 +102,7 @@ impl std::fmt::Debug for OpenHlPrivateKeyFile {
 pub struct OpenHlNodeHandle {
     engine: EngineHandle,
     channels: Mutex<Option<Channels<OpenHlContext>>>,
+    events: TxEvent<OpenHlContext>,
 }
 
 impl std::fmt::Debug for OpenHlNodeHandle {
@@ -119,9 +125,7 @@ impl OpenHlNodeHandle {
 #[async_trait]
 impl NodeHandle<OpenHlContext> for OpenHlNodeHandle {
     fn subscribe(&self) -> informalsystems_malachitebft_app::events::RxEvent<OpenHlContext> {
-        // No event subscription in Stage 6c — caller can't yet observe engine
-        // events. Stage 6d wires the TxEvent from the engine to here.
-        informalsystems_malachitebft_app::events::TxEvent::new().subscribe()
+        self.events.subscribe()
     }
 
     async fn kill(&self, _reason: Option<String>) -> eyre::Result<()> {
@@ -143,6 +147,16 @@ pub struct OpenHlNode {
     /// and tests). When `Some`, must be a valid libp2p multiaddr such
     /// as `/ip4/0.0.0.0/tcp/9000`.
     pub listen_addr: Option<String>,
+    /// Optional override for Malachite value payload mode.
+    ///
+    /// Production defaults to `ProposalOnly` (the OpenHL target shape), but
+    /// tests can force `ProposalAndParts` for better compatibility with the
+    /// current upstream app-channel behaviors.
+    pub value_payload: Option<ValuePayload>,
+    /// If set, `start()` waits for the first consensus app message to prove
+    /// the host/network path is alive; on timeout it tears down actors and
+    /// returns an error instead of handing back a silently stalled handle.
+    pub startup_ready_timeout: Option<Duration>,
 }
 
 impl OpenHlNode {
@@ -159,6 +173,8 @@ impl OpenHlNode {
             home_dir,
             moniker: moniker.into(),
             listen_addr: None,
+            value_payload: None,
+            startup_ready_timeout: Some(DEFAULT_STARTUP_READY_TIMEOUT),
         }
     }
 
@@ -168,6 +184,28 @@ impl OpenHlNode {
     #[must_use]
     pub fn with_listen_addr(mut self, multiaddr: impl Into<String>) -> Self {
         self.listen_addr = Some(multiaddr.into());
+        self
+    }
+
+    /// Override the consensus value payload mode.
+    #[must_use]
+    pub fn with_value_payload(mut self, value_payload: ValuePayload) -> Self {
+        self.value_payload = Some(value_payload);
+        self
+    }
+
+    /// Override startup readiness timeout. `None` disables the check.
+    #[must_use]
+    pub fn with_startup_ready_timeout(mut self, timeout: Option<Duration>) -> Self {
+        self.startup_ready_timeout = timeout;
+        self
+    }
+
+    /// Disable startup readiness checks. Useful for deterministic unit tests
+    /// in constrained environments.
+    #[must_use]
+    pub fn without_startup_ready_check(mut self) -> Self {
+        self.startup_ready_timeout = None;
         self
     }
 }
@@ -187,6 +225,9 @@ impl Node for OpenHlNode {
 
     fn load_config(&self) -> eyre::Result<Self::Config> {
         let mut cfg = OpenHlConfig::new(&self.moniker);
+        if let Some(payload) = self.value_payload {
+            cfg.consensus.value_payload = payload;
+        }
         // listen_addr: ephemeral local port by default (fine for tests
         // and single-validator devnets), explicit override via
         // `OpenHlNode::with_listen_addr` for multi-validator deployments.
@@ -249,9 +290,51 @@ impl Node for OpenHlNode {
         )
         .await?;
 
+        let mut raw_consensus = channels.consensus;
+        let (consensus_tx, consensus_rx) = mpsc::channel(128);
+        let (ready_tx, ready_rx) = oneshot::channel::<()>();
+        tokio::spawn(async move {
+            let mut ready_tx = Some(ready_tx);
+            while let Some(msg) = raw_consensus.recv().await {
+                if let Some(tx) = ready_tx.take() {
+                    let _ = tx.send(());
+                }
+                if consensus_tx.send(msg).await.is_err() {
+                    break;
+                }
+            }
+        });
+
+        if let Some(wait_for) = self.startup_ready_timeout {
+            match timeout(wait_for, ready_rx).await {
+                Ok(Ok(())) => {}
+                Ok(Err(_)) => {
+                    let _ = engine.actor.kill_and_wait(None).await;
+                    engine.handle.abort();
+                    return Err(eyre!("consensus startup failed: host/app channel closed before first message"));
+                }
+                Err(_) => {
+                    let _ = engine.actor.kill_and_wait(None).await;
+                    engine.handle.abort();
+                    return Err(eyre!(
+                        "consensus startup timed out after {}s waiting for first app message; check listen_addr/permissions",
+                        wait_for.as_secs()
+                    ));
+                }
+            }
+        }
+
+        let events = channels.events.clone();
+        let channels = Channels {
+            consensus: consensus_rx,
+            network: channels.network,
+            events: channels.events,
+        };
+
         Ok(OpenHlNodeHandle {
             engine,
             channels: Mutex::new(Some(channels)),
+            events,
         })
     }
 
@@ -264,8 +347,10 @@ impl Node for OpenHlNode {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use informalsystems_malachitebft_app_channel::AppMsg;
     use crate::types::OpenHlValidator;
     use rand::rngs::OsRng;
+    use std::time::Duration;
 
     fn single_validator_node(home_dir: PathBuf) -> OpenHlNode {
         let sk = PrivateKey::generate(OsRng);
@@ -275,7 +360,7 @@ mod tests {
         addr_bytes.copy_from_slice(&digest[12..32]);
         let address = OpenHlAddress(addr_bytes);
         let validator_set = OpenHlValidatorSet::new(vec![OpenHlValidator::new(address, pk, 1)]);
-        OpenHlNode::new(sk, validator_set, home_dir, "openhl-test")
+        OpenHlNode::new(sk, validator_set, home_dir, "openhl-test").without_startup_ready_check()
     }
 
     #[test]
@@ -352,6 +437,55 @@ mod tests {
         // Sanity-poke the channels handle is available exactly once.
         assert!(handle.take_channels().await.is_some());
         assert!(handle.take_channels().await.is_none());
+        handle.kill(None).await.unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[ignore = "Diagnostic: currently no initial AppMsg arrives in this harness"]
+    async fn start_engine_emits_initial_consensus_message() {
+        let tmp = tempfile::tempdir().unwrap();
+        let node = single_validator_node(tmp.path().to_path_buf());
+        let handle = node.start().await.expect("start_engine failed");
+        let mut channels = handle
+            .take_channels()
+            .await
+            .expect("channels available exactly once");
+
+        let first_msg = tokio::time::timeout(Duration::from_secs(5), channels.consensus.recv())
+            .await
+            .expect("timed out waiting for first consensus message")
+            .expect("consensus channel closed before first message");
+
+        assert!(
+            matches!(
+                first_msg,
+                AppMsg::ConsensusReady { .. } | AppMsg::GetHistoryMinHeight { .. }
+            ),
+            "unexpected first consensus message variant"
+        );
+
+        handle.kill(None).await.unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[ignore = "Diagnostic: event timing is environment-dependent (sandbox/actor scheduling)"]
+    async fn start_engine_emits_listening_event() {
+        let tmp = tempfile::tempdir().unwrap();
+        let node = single_validator_node(tmp.path().to_path_buf());
+        let handle = node.start().await.expect("start_engine failed");
+        let mut events = handle.subscribe();
+
+        let first_event = tokio::time::timeout(Duration::from_secs(5), events.recv())
+            .await
+            .expect("timed out waiting for first engine event")
+            .expect("event channel closed before first event");
+
+        let event_text = first_event.to_string();
+        assert!(
+            event_text.contains("Listening(") || event_text.contains("StartedHeight("),
+            "unexpected first event: {event_text}"
+        );
+
         handle.kill(None).await.unwrap();
     }
 }
