@@ -139,6 +139,35 @@ where
                 certificate, reply, ..
             } => {
                 let hash = certificate.value_id;
+
+                // Stage 13n: follower-side bridge replication via
+                // deterministic recompute. The proposer's `GetValue`
+                // already populated its bridge's pending map for this
+                // height; the follower never called `build_payload` and
+                // would error in `commit` with "unknown hash". Rerunning
+                // `build_payload(current_parent, default_attrs())` here
+                // is safe because v0 payload building is a pure function
+                // of (parent, attrs): the timestamp falls out as
+                // `parent.timestamp + 1`, gas_limit/state_root copy from
+                // parent, base_fee is computed from the chain spec.
+                // Proposer-side: this is a benign duplicate insert in
+                // `pending` keyed on a fresh payload id; `commit` looks
+                // up by hash and finds the earlier entry.
+                // Once real EVM execution + mempool transactions land,
+                // payload building stops being deterministic — that
+                // stage replaces this with proposal-parts streaming.
+                let id = bridge.build_payload(current_parent, default_attrs()).await?;
+                let block = bridge.payload_ready(id).await?;
+                if block.hash != hash {
+                    return Err(eyre!(
+                        "Stage 13n: deterministic build_payload mismatch — \
+                         consensus decided {hash:?} but our recompute yielded {recomputed:?}; \
+                         the proposer's attrs or parent state diverged from ours",
+                        hash = hash,
+                        recomputed = block.hash,
+                    ));
+                }
+
                 bridge.commit(hash).await?;
                 decided.push(hash);
                 current_parent = hash;
