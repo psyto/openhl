@@ -19,11 +19,14 @@ informalsystems-malachitebft-core-consensus  = { workspace = true }
 informalsystems-malachitebft-app             = { workspace = true }
 informalsystems-malachitebft-app-channel     = { workspace = true }
 informalsystems-malachitebft-config          = { workspace = true }
+informalsystems-malachitebft-sync            = { workspace = true }
+informalsystems-malachitebft-engine          = { workspace = true }
 informalsystems-malachitebft-signing-ed25519 = { workspace = true, features = ["rand", "serde"] }
-bytes                                         = "1"
+bytes                                         = { version = "1", features = ["serde"] }
 rand                                          = "0.8"
 sha2                                          = "0.10"
 serde                                         = { workspace = true }
+serde_json                                    = { workspace = true }
 tokio                                         = { workspace = true }
 tracing                                       = { workspace = true }
 

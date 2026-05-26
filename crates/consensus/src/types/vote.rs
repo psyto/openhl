@@ -2,11 +2,12 @@ use informalsystems_malachitebft_core_types::{
     NilOrVal, Round, SignedExtension, VoteType, Vote as VoteTrait,
 };
 use openhl_types::BlockHash;
+use serde::{Deserialize, Serialize};
 
 use crate::context::OpenHlContext;
 use crate::types::{OpenHlAddress, OpenHlHeight};
 
-#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub struct OpenHlVote {
     pub height: OpenHlHeight,
     pub round: Round,

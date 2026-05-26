@@ -4392,6 +4392,7 @@ dependencies = [
  "bytes",
  "derive-where",
  "informalsystems-malachitebft-peer",
+ "serde",
  "thiserror 2.0.18",
 ]
 
@@ -6233,6 +6234,8 @@ dependencies = [
  "sha2 0.10.9",
  "tempfile",
  "tokio",
+ "tracing",
+ "tracing-subscriber 0.3.23",
 ]
 
 [[package]]
@@ -6259,10 +6262,13 @@ dependencies = [
  "informalsystems-malachitebft-core-consensus",
  "informalsystems-malachitebft-core-driver",
  "informalsystems-malachitebft-core-types",
+ "informalsystems-malachitebft-engine",
  "informalsystems-malachitebft-signing-ed25519",
+ "informalsystems-malachitebft-sync",
  "openhl-types",
  "rand 0.8.6",
  "serde",
+ "serde_json",
  "sha2 0.10.9",
  "tempfile",
  "thiserror 1.0.69",

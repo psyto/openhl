@@ -1,9 +1,10 @@
 use core::fmt;
 
 use informalsystems_malachitebft_core_types::Height;
+use serde::{Deserialize, Serialize};
 
 /// Block height — a monotonic u64 counter.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub struct OpenHlHeight(pub u64);
 
 impl fmt::Display for OpenHlHeight {

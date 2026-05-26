@@ -1,9 +1,10 @@
 use core::fmt;
 
 use informalsystems_malachitebft_core_types::Address;
+use serde::{Deserialize, Serialize};
 
 /// A 20-byte validator address, Ethereum convention.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub struct OpenHlAddress(pub [u8; 20]);
 
 impl fmt::Display for OpenHlAddress {

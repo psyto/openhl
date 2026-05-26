@@ -1,9 +1,10 @@
 use informalsystems_malachitebft_core_types::{Proposal, Round};
+use serde::{Deserialize, Serialize};
 
 use crate::context::OpenHlContext;
 use crate::types::{OpenHlAddress, OpenHlHeight, OpenHlValue};
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct OpenHlProposal {
     pub height: OpenHlHeight,
     pub round: Round,
