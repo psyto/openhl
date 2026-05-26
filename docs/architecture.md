@@ -10,8 +10,9 @@ openhl is a single Rust binary composed of two cleanly-separated halves:
 Plus three pure state-machine subsystems that the EL composes:
 
 - **CLOB** (`crates/clob`) — orderbook matching engine. Pure, deterministic, replayable.
-- **Settlement** (`crates/funding`, `crates/oracle`, `crates/liquidation`) — funding rates, mark prices, liquidations. `funding` is complete (Stage 8b); `liquidation` ships in three sub-stages — 10a (margin math, complete) → 10b (insurance fund, pending) → 10c (multi-account scanner, pending); `oracle` is still pending.
-- **Vault** (`crates/vault`) — protocol-native vault primitive for strategy products.
+- **Settlement** (`crates/funding`, `crates/oracle`, `crates/liquidation`) — funding rates, mark prices, liquidations. `funding` (Stage 8b), `liquidation` (10a margin math → 10b insurance fund → 10c multi-account scanner → 10d ADL), and `oracle` (11 aggregation → 11b signed observations) are all complete; each runs deterministically per block via the integration coordinator (Stages 14a–15d).
+- **Vault** (`crates/vault`) — protocol-native vault primitive for strategy products. Shipped at Stage 12 (share-based collateral pooling); marked-to-market per block (Stage 14a).
+- **Integration coordinator** (`crates/node` — `OpenHlNode::tick`) — composes the pure subsystems above into one deterministic per-block routine: oracle refresh → liquidation scan → ADL absorption → vault mark-to-market → funding settlement. Driven from `LiveRethEvmBridge`'s commit path in `bin/openhl reth-devnet` (Stages 14a–15d); produces a `TickReport` whose fields the bridge applies back to per-account state.
 
 ## The CL/EL contract
 
