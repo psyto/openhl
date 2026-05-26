@@ -53,7 +53,8 @@ use openhl_consensus::OpenHlPrivateKeyFile;
 use openhl_clob::{AccountId as ClobAccountId, Order, OrderId, OrderType, Price, Qty, Side};
 use openhl_evm::{BridgeSnapshot, InMemoryEvmBridge, LiveRethEvmBridge, OpenHlExecutorBuilder};
 use k256::ecdsa::{signature::Signer, SigningKey};
-use openhl_funding::{IndexPrice, MarkPrice};
+use openhl_funding::{IndexPrice, MarkPrice, Notional, PositionSize};
+use openhl_liquidation::AccountSnapshot;
 use openhl_node::{OpenHlNode, OpenHlNodeConfig, TickInput, TickReport};
 use openhl_oracle::{FeedId, PriceObservation, PublisherKey, Signature as OracleSignature};
 use openhl_types::BlockHash;
@@ -705,9 +706,23 @@ async fn run_reth_devnet(
     });
     println!("      seeded clob bids/asks at 100/102 (mid 101)");
 
+    // Stage 14d: synthetic per-account snapshots. The bridge in a real
+    // perp-DEX would maintain these by applying CLOB fills + funding
+    // settlements per fill — that clearing layer is its own future
+    // stage. Until then we hand the scan a deterministic set: one
+    // healthy, one liquidatable, one underwater (see `synthetic_accounts`
+    // for the math). Both validators run the same function so both
+    // arrive at the same `ScanReport`.
+    let accounts = Arc::new(synthetic_accounts());
+    println!(
+        "      synthetic accounts = {} (healthy + liquidatable + underwater)",
+        accounts.len(),
+    );
+
     let coordinator_for_hook = coordinator.clone();
     let publishers_for_hook = publishers.clone();
     let bridge_for_hook = bridge.clone();
+    let accounts_for_hook = accounts.clone();
     let app_task = tokio::spawn(async move {
         run_engine_app(
             bridge_for_engine,
@@ -758,7 +773,7 @@ async fn run_reth_devnet(
                     block_height: height.0,
                     block_time,
                     mark,
-                    account_snapshots: &[],
+                    account_snapshots: accounts_for_hook.as_slice(),
                     vault_total_assets,
                 });
                 println!("  mark = {} ({mark_source})", mark.0);
@@ -1048,6 +1063,45 @@ const SYNTHETIC_FEEDS: &[(u32, u8, u64)] = &[
     (2, 2, 102),
     (3, 3, 103),
 ];
+
+/// Stage 14d synthetic accounts. With mark=101 and the default
+/// `LiquidationParams` (initial 10%, maintenance 2%) every validator's
+/// per-block scan should classify these the same way:
+///
+///   - account 10: long 10 @ 100, collateral 200 → healthy
+///       equity ≈ 200 + (101−100)·10 = 210, ratio 210/1010 ≈ 21% > 10%
+///
+///   - account 20: long 10 @ 100, collateral 30 → liquidatable
+///       equity ≈ 40, ratio ≈ 4% (between 2% and 10%)
+///
+///   - account 30: short 100 @ 50, collateral 100 → underwater
+///       equity ≈ 100 + (50−101)·100 = −5000 → negative equity
+///
+/// Same determinism story as the publishers and book seeds: every
+/// validator runs this same data through the same scan and arrives
+/// at the same `ScanReport`.
+fn synthetic_accounts() -> Vec<AccountSnapshot> {
+    vec![
+        AccountSnapshot {
+            account: ClobAccountId(10),
+            position_size: PositionSize(10),
+            avg_entry: MarkPrice(100),
+            collateral: Notional(200),
+        },
+        AccountSnapshot {
+            account: ClobAccountId(20),
+            position_size: PositionSize(10),
+            avg_entry: MarkPrice(100),
+            collateral: Notional(30),
+        },
+        AccountSnapshot {
+            account: ClobAccountId(30),
+            position_size: PositionSize(-100),
+            avg_entry: MarkPrice(50),
+            collateral: Notional(100),
+        },
+    ]
+}
 
 fn short_hash(h: &BlockHash) -> String {
     use std::fmt::Write as _;

@@ -6222,6 +6222,7 @@ dependencies = [
  "openhl-consensus",
  "openhl-evm",
  "openhl-funding",
+ "openhl-liquidation",
  "openhl-node",
  "openhl-oracle",
  "openhl-types",
