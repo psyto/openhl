@@ -50,6 +50,7 @@ use informalsystems_malachitebft_signing_ed25519::PrivateKey;
 use openhl_consensus::run_engine_app;
 use openhl_consensus::run_single_validator;
 use openhl_consensus::OpenHlPrivateKeyFile;
+use openhl_clob::{AccountId as ClobAccountId, Order, OrderId, OrderType, Price, Qty, Side};
 use openhl_evm::{BridgeSnapshot, InMemoryEvmBridge, LiveRethEvmBridge, OpenHlExecutorBuilder};
 use k256::ecdsa::{signature::Signer, SigningKey};
 use openhl_funding::{IndexPrice, MarkPrice};
@@ -681,8 +682,32 @@ async fn run_reth_devnet(
     );
     let publishers = Arc::new(publishers);
 
+    // Stage 14c: seed the bridge's CLOB with a tight two-sided
+    // book so `bridge.current_mark()` returns a meaningful mid
+    // every tick. Same determinism story as the synthetic
+    // publishers: every validator runs this same code path at
+    // boot, so every validator's book starts at (bid=100, ask=102)
+    // → mark=101. Without these orders the book is empty and the
+    // tick falls back to a stub mark.
+    let _ = bridge.submit_order(Order {
+        id: OrderId(1),
+        account: ClobAccountId(1),
+        side: Side::Buy,
+        qty: Qty(10),
+        order_type: OrderType::Limit { price: Price(100) },
+    });
+    let _ = bridge.submit_order(Order {
+        id: OrderId(2),
+        account: ClobAccountId(2),
+        side: Side::Sell,
+        qty: Qty(10),
+        order_type: OrderType::Limit { price: Price(102) },
+    });
+    println!("      seeded clob bids/asks at 100/102 (mid 101)");
+
     let coordinator_for_hook = coordinator.clone();
     let publishers_for_hook = publishers.clone();
+    let bridge_for_hook = bridge.clone();
     let app_task = tokio::spawn(async move {
         run_engine_app(
             bridge_for_engine,
@@ -720,16 +745,23 @@ async fn run_reth_devnet(
                 }
 
                 let vault_total_assets = node.vault().total_assets().0;
+                // Stage 14c: live CLOB mark from the bridge. Falls back
+                // to MarkPrice(100) only when the book is one-sided or
+                // empty (e.g., if every order has been crossed out).
+                // The fallback keeps the tick running with a stable
+                // value rather than failing on a transient empty book.
+                let (mark, mark_source) = match bridge_for_hook.current_mark() {
+                    Some(m) => (m, "clob"),
+                    None => (MarkPrice(100), "stub-empty-book"),
+                };
                 let report = node.tick(TickInput {
                     block_height: height.0,
                     block_time,
-                    // Stage 14a: stub mark — CLOB mark plumbing lands in a
-                    // later sub-stage. Liquidation scan with no accounts
-                    // is a no-op so any mark works here.
-                    mark: MarkPrice(100),
+                    mark,
                     account_snapshots: &[],
                     vault_total_assets,
                 });
+                println!("  mark = {} ({mark_source})", mark.0);
                 print_tick_report(&report);
                 let _ = hash; // hash currently unused; future stages may want it
                 Ok(())

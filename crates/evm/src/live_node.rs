@@ -166,6 +166,26 @@ impl<P> LiveRethEvmBridge<P> {
             .len()
     }
 
+    /// Current top-of-book mark from the CLOB — the midpoint of
+    /// `(best_bid + best_ask) / 2`, expressed as [`MarkPrice`].
+    ///
+    /// Returns `None` when either side of the book is empty: a one-sided
+    /// book has no midpoint, and the caller (Stage 14c integration
+    /// coordinator) is responsible for the fallback policy. Per the
+    /// `TickInput::mark` docstring on `openhl-node`, the mark is
+    /// strictly CLOB-derived and must **not** be conflated with the
+    /// oracle's aggregated index price.
+    #[must_use]
+    pub fn current_mark(&self) -> Option<openhl_funding::MarkPrice> {
+        let book = self.clob.lock().expect("clob mutex poisoned");
+        let bid = book.best_bid()?;
+        let ask = book.best_ask()?;
+        // Integer midpoint; rounds toward zero. With u64 prices this is
+        // a saturating add but bid + ask can't overflow u64 in any
+        // realistic deployment.
+        Some(openhl_funding::MarkPrice((bid.0 + ask.0) / 2))
+    }
+
     /// Snapshot of the bridge's committed-chain state (Stage 13g).
     ///
     /// Captures only the load-bearing fields for cross-restart resume:
@@ -473,6 +493,43 @@ mod tests {
         }"#;
         let genesis: Genesis = serde_json::from_str(custom_genesis).expect("dev genesis parses");
         Arc::new(genesis.into())
+    }
+
+    /// Stage 14c: `current_mark()` is empty until both sides of the book
+    /// have resting liquidity, then returns the midpoint as a
+    /// [`openhl_funding::MarkPrice`]. Uses `()` as the provider since the
+    /// method only reads from the bridge's `clob` and never touches the
+    /// provider — the trait bound on `ConsensusBridge` doesn't apply to
+    /// inherent methods.
+    #[test]
+    fn current_mark_midpoint_of_two_sided_book() {
+        use openhl_clob::{AccountId, OrderId, OrderType, Price, Qty, Side};
+        use openhl_funding::MarkPrice;
+
+        let bridge = LiveRethEvmBridge::new((), dev_chain_spec());
+
+        // Empty book → no mark.
+        assert_eq!(bridge.current_mark(), None);
+
+        // One-sided book → still no mark (no midpoint defined).
+        bridge.submit_order(Order {
+            id: OrderId(1),
+            account: AccountId(1),
+            side: Side::Buy,
+            qty: Qty(1),
+            order_type: OrderType::Limit { price: Price(99) },
+        });
+        assert_eq!(bridge.current_mark(), None);
+
+        // Two-sided → midpoint of (99, 103) = 101.
+        bridge.submit_order(Order {
+            id: OrderId(2),
+            account: AccountId(2),
+            side: Side::Sell,
+            qty: Qty(1),
+            order_type: OrderType::Limit { price: Price(103) },
+        });
+        assert_eq!(bridge.current_mark(), Some(MarkPrice(101)));
     }
 
     /// END-TO-END Stage 7b: bootstrap a real Reth node, hand its provider to
