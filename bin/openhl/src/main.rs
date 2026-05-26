@@ -54,7 +54,7 @@ use openhl_clob::{AccountId as ClobAccountId, Order, OrderId, OrderType, Price, 
 use openhl_evm::{BridgeSnapshot, InMemoryEvmBridge, LiveRethEvmBridge, OpenHlExecutorBuilder};
 use k256::ecdsa::{signature::Signer, SigningKey};
 use openhl_funding::{IndexPrice, MarkPrice, Notional, PositionSize};
-use openhl_liquidation::AccountSnapshot;
+use openhl_liquidation::{AccountSnapshot, CloseOutcomeKind};
 use openhl_node::{CoordinatorSnapshot, OpenHlNode, OpenHlNodeConfig, TickInput, TickReport};
 use openhl_oracle::{FeedId, PriceObservation, PublisherKey, Signature as OracleSignature};
 use openhl_types::BlockHash;
@@ -856,6 +856,92 @@ async fn run_reth_devnet(
                     }
                 }
 
+                // Stage 15d: apply scan records (full close per
+                // outcome) and then ADL records (partial close + the
+                // counterparty's pnl_paid added to their collateral).
+                // The scanner already mutated the insurance fund
+                // balance inside the coordinator during `scan()` —
+                // we only touch per-account position/collateral here.
+                // The synthetic seed is designed so scan and ADL
+                // never target the same account from one tick (see
+                // `synthetic_accounts`).
+                if !report.liquidation.records.is_empty()
+                    || report
+                        .adl
+                        .as_ref()
+                        .is_some_and(|a| !a.records.is_empty())
+                {
+                    let mut accts = accounts_for_hook
+                        .lock()
+                        .map_err(|_| eyre::eyre!("accounts mutex poisoned"))?;
+                    for rec in &report.liquidation.records {
+                        if let Some(acct) = accts
+                            .iter_mut()
+                            .find(|a| a.account == rec.close_order.account)
+                        {
+                            let prev_coll = acct.collateral.0;
+                            match rec.outcome {
+                                CloseOutcomeKind::Solvent(sc) => {
+                                    acct.position_size = PositionSize(0);
+                                    acct.collateral = Notional(sc.residual_to_account);
+                                    println!(
+                                        "  liquidation apply: account {} closed (solvent) coll {} → {} (fee {} to fund)",
+                                        acct.account.0,
+                                        prev_coll,
+                                        sc.residual_to_account,
+                                        sc.fee_to_fund,
+                                    );
+                                }
+                                CloseOutcomeKind::Underwater(uc) => {
+                                    acct.position_size = PositionSize(0);
+                                    acct.collateral = Notional(0);
+                                    println!(
+                                        "  liquidation apply: account {} closed (underwater) coll {} → 0 (fund covered shortfall {}, fee {})",
+                                        acct.account.0,
+                                        prev_coll,
+                                        uc.shortfall_to_fund,
+                                        uc.fee_to_fund,
+                                    );
+                                }
+                            }
+                        }
+                    }
+                    if let Some(ref ar) = report.adl {
+                        for rec in &ar.records {
+                            if let Some(acct) = accts
+                                .iter_mut()
+                                .find(|a| a.account == rec.close_order.account)
+                            {
+                                let prev_size = acct.position_size.0;
+                                let prev_coll = acct.collateral.0;
+                                let qty = i64::try_from(rec.close_order.qty.0).unwrap_or(i64::MAX);
+                                // close_order.side is the *close*
+                                // side; Sell against a long shrinks
+                                // its positive size, Buy against a
+                                // short shrinks its negative size
+                                // toward zero.
+                                let new_size = match rec.close_order.side {
+                                    Side::Sell => prev_size.saturating_sub(qty),
+                                    Side::Buy => prev_size.saturating_add(qty),
+                                };
+                                acct.position_size = PositionSize(new_size);
+                                acct.collateral =
+                                    Notional(prev_coll.saturating_add(rec.pnl_paid));
+                                println!(
+                                    "  adl apply: account {} size {} → {} coll {} → {} (pnl_paid={}, haircut={})",
+                                    acct.account.0,
+                                    prev_size,
+                                    new_size,
+                                    prev_coll,
+                                    prev_coll.saturating_add(rec.pnl_paid),
+                                    rec.pnl_paid,
+                                    rec.haircut,
+                                );
+                            }
+                        }
+                    }
+                }
+
                 let _ = hash; // hash currently unused; future stages may want it
                 Ok(())
             },
@@ -1185,22 +1271,27 @@ const SYNTHETIC_FEEDS: &[(u32, u8, u64)] = &[
     (3, 3, 103),
 ];
 
-/// Stage 14d synthetic accounts. With mark=101 and the default
-/// `LiquidationParams` (initial 10%, maintenance 2%) every validator's
-/// per-block scan should classify these the same way:
+/// Stage 14d synthetic accounts, revised in Stage 15d so scan and ADL
+/// don't both target the same account from one tick's snapshot. With
+/// mark=101 and the default `LiquidationParams` (initial 10%,
+/// maintenance 2%) every validator's per-block scan should classify:
 ///
-///   - account 10: long 10 @ 100, collateral 200 → healthy
-///       equity ≈ 200 + (101−100)·10 = 210, ratio 210/1010 ≈ 21% > 10%
+///   - account 10: long 10 @ 100, collateral 200 → safe + ADL-eligible
+///       PnL = +10, equity = 210, ratio 21% > 10% → Safe
+///       PnL > 0 → eligible to absorb deficit via ADL
 ///
-///   - account 20: long 10 @ 100, collateral 30 → liquidatable
-///       equity ≈ 40, ratio ≈ 4% (between 2% and 10%)
+///   - account 20: long 10 @ 105, collateral 50 → liquidatable
+///       PnL = (101−105)·10 = −40, equity = 10, ratio ≈ 1% < 2%
+///       → Liquidatable; PnL ≤ 0 → NOT ADL-eligible (so scan
+///       and ADL never target it from the same snapshot)
 ///
 ///   - account 30: short 100 @ 50, collateral 100 → underwater
-///       equity ≈ 100 + (50−101)·100 = −5000 → negative equity
+///       PnL = (50−101)·100 = −5100, equity ≈ −5000 → negative
+///       equity; not ADL-eligible
 ///
 /// Same determinism story as the publishers and book seeds: every
-/// validator runs this same data through the same scan and arrives
-/// at the same `ScanReport`.
+/// validator runs this same data through the same scan and ADL and
+/// arrives at the same records.
 fn synthetic_accounts() -> Vec<AccountSnapshot> {
     vec![
         AccountSnapshot {
@@ -1212,8 +1303,8 @@ fn synthetic_accounts() -> Vec<AccountSnapshot> {
         AccountSnapshot {
             account: ClobAccountId(20),
             position_size: PositionSize(10),
-            avg_entry: MarkPrice(100),
-            collateral: Notional(30),
+            avg_entry: MarkPrice(105),
+            collateral: Notional(50),
         },
         AccountSnapshot {
             account: ClobAccountId(30),
