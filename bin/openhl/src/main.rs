@@ -51,8 +51,10 @@ use openhl_consensus::run_engine_app;
 use openhl_consensus::run_single_validator;
 use openhl_consensus::OpenHlPrivateKeyFile;
 use openhl_evm::{BridgeSnapshot, InMemoryEvmBridge, LiveRethEvmBridge, OpenHlExecutorBuilder};
-use openhl_funding::MarkPrice;
+use k256::ecdsa::{signature::Signer, SigningKey};
+use openhl_funding::{IndexPrice, MarkPrice};
 use openhl_node::{OpenHlNode, OpenHlNodeConfig, TickInput, TickReport};
+use openhl_oracle::{FeedId, PriceObservation, PublisherKey, Signature as OracleSignature};
 use openhl_types::BlockHash;
 use rand::rngs::OsRng;
 use reth_chainspec::ChainSpec;
@@ -653,14 +655,34 @@ async fn run_reth_devnet(
         .map_err(|_| eyre::eyre!("rounds value too large for usize on this target"))?;
 
     // Stage 14a: integration coordinator. One `OpenHlNode` per
-    // running validator. Stage 14a only proves the pipe: every
-    // committed block triggers a `tick` and we print the report.
-    // Inputs are placeholders (no observation ingestion, no real
-    // CLOB mark, no account snapshots) — those land in 14b–14d.
+    // running validator. Every committed block triggers a `tick`.
     let coordinator = Arc::new(Mutex::new(OpenHlNode::new(
         OpenHlNodeConfig::hyperliquid_default(),
     )));
+
+    // Stage 14b: register synthetic publishers and seed the oracle
+    // so the per-block refresh has feeds to aggregate. In production
+    // these come from external CEX publishers; here we generate them
+    // in-process with deterministic seeds (same code on every
+    // validator → identical signed bytes → matching aggregation).
+    let publishers: Vec<SyntheticPublisher> = SYNTHETIC_FEEDS
+        .iter()
+        .map(|(feed_id, seed, _)| SyntheticPublisher::from_seed(*feed_id, *seed))
+        .collect();
+    {
+        let mut node = coordinator.lock().expect("coordinator mutex poisoned");
+        for pub_ in &publishers {
+            node.register_publisher(pub_.feed, pub_.public_key);
+        }
+    }
+    println!(
+        "      oracle publishers = {} synthetic feed(s) registered",
+        publishers.len()
+    );
+    let publishers = Arc::new(publishers);
+
     let coordinator_for_hook = coordinator.clone();
+    let publishers_for_hook = publishers.clone();
     let app_task = tokio::spawn(async move {
         run_engine_app(
             bridge_for_engine,
@@ -670,13 +692,37 @@ async fn run_reth_devnet(
             initial_height_for_consensus,
             rounds_usize,
             move |hash, height| {
+                let block_time = wallclock_secs();
                 let mut node = coordinator_for_hook
                     .lock()
                     .map_err(|_| eyre::eyre!("coordinator mutex poisoned"))?;
+
+                // Stage 14b: ingest one fresh signed observation per
+                // synthetic publisher before the tick. Prices are the
+                // hardcoded per-feed values from SYNTHETIC_FEEDS; the
+                // timestamp is the same `block_time` the tick will
+                // see, so the staleness window is irrelevant. Errors
+                // are non-fatal (we log them and let `tick` decide
+                // whether the resulting feed count is enough to
+                // aggregate) — this matches the production pattern
+                // where a bridge would never halt the chain on a
+                // single feed's ingestion failure.
+                for (publisher, &(_, _, price)) in
+                    publishers_for_hook.iter().zip(SYNTHETIC_FEEDS.iter())
+                {
+                    let obs = publisher.sign(IndexPrice(price), block_time);
+                    if let Err(e) = node.ingest_signed_observation(obs, block_time) {
+                        tracing::warn!(
+                            "stage 14b: ingest_signed_observation failed for feed {}: {e:?}",
+                            publisher.feed.0,
+                        );
+                    }
+                }
+
                 let vault_total_assets = node.vault().total_assets().0;
                 let report = node.tick(TickInput {
                     block_height: height.0,
-                    block_time: wallclock_secs(),
+                    block_time,
                     // Stage 14a: stub mark — CLOB mark plumbing lands in a
                     // later sub-stage. Liquidation scan with no accounts
                     // is a no-op so any mark works here.
@@ -913,6 +959,63 @@ fn wallclock_secs() -> u64 {
         .duration_since(UNIX_EPOCH)
         .map_or(0, |d| d.as_secs())
 }
+
+/// Stage 14b synthetic publisher. In real production, external
+/// publishers (Binance/Coinbase/OKX) run their own signing services
+/// and the bridge only ingests + verifies. For the v0 reference
+/// devnet we generate observations in-process from deterministic
+/// seeds so every validator computes identical signed bytes for the
+/// same `(feed, price, timestamp)` tuple — that's the determinism the
+/// oracle relies on.
+///
+/// The seed byte is repeated 32 times to form the secp256k1 secret
+/// scalar; this is the same trick the oracle's `test_signing_key`
+/// helper uses internally, lifted into the binary so the bridge-
+/// simulator code stays out of the oracle crate's production
+/// surface.
+struct SyntheticPublisher {
+    feed: FeedId,
+    signing_key: SigningKey,
+    public_key: PublisherKey,
+}
+
+impl SyntheticPublisher {
+    fn from_seed(feed_id: u32, seed: u8) -> Self {
+        assert!(seed != 0, "seed must be non-zero (scalar must be in 1..n)");
+        let signing_key = SigningKey::from_slice(&[seed; 32])
+            .expect("repeating seed forms a valid secp256k1 scalar");
+        let compressed = signing_key.verifying_key().to_encoded_point(true);
+        let mut bytes = [0u8; 33];
+        bytes.copy_from_slice(compressed.as_bytes());
+        Self {
+            feed: FeedId(feed_id),
+            signing_key,
+            public_key: PublisherKey(bytes),
+        }
+    }
+
+    fn sign(&self, price: IndexPrice, timestamp: u64) -> PriceObservation {
+        let unsigned = PriceObservation::unsigned(self.feed, price, timestamp);
+        let signed_bytes = unsigned.signed_bytes();
+        let sig: k256::ecdsa::Signature = self.signing_key.sign(&signed_bytes);
+        let mut sig_array = [0u8; 64];
+        sig_array.copy_from_slice(&sig.to_bytes());
+        PriceObservation {
+            signature: OracleSignature(sig_array),
+            ..unsigned
+        }
+    }
+}
+
+/// Spread of three publishers around a 102-cent anchor. Median is 102.
+/// Trivial enough to verify visually in tick logs; rich enough that the
+/// oracle's deviation filter is exercised (101/102/103 are all within
+/// the 100-bps default deviation cap).
+const SYNTHETIC_FEEDS: &[(u32, u8, u64)] = &[
+    (1, 1, 101),
+    (2, 2, 102),
+    (3, 3, 103),
+];
 
 fn short_hash(h: &BlockHash) -> String {
     use std::fmt::Write as _;

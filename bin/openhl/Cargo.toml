@@ -16,6 +16,7 @@ openhl-consensus = { path = "../../crates/consensus" }
 openhl-evm       = { path = "../../crates/evm" }
 openhl-funding   = { path = "../../crates/funding" }
 openhl-node      = { path = "../../crates/node" }
+openhl-oracle    = { path = "../../crates/oracle" }
 openhl-types     = { path = "../../crates/types" }
 
 clap  = { version = "4.6", features = ["derive"] }
@@ -46,6 +47,7 @@ rand               = "0.8"
 sha2               = "0.10"
 hex                = "0.4"
 tempfile           = "3"
+k256               = { version = "0.13", default-features = false, features = ["ecdsa", "std", "precomputed-tables"] }
 
 [lints]
 workspace = true
