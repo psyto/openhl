@@ -61,7 +61,7 @@
 //! keeps each layer independently testable. The `bin/openhl` binary
 //! will own wiring of these two layers together.
 
-use openhl_funding::MarkPrice;
+use openhl_funding::{FundingClock, FundingParams, FundingTick, MarkPrice, Position};
 use openhl_liquidation::{
     execute_adl, AccountSnapshot, AdlReport, InsuranceFund, LiquidationParams,
     LiquidationScanner, ScanReport,
@@ -88,6 +88,8 @@ pub struct OpenHlNodeConfig {
     pub oracle_params: OracleParams,
     /// Vault parameters (deposit floor).
     pub vault_params: VaultParams,
+    /// Funding clock parameters (interval, rate cap, divisor).
+    pub funding_params: FundingParams,
     /// When `true`, the tick auto-runs ADL on any
     /// `ScanReport::unfilled_deficit > 0`. When `false`, the bridge
     /// inspects the scan report itself and decides what to do.
@@ -104,6 +106,7 @@ impl OpenHlNodeConfig {
             liquidation_params: LiquidationParams::hyperliquid_default(),
             oracle_params: OracleParams::hyperliquid_default(),
             vault_params: VaultParams::production_default(),
+            funding_params: FundingParams::hyperliquid_default(),
             run_adl_on_unfilled_deficit: true,
         }
     }
@@ -145,6 +148,11 @@ pub struct CoordinatorSnapshot {
     /// Restoring this prevents an unnecessary refresh on the first
     /// tick after restart when the interval hasn't elapsed.
     pub last_oracle_refresh_at: Option<u64>,
+    /// Last block_time at which the funding clock successfully
+    /// settled (Stage 15a). Restoring this prevents an unintended
+    /// extra settlement on the first tick after restart when the
+    /// interval hasn't elapsed.
+    pub funding_last_settled_at: u64,
 }
 
 /// Per-tick output — aggregated reports plus a snapshot of post-tick
@@ -170,6 +178,14 @@ pub struct TickReport {
     pub vault_total_shares: u64,
     pub vault_total_assets: i64,
     pub vault_share_price_bps: Option<i64>,
+    /// `Some(tick)` when the funding clock fired this block — i.e.,
+    /// the oracle had a cached index price AND the interval since the
+    /// last settlement had elapsed. `None` otherwise.
+    ///
+    /// Stage 15a only surfaces the rate / settlements as telemetry;
+    /// applying the settlements to account balances is the clearing
+    /// layer's job and lands in a later stage.
+    pub funding: Option<FundingTick>,
 }
 
 /// The integration coordinator. One [`OpenHlNode`] per deployed
@@ -180,6 +196,7 @@ pub struct OpenHlNode {
     oracle: OracleState,
     scanner: LiquidationScanner,
     vault: VaultState,
+    funding_clock: FundingClock,
     last_oracle_refresh_at: Option<u64>,
 }
 
@@ -192,11 +209,14 @@ impl OpenHlNode {
         let oracle = OracleState::new(config.oracle_params);
         let scanner = LiquidationScanner::with_empty_fund(config.liquidation_params);
         let vault = VaultState::new(config.vault_params);
+        // Genesis time 0: first tick at any block_time ≥ interval_secs fires.
+        let funding_clock = FundingClock::new(config.funding_params, 0);
         Self {
             config,
             oracle,
             scanner,
             vault,
+            funding_clock,
             last_oracle_refresh_at: None,
         }
     }
@@ -208,11 +228,13 @@ impl OpenHlNode {
         let oracle = OracleState::new(config.oracle_params);
         let scanner = LiquidationScanner::new(config.liquidation_params, fund);
         let vault = VaultState::new(config.vault_params);
+        let funding_clock = FundingClock::new(config.funding_params, 0);
         Self {
             config,
             oracle,
             scanner,
             vault,
+            funding_clock,
             last_oracle_refresh_at: None,
         }
     }
@@ -319,6 +341,24 @@ impl OpenHlNode {
         // 4. Vault mark-to-market — no shares move, only NAV.
         self.vault.mark_to_market(input.vault_total_assets);
 
+        // 5. Funding tick — only if the oracle has a cached current
+        //    price AND the funding interval has elapsed. The clock's
+        //    own gating decides whether a settlement actually fires;
+        //    we just supply the inputs. Per the module's "no catch-up"
+        //    invariant, a long gap still produces at most one tick.
+        let funding = self.oracle.current_price().and_then(|index| {
+            let positions: Vec<Position> = input
+                .account_snapshots
+                .iter()
+                .map(|snap| Position {
+                    account: snap.account,
+                    size: snap.position_size,
+                })
+                .collect();
+            self.funding_clock
+                .tick(input.block_time, input.mark, index, &positions)
+        });
+
         TickReport {
             block_height: input.block_height,
             block_time: input.block_time,
@@ -328,6 +368,7 @@ impl OpenHlNode {
             vault_total_shares: self.vault.total_shares().0,
             vault_total_assets: self.vault.total_assets().0,
             vault_share_price_bps: self.vault.share_price_bps(),
+            funding,
         }
     }
 
@@ -349,6 +390,7 @@ impl OpenHlNode {
             vault_total_shares: self.vault.total_shares().0,
             vault_total_assets: self.vault.total_assets().0,
             last_oracle_refresh_at: self.last_oracle_refresh_at,
+            funding_last_settled_at: self.funding_clock.last_settled_at(),
         }
     }
 
@@ -366,6 +408,10 @@ impl OpenHlNode {
             self.config.vault_params,
             snap.vault_total_shares,
             snap.vault_total_assets,
+        );
+        self.funding_clock = FundingClock::new(
+            self.config.funding_params,
+            snap.funding_last_settled_at,
         );
         self.last_oracle_refresh_at = snap.last_oracle_refresh_at;
     }
@@ -435,11 +481,15 @@ mod tests {
         // set directly inside `mod tests`.
         node.last_oracle_refresh_at = Some(12);
 
+        // Pretend the funding clock has settled once at block_time 9.
+        node.funding_clock = FundingClock::new(node.config.funding_params, 9);
+
         let snap = node.snapshot();
         assert_eq!(snap.insurance_fund_balance, 750);
         assert_eq!(snap.vault_total_shares, 10_000);
         assert_eq!(snap.vault_total_assets, 10_000);
         assert_eq!(snap.last_oracle_refresh_at, Some(12));
+        assert_eq!(snap.funding_last_settled_at, 9);
 
         // Round-trip via serde to mirror the real on-disk path.
         let bytes = serde_json::to_vec(&snap).expect("serialize");
@@ -449,11 +499,13 @@ mod tests {
         let mut fresh = default_node();
         assert_eq!(fresh.scanner().fund_balance(), 0);
         assert_eq!(fresh.vault().total_shares().0, 0);
+        assert_eq!(fresh.funding_clock.last_settled_at(), 0);
         fresh.load_snapshot(decoded);
         assert_eq!(fresh.scanner().fund_balance(), 750);
         assert_eq!(fresh.vault().total_shares().0, 10_000);
         assert_eq!(fresh.vault().total_assets().0, 10_000);
         assert_eq!(fresh.last_oracle_refresh_at, Some(12));
+        assert_eq!(fresh.funding_clock.last_settled_at(), 9);
     }
 
     #[test]

@@ -662,7 +662,12 @@ async fn run_reth_devnet(
     // load it so the insurance fund balance, vault, and oracle
     // refresh marker carry across restart. Mirrors the bridge
     // snapshot pattern (Stage 13g).
-    let mut coordinator_inner = OpenHlNode::new(OpenHlNodeConfig::hyperliquid_default());
+    // Stage 15a: dev override — shrink the funding interval from
+    // Hyperliquid's 1 hour to 1 second so the clock fires per block
+    // in a 3-round test. Production deployments leave it at 3600.
+    let mut node_config = OpenHlNodeConfig::hyperliquid_default();
+    node_config.funding_params.interval_secs = 1;
+    let mut coordinator_inner = OpenHlNode::new(node_config);
     let coordinator_state_path = data_dir_path.join("coordinator").join("state.json");
     if coordinator_state_path.exists() {
         let bytes = std::fs::read(&coordinator_state_path)?;
@@ -1208,6 +1213,15 @@ fn print_tick_report(report: &TickReport) {
             a.deficit_remaining,
         ),
         None => print!("adl=skip "),
+    }
+    match &report.funding {
+        Some(f) => print!(
+            "funding(premium={}, rate={}, settlements={}) ",
+            f.premium.0,
+            f.rate.0,
+            f.settlements.len(),
+        ),
+        None => print!("funding=skip "),
     }
     println!(
         "vault(shares={}, assets={}, price_bps={:?})",
