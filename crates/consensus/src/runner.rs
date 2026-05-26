@@ -370,6 +370,7 @@ mod tests {
                 parent_hash: BlockHash([0u8; 32]),
                 number: 1,
                 state_root: [0u8; 32],
+                timestamp: 1,
             })
         }
 

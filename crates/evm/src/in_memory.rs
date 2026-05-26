@@ -35,14 +35,23 @@ impl ConsensusBridge for InMemoryEvmBridge {
     async fn build_payload(
         &self,
         parent: BlockHash,
-        _attrs: PayloadAttrs,
+        attrs: PayloadAttrs,
     ) -> Result<PayloadId, BridgeError> {
         let mut s = self.state.lock().expect("state mutex poisoned");
         let id = s.next_payload_id;
         s.next_payload_id += 1;
 
-        let parent_number = s.chain.get(&parent.0).map_or(0, |b| b.number);
+        let (parent_number, parent_timestamp) = s
+            .chain
+            .get(&parent.0)
+            .map_or((0, 0), |b| (b.number, b.timestamp));
         let number = parent_number + 1;
+        // Mirror LiveRethEvmBridge's timestamp derivation:
+        // `max(attrs.timestamp, parent.timestamp + 1)`. Keeps the
+        // in-memory bridge byte-deterministic across validators and
+        // forces monotonic chain time even when the caller passes
+        // attrs.timestamp = 0 (which is the engine_app default).
+        let timestamp = attrs.timestamp.max(parent_timestamp + 1);
 
         let mut hash_bytes = [0u8; 32];
         hash_bytes[..8].copy_from_slice(&id.to_le_bytes());
@@ -53,6 +62,7 @@ impl ConsensusBridge for InMemoryEvmBridge {
             parent_hash: parent,
             number,
             state_root: [0u8; 32],
+            timestamp,
         };
         s.pending.insert(id, block);
         Ok(PayloadId(id))
@@ -130,6 +140,7 @@ mod tests {
             parent_hash: BlockHash([1u8; 32]),
             number: 1,
             state_root: [0u8; 32],
+            timestamp: 1,
         };
         let status = bridge.validate_payload(&block).await.unwrap();
         assert_eq!(status, PayloadStatus::Valid);

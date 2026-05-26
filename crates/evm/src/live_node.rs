@@ -362,6 +362,7 @@ where
             parent_hash: BlockHash(header.parent_hash.0),
             number: header.number,
             state_root: header.state_root.0,
+            timestamp: header.timestamp,
         })
     }
 
@@ -595,6 +596,7 @@ mod tests {
             parent_hash: BlockHash(genesis_hash_b256.0),
             number: 1,
             state_root: [0u8; 32],
+            timestamp: 0,
         };
         let status = bridge
             .validate_payload(&unknown_block)

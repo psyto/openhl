@@ -7,7 +7,7 @@
 //! and (optionally) stop after N decisions for tests.
 
 use std::sync::Arc;
-use std::collections::HashSet;
+use std::collections::HashMap;
 
 use eyre::eyre;
 use informalsystems_malachitebft_app::engine::host::Next;
@@ -48,8 +48,15 @@ const APP_REPLY_WAIT_LOG: &str = "engine_app: peer replied unsuccessfully (chann
 /// types into the consensus crate — engine_app stays consensus-only
 /// and the binary plugs in the coordinator-tick closure.
 ///
-/// The hook receives the committed block hash and its consensus height.
-/// If it returns `Err`, `run_engine_app` propagates the error.
+/// The hook receives the committed block hash, its consensus height,
+/// and the **block-header timestamp** (Stage 15e). Using the header
+/// timestamp instead of host wallclock keeps the coordinator tick
+/// (oracle refresh interval, funding clock, etc.) deterministic
+/// across validators — host clocks could drift millisecond-to-second
+/// in a real distributed setting and silently break consensus
+/// downstream.
+///
+/// If the hook returns `Err`, `run_engine_app` propagates the error.
 #[allow(clippy::too_many_lines)] // 12 AppMsg arms — laid out flat for lesson L11's match-by-match walk
 #[allow(clippy::too_many_arguments)] // 7 args, all load-bearing — see doc comments
 pub async fn run_engine_app<B, F>(
@@ -63,13 +70,18 @@ pub async fn run_engine_app<B, F>(
 ) -> eyre::Result<Vec<BlockHash>>
 where
     B: ConsensusBridge + 'static,
-    F: FnMut(BlockHash, OpenHlHeight) -> eyre::Result<()> + Send,
+    F: FnMut(BlockHash, OpenHlHeight, u64) -> eyre::Result<()> + Send,
 {
     let mut decided: Vec<BlockHash> = Vec::new();
     let mut current_parent = initial_parent;
     let mut current_height = initial_height;
     let history_min_height = initial_height;
-    let mut locally_built_heights: HashSet<OpenHlHeight> = HashSet::new();
+    // Stage 14d / 15e: heights where this validator served as
+    // proposer, mapped to the block-header timestamp it computed
+    // during `GetValue`. Used in `Decided` to (a) skip a redundant
+    // recompute (15a) and (b) hand the integration coordinator the
+    // chain-derived block_time rather than host wallclock (15e).
+    let mut locally_built_at: HashMap<OpenHlHeight, u64> = HashMap::new();
 
     while let Some(msg) = channels.consensus.recv().await {
         match msg {
@@ -103,7 +115,7 @@ where
                 let attrs = default_attrs();
                 let id = bridge.build_payload(current_parent, attrs).await?;
                 let block = bridge.payload_ready(id).await?;
-                locally_built_heights.insert(height);
+                locally_built_at.insert(height, block.timestamp);
                 let value = OpenHlValue(block.hash);
                 let lpv =
                     informalsystems_malachitebft_app_channel::app::types::LocallyProposedValue::new(
@@ -161,7 +173,20 @@ where
                 // height should re-build. If proposer-side code re-builds here,
                 // bridge side effects can run twice (for example draining
                 // pending fills in LiveRethEvmBridge).
-                if !locally_built_heights.remove(&certificate.height) {
+                //
+                // Stage 15e: pick up the chain's notion of block time from
+                // whichever of the two paths actually produced the block.
+                // Proposer remembered it in `locally_built_at` during
+                // `GetValue`; follower learns it from its own recompute
+                // here. Both arrive at the same value because the
+                // bridge's timestamp derivation
+                // (`max(attrs.timestamp, parent.timestamp + 1)`) is a
+                // pure function of inputs they share.
+                let block_time = if let Some(ts) =
+                    locally_built_at.remove(&certificate.height)
+                {
+                    ts
+                } else {
                     let id = bridge.build_payload(current_parent, default_attrs()).await?;
                     let block = bridge.payload_ready(id).await?;
                     if block.hash != hash {
@@ -173,10 +198,11 @@ where
                             recomputed = block.hash,
                         ));
                     }
-                }
+                    block.timestamp
+                };
 
                 bridge.commit(hash).await?;
-                on_committed(hash, certificate.height)?;
+                on_committed(hash, certificate.height, block_time)?;
                 decided.push(hash);
                 current_parent = hash;
 
@@ -274,6 +300,7 @@ mod tests {
                 parent_hash: BlockHash([0u8; 32]),
                 number: 1,
                 state_root: [0u8; 32],
+                timestamp: 1,
             })
         }
 
@@ -369,7 +396,7 @@ mod tests {
             BlockHash([0u8; 32]),
             OpenHlHeight::INITIAL,
             1,
-            |_hash, _height| Ok(()),
+            |_hash, _height, _block_time| Ok(()),
         ));
 
         let decisions = tokio::time::timeout(Duration::from_secs(15), app_task)
@@ -444,7 +471,7 @@ mod tests {
             BlockHash([0u8; 32]),
             OpenHlHeight(7),
             1,
-            |_hash, _height| Ok(()),
+            |_hash, _height, _block_time| Ok(()),
         ));
 
         let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
@@ -493,7 +520,7 @@ mod tests {
             BlockHash([0u8; 32]),
             OpenHlHeight::INITIAL,
             1,
-            |_hash, _height| Ok(()),
+            |_hash, _height, _block_time| Ok(()),
         ));
 
         let (gv_tx, gv_rx) = tokio::sync::oneshot::channel();
@@ -564,7 +591,7 @@ mod tests {
             BlockHash([0u8; 32]),
             OpenHlHeight::INITIAL,
             1,
-            |_hash, _height| Ok(()),
+            |_hash, _height, _block_time| Ok(()),
         ));
 
         let (decided_tx, decided_rx) = tokio::sync::oneshot::channel();

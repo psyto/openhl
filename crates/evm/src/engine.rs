@@ -110,6 +110,7 @@ fn to_executed_block(hash: B256, header: &Header) -> ExecutedBlock {
         parent_hash: from_b256(header.parent_hash),
         number: header.number,
         state_root: header.state_root.0,
+        timestamp: header.timestamp,
     }
 }
 

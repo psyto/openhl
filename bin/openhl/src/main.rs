@@ -770,8 +770,7 @@ async fn run_reth_devnet(
             initial_parent_for_consensus,
             initial_height_for_consensus,
             rounds_usize,
-            move |hash, height| {
-                let block_time = wallclock_secs();
+            move |hash, height, block_time| {
                 let mut node = coordinator_for_hook
                     .lock()
                     .map_err(|_| eyre::eyre!("coordinator mutex poisoned"))?;

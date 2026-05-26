@@ -45,4 +45,10 @@ pub struct ExecutedBlock {
     pub parent_hash: BlockHash,
     pub number: u64,
     pub state_root: [u8; 32],
+    /// Unix-seconds timestamp from the header. Both validators compute
+    /// the same value deterministically (proposer's `build_payload`
+    /// derives it from `parent.timestamp + 1` when the attrs timestamp
+    /// is stale), so it is safe to use as the chain's notion of
+    /// "block time" instead of host wallclock.
+    pub timestamp: u64,
 }
