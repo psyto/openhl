@@ -520,34 +520,55 @@ async fn run_reth_devnet(
     // Stage 13j: validator set — load from file if given, else
     // construct single-validator set from the loaded key (preserves
     // pre-13j behavior).
-    let validator_set = if let Some(path) = validators_path.as_deref() {
-        let (set, peer_multiaddrs) = load_validator_set(path, &public)?;
+    // Stage 13l: also derive the libp2p dial list — every peer entry
+    // with a `peer_multiaddr` that isn't *us*.
+    let (validator_set, persistent_peers) = if let Some(path) = validators_path.as_deref() {
+        let LoadedValidatorSet {
+            set,
+            peer_multiaddrs,
+            self_index,
+        } = load_validator_set(path, &public)?;
         println!(
             "      validator set    = {} ({} validator{})",
             path.display(),
             set.validators().len(),
             if set.validators().len() == 1 { "" } else { "s" }
         );
-        // Stage 13k: log advertised peer multiaddrs so operators can
-        // sanity-check the network layout before the (future) libp2p
-        // dialer consumes them. Empty list is fine — single-validator
-        // devnets never list peer addresses.
+        // Log advertised peer multiaddrs (Stage 13k) so operators can
+        // sanity-check the network layout.
         for (idx, addr) in peer_multiaddrs.iter().enumerate() {
+            let marker = if idx == self_index { " (self)" } else { "" };
             match addr {
-                Some(a) => println!("        peer[{idx}].multiaddr = {a}"),
-                None => println!("        peer[{idx}].multiaddr = (unset)"),
+                Some(a) => println!("        peer[{idx}].multiaddr = {a}{marker}"),
+                None => println!("        peer[{idx}].multiaddr = (unset){marker}"),
             }
         }
-        set
+        // Stage 13l: build the dial list — every non-self entry that
+        // has a multiaddr set. Self is excluded to avoid a libp2p
+        // self-dial; entries without a multiaddr are skipped (they're
+        // valid validators we just can't reach until they advertise).
+        let dial_list: Vec<String> = peer_multiaddrs
+            .iter()
+            .enumerate()
+            .filter_map(|(idx, addr)| {
+                if idx == self_index {
+                    None
+                } else {
+                    addr.clone()
+                }
+            })
+            .collect();
+        (set, dial_list)
     } else {
         let digest = Sha256::digest(public.as_bytes());
         let mut addr_bytes = [0u8; 20];
         addr_bytes.copy_from_slice(&digest[12..32]);
         let address = openhl_consensus::types::OpenHlAddress(addr_bytes);
         println!("      validator set    = (single-validator default)");
-        openhl_consensus::types::OpenHlValidatorSet::new(vec![
+        let set = openhl_consensus::types::OpenHlValidatorSet::new(vec![
             openhl_consensus::types::OpenHlValidator::new(address, public, 1),
-        ])
+        ]);
+        (set, Vec::new())
     };
     // Consensus home dir: a subdir of the resolved data dir. Persists
     // across restarts so the Malachite WAL has a stable location (real
@@ -566,6 +587,18 @@ async fn run_reth_devnet(
         println!("      listen addr      = {multiaddr}");
     } else {
         println!("      listen addr      = (ephemeral /ip4/127.0.0.1/tcp/0)");
+    }
+    // Stage 13l: forward the derived dial list. Empty (single-validator
+    // path, or no peer_multiaddrs in the validator file) preserves
+    // pre-13l behavior.
+    if persistent_peers.is_empty() {
+        println!("      persistent peers = (none)");
+    } else {
+        println!("      persistent peers = {} peer(s)", persistent_peers.len());
+        for (idx, peer) in persistent_peers.iter().enumerate() {
+            println!("        dial[{idx}]            = {peer}");
+        }
+        consensus_node = consensus_node.with_persistent_peers(persistent_peers.clone());
     }
     println!("      moniker          = {moniker}");
 
@@ -672,13 +705,21 @@ fn load_chain_spec(path: &Path) -> eyre::Result<Arc<ChainSpec>> {
 /// key's public key MUST appear in the set — otherwise the node
 /// refuses to sign on behalf of an identity the network doesn't
 /// recognize.
+/// Loaded validator-set result. `peer_multiaddrs[i]` is the
+/// `peer_multiaddr` entry for validator `i` (parallel to
+/// `set.validators()`); `self_index` is the position of *our*
+/// validator in the set — used to filter our own entry out of the
+/// libp2p dial list (Stage 13l).
+struct LoadedValidatorSet {
+    set: openhl_consensus::types::OpenHlValidatorSet,
+    peer_multiaddrs: Vec<Option<String>>,
+    self_index: usize,
+}
+
 fn load_validator_set(
     path: &Path,
     our_pubkey: &informalsystems_malachitebft_signing_ed25519::PublicKey,
-) -> eyre::Result<(
-    openhl_consensus::types::OpenHlValidatorSet,
-    Vec<Option<String>>,
-)> {
+) -> eyre::Result<LoadedValidatorSet> {
     let bytes = std::fs::read(path)
         .map_err(|e| eyre::eyre!("failed to read validator set at {}: {e}", path.display()))?;
     let file: ValidatorSetFile = serde_json::from_slice(&bytes)
@@ -688,10 +729,10 @@ fn load_validator_set(
     }
     let our_pubkey_bytes = our_pubkey.as_bytes();
 
-    let mut found_self = false;
+    let mut self_index: Option<usize> = None;
     let mut built = Vec::with_capacity(file.validators.len());
     let mut peer_multiaddrs = Vec::with_capacity(file.validators.len());
-    for entry in &file.validators {
+    for (idx, entry) in file.validators.iter().enumerate() {
         if entry.voting_power == 0 {
             return Err(eyre::eyre!(
                 "validator with pubkey_hex={} has voting_power=0; must be > 0",
@@ -714,7 +755,13 @@ fn load_validator_set(
         })?;
         let pubkey = informalsystems_malachitebft_signing_ed25519::PublicKey::new(vk);
         if pubkey.as_bytes() == our_pubkey_bytes {
-            found_self = true;
+            if let Some(prior) = self_index {
+                return Err(eyre::eyre!(
+                    "validator set at {} lists our public key twice (positions {prior} and {idx})",
+                    path.display()
+                ));
+            }
+            self_index = Some(idx);
         }
         let digest = Sha256::digest(pubkey.as_bytes());
         let mut addr = [0u8; 20];
@@ -726,17 +773,18 @@ fn load_validator_set(
         ));
         peer_multiaddrs.push(entry.peer_multiaddr.clone());
     }
-    if !found_self {
-        return Err(eyre::eyre!(
+    let self_index = self_index.ok_or_else(|| {
+        eyre::eyre!(
             "loaded validator key's public key does not appear in {}; \
              refusing to start (won't sign as an unrecognized identity)",
             path.display()
-        ));
-    }
-    Ok((
-        openhl_consensus::types::OpenHlValidatorSet::new(built),
+        )
+    })?;
+    Ok(LoadedValidatorSet {
+        set: openhl_consensus::types::OpenHlValidatorSet::new(built),
         peer_multiaddrs,
-    ))
+        self_index,
+    })
 }
 
 /// Parse an `<addr>:<port>` socket spec for `--rpc-bind`. Accepts:

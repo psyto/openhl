@@ -182,6 +182,14 @@ pub struct OpenHlNode {
     /// and tests). When `Some`, must be a valid libp2p multiaddr such
     /// as `/ip4/0.0.0.0/tcp/9000`.
     pub listen_addr: Option<String>,
+    /// libp2p multiaddrs of other validators we should maintain
+    /// persistent connections to (Stage 13l). Empty for
+    /// single-validator devnets. For multi-validator deployments,
+    /// callers populate this from the validator-set JSON's
+    /// `peer_multiaddr` entries, filtered to exclude self. Parsed
+    /// during `load_config()` and forwarded into
+    /// `cfg.consensus.p2p.persistent_peers`.
+    pub persistent_peers: Vec<String>,
     /// Optional override for Malachite value payload mode.
     ///
     /// Production defaults to `ProposalOnly` (the OpenHL target shape), but
@@ -208,6 +216,7 @@ impl OpenHlNode {
             home_dir,
             moniker: moniker.into(),
             listen_addr: None,
+            persistent_peers: Vec::new(),
             value_payload: None,
             startup_ready_timeout: Some(DEFAULT_STARTUP_READY_TIMEOUT),
         }
@@ -219,6 +228,19 @@ impl OpenHlNode {
     #[must_use]
     pub fn with_listen_addr(mut self, multiaddr: impl Into<String>) -> Self {
         self.listen_addr = Some(multiaddr.into());
+        self
+    }
+
+    /// Set the libp2p persistent-peer multiaddrs. See
+    /// [`OpenHlNode::persistent_peers`]; callers should filter out
+    /// their own peer entry to avoid self-dial.
+    #[must_use]
+    pub fn with_persistent_peers<I, S>(mut self, peers: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        self.persistent_peers = peers.into_iter().map(Into::into).collect();
         self
     }
 
@@ -273,6 +295,17 @@ impl Node for OpenHlNode {
         cfg.consensus.p2p.listen_addr = raw
             .parse()
             .map_err(|e| eyre!("invalid listen_addr `{raw}`: {e}"))?;
+        // Stage 13l: parse persistent peer multiaddrs and forward
+        // into Malachite's p2p config. Empty list (default) preserves
+        // the single-validator path.
+        let mut parsed_peers = Vec::with_capacity(self.persistent_peers.len());
+        for peer in &self.persistent_peers {
+            let parsed = peer
+                .parse()
+                .map_err(|e| eyre!("invalid persistent peer multiaddr `{peer}`: {e}"))?;
+            parsed_peers.push(parsed);
+        }
+        cfg.consensus.p2p.persistent_peers = parsed_peers;
         Ok(cfg)
     }
 
@@ -408,6 +441,52 @@ mod tests {
         assert!(
             listen_str.starts_with("/ip4/0.0.0.0/tcp/26656"),
             "expected listen_addr override, got: {listen_str}"
+        );
+    }
+
+    #[test]
+    fn default_persistent_peers_is_empty() {
+        let tmp = tempfile::tempdir().unwrap();
+        let node = single_validator_node(tmp.path().to_path_buf());
+        let cfg = node.load_config().unwrap();
+        assert!(cfg.consensus.p2p.persistent_peers.is_empty());
+    }
+
+    #[test]
+    fn with_persistent_peers_forwards_into_consensus_config() {
+        let tmp = tempfile::tempdir().unwrap();
+        let node = single_validator_node(tmp.path().to_path_buf())
+            .with_persistent_peers(vec![
+                "/ip4/10.0.0.5/tcp/9001",
+                "/ip4/10.0.0.6/tcp/9002",
+            ]);
+        let cfg = node.load_config().unwrap();
+        let rendered: Vec<String> = cfg
+            .consensus
+            .p2p
+            .persistent_peers
+            .iter()
+            .map(ToString::to_string)
+            .collect();
+        assert_eq!(
+            rendered,
+            vec![
+                "/ip4/10.0.0.5/tcp/9001".to_string(),
+                "/ip4/10.0.0.6/tcp/9002".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn with_persistent_peers_rejects_malformed_multiaddr() {
+        let tmp = tempfile::tempdir().unwrap();
+        let node = single_validator_node(tmp.path().to_path_buf())
+            .with_persistent_peers(vec!["not-a-multiaddr"]);
+        let err = node.load_config().expect_err("malformed peer should error");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("invalid persistent peer multiaddr"),
+            "unexpected error message: {msg}"
         );
     }
 
