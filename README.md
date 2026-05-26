@@ -2,7 +2,7 @@
 
 An open-source reference implementation of a Hyperliquid-shape L1: BFT consensus + EVM execution + a CLOB matching engine, with first-class vault primitives.
 
-**Status:** Modules 1–3 shipped; Module 4 partial. Single-validator devnet produces blocks end-to-end (real Reth EVM + real Malachite BFT); CLOB matching engine wires fills through the bridge into committed payloads; custom EVM precompiles let smart contracts read CLOB state and place orders; funding state machine and liquidation margin math run as pure deterministic state machines. Insurance fund, oracle, and Module 5 vault primitive are next. See the build arc below.
+**Status:** Modules 1–5 shipped at the state-machine level; live per-block integration in progress. Single-validator devnet produces blocks end-to-end (real Reth EVM + real Malachite BFT) and now extends to a **two-validator BFT devnet** where two `openhl reth-devnet` processes produce matching block hashes and identical bridge state over libp2p (Stages 13l–13n). CLOB matching engine wires fills through the bridge into committed payloads; custom EVM precompiles let smart contracts read CLOB state and place orders; funding, oracle (with signed observations), liquidation (with insurance fund + ADL), and vault all ship as pure deterministic state machines. Next: driving those state machines from the live per-block flow inside the production devnet. See the build arc below.
 
 ## Why
 
@@ -35,15 +35,17 @@ See [`docs/architecture.md`](docs/architecture.md) for the full design, and `doc
 
 | # | Module | Crates touched | Status |
 | - | --- | --- | --- |
-| 1 | Consensus substrate (Malachite + Reth) | `consensus`, `evm`, `node` | ✅ Stage 6 → 7d |
+| 1 | Consensus substrate (Malachite + Reth) | `consensus`, `evm`, `node` | ✅ Stage 6 → 7d (single-validator); Stages 13l–13n add two-validator BFT |
 | 2 | CLOB matching engine | `clob`, `types`, `codec` | ✅ Stage 8a + 8d |
 | 3 | Core ↔ EVM precompiles | `evm`, `clob` | ✅ Stage 9a–9e + 9c+ + 9d |
-| 4 | Funding, oracle, liquidations | `funding`, `oracle`, `liquidation` | 🟡 Partial — funding ✅ Stage 8b; liquidation 🟡 Stage 10a (margin math); insurance fund + oracle next |
-| 5 | Protocol-native vault primitive | `vault` | ⬜ Pending |
+| 4 | Funding, oracle, liquidations | `funding`, `oracle`, `liquidation` | ✅ Stage 8b (funding) + 10a–10d (liquidation margin, insurance fund, scanner, ADL) + 11–11b (oracle aggregation + signed observations) |
+| 5 | Protocol-native vault primitive | `vault` | ✅ Stage 12 (share-based collateral pooling) |
 
 v0 milestone: single-validator devnet produces blocks end-to-end. **Achieved** at the end of Module 1 / Stage 7d.
 
-v1 milestone: full perp DEX with funding + liquidations + oracle wired into the bridge. **In progress** — Stage 10a (liquidation margin math) is the latest landed sub-stage.
+Two-validator BFT milestone: two `openhl reth-devnet` processes reach consensus over libp2p and commit matching block hashes with identical bridge state. **Achieved** at Stage 13n. See [`docs/testing.md`](docs/testing.md) for the manual bring-up procedure (including restart resilience).
+
+v1 milestone: full perp DEX with funding + liquidations + oracle + vault wired into the live per-block bridge flow. **In progress** — all subsystems exist as pure state machines; the remaining work is driving them from `LiveRethEvmBridge` per block in the production devnet path.
 
 ## Build
 

@@ -105,3 +105,25 @@ Each process logs `persistent peers = 1 peer(s)` and a `dial[0]` line
 showing the *other* validator's multiaddr (self is filtered out).
 Both nodes should converge on the same decided block hashes for each
 height.
+
+### Step 4 (optional) — verify restart resilience
+
+Re-run step 3 with the **same** `--data-dir`s. Each node loads its
+persisted bridge snapshot (Stage 13g), validator key (Stage 13h),
+consensus height (Stage 13i), and Malachite WAL, and continues from
+the prior tip — log lines read:
+
+```
+loaded snapshot  = 3 block(s); head = 7c10b6df…
+driving run_engine_app for 3 decision(s) starting at height 4…
+```
+
+After the second run, both `bridge/state.json` files should show 6
+blocks and identical heads:
+
+```bash
+diff \
+  <(jq -S '.chain | keys' /tmp/openhl-a/bridge/state.json) \
+  <(jq -S '.chain | keys' /tmp/openhl-b/bridge/state.json)
+# no output → identical
+```
