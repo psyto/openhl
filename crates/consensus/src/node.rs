@@ -26,6 +26,41 @@ use crate::types::{OpenHlAddress, OpenHlHeight, OpenHlValidatorSet};
 
 const DEFAULT_STARTUP_READY_TIMEOUT: Duration = Duration::from_secs(5);
 
+fn spawn_consensus_forwarder(
+    mut raw_consensus: mpsc::Receiver<informalsystems_malachitebft_app_channel::AppMsg<OpenHlContext>>,
+    consensus_tx: mpsc::Sender<informalsystems_malachitebft_app_channel::AppMsg<OpenHlContext>>,
+) -> oneshot::Receiver<()> {
+    let (ready_tx, ready_rx) = oneshot::channel::<()>();
+    tokio::spawn(async move {
+        let mut ready_tx = Some(ready_tx);
+        while let Some(msg) = raw_consensus.recv().await {
+            if let Some(tx) = ready_tx.take() {
+                let _ = tx.send(());
+            }
+            if consensus_tx.send(msg).await.is_err() {
+                break;
+            }
+        }
+    });
+    ready_rx
+}
+
+async fn await_startup_ready(
+    ready_rx: oneshot::Receiver<()>,
+    wait_for: Duration,
+) -> eyre::Result<()> {
+    match timeout(wait_for, ready_rx).await {
+        Ok(Ok(())) => Ok(()),
+        Ok(Err(_)) => Err(eyre!(
+            "consensus startup failed: host/app channel closed before first message"
+        )),
+        Err(_) => Err(eyre!(
+            "consensus startup timed out after {}s waiting for first app message; check listen_addr/permissions",
+            wait_for.as_secs()
+        )),
+    }
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct OpenHlConfig {
     pub moniker: String,
@@ -290,37 +325,15 @@ impl Node for OpenHlNode {
         )
         .await?;
 
-        let mut raw_consensus = channels.consensus;
+        let raw_consensus = channels.consensus;
         let (consensus_tx, consensus_rx) = mpsc::channel(128);
-        let (ready_tx, ready_rx) = oneshot::channel::<()>();
-        tokio::spawn(async move {
-            let mut ready_tx = Some(ready_tx);
-            while let Some(msg) = raw_consensus.recv().await {
-                if let Some(tx) = ready_tx.take() {
-                    let _ = tx.send(());
-                }
-                if consensus_tx.send(msg).await.is_err() {
-                    break;
-                }
-            }
-        });
+        let ready_rx = spawn_consensus_forwarder(raw_consensus, consensus_tx);
 
         if let Some(wait_for) = self.startup_ready_timeout {
-            match timeout(wait_for, ready_rx).await {
-                Ok(Ok(())) => {}
-                Ok(Err(_)) => {
-                    let _ = engine.actor.kill_and_wait(None).await;
-                    engine.handle.abort();
-                    return Err(eyre!("consensus startup failed: host/app channel closed before first message"));
-                }
-                Err(_) => {
-                    let _ = engine.actor.kill_and_wait(None).await;
-                    engine.handle.abort();
-                    return Err(eyre!(
-                        "consensus startup timed out after {}s waiting for first app message; check listen_addr/permissions",
-                        wait_for.as_secs()
-                    ));
-                }
+            if let Err(err) = await_startup_ready(ready_rx, wait_for).await {
+                let _ = engine.actor.kill_and_wait(None).await;
+                engine.handle.abort();
+                return Err(err);
             }
         }
 
@@ -441,30 +454,38 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    #[ignore = "Diagnostic: currently no initial AppMsg arrives in this harness"]
-    async fn start_engine_emits_initial_consensus_message() {
-        let tmp = tempfile::tempdir().unwrap();
-        let node = single_validator_node(tmp.path().to_path_buf());
-        let handle = node.start().await.expect("start_engine failed");
-        let mut channels = handle
-            .take_channels()
-            .await
-            .expect("channels available exactly once");
+    async fn startup_forwarder_signals_and_forwards_first_message() {
+        let (raw_tx, raw_rx) = mpsc::channel(8);
+        let (forward_tx, mut forward_rx) = mpsc::channel(8);
+        let ready_rx = spawn_consensus_forwarder(raw_rx, forward_tx);
 
-        let first_msg = tokio::time::timeout(Duration::from_secs(5), channels.consensus.recv())
+        let (reply, _wait) = oneshot::channel();
+        raw_tx
+            .send(AppMsg::GetHistoryMinHeight { reply })
             .await
-            .expect("timed out waiting for first consensus message")
-            .expect("consensus channel closed before first message");
+            .expect("send mock app message");
 
+        await_startup_ready(ready_rx, Duration::from_secs(1))
+            .await
+            .expect("startup ready should be signaled");
+
+        let forwarded = forward_rx
+            .recv()
+            .await
+            .expect("forwarder should preserve first message");
+        assert!(matches!(forwarded, AppMsg::GetHistoryMinHeight { .. }));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn startup_ready_timeout_errors_without_signal() {
+        let (_tx, rx) = oneshot::channel::<()>();
+        let err = await_startup_ready(rx, Duration::from_millis(20))
+            .await
+            .expect_err("missing startup signal should timeout");
         assert!(
-            matches!(
-                first_msg,
-                AppMsg::ConsensusReady { .. } | AppMsg::GetHistoryMinHeight { .. }
-            ),
-            "unexpected first consensus message variant"
+            err.to_string().contains("timed out"),
+            "unexpected startup timeout error: {err}"
         );
-
-        handle.kill(None).await.unwrap();
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
