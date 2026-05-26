@@ -55,7 +55,7 @@ use openhl_evm::{BridgeSnapshot, InMemoryEvmBridge, LiveRethEvmBridge, OpenHlExe
 use k256::ecdsa::{signature::Signer, SigningKey};
 use openhl_funding::{IndexPrice, MarkPrice, Notional, PositionSize};
 use openhl_liquidation::AccountSnapshot;
-use openhl_node::{OpenHlNode, OpenHlNodeConfig, TickInput, TickReport};
+use openhl_node::{CoordinatorSnapshot, OpenHlNode, OpenHlNodeConfig, TickInput, TickReport};
 use openhl_oracle::{FeedId, PriceObservation, PublisherKey, Signature as OracleSignature};
 use openhl_types::BlockHash;
 use rand::rngs::OsRng;
@@ -658,9 +658,29 @@ async fn run_reth_devnet(
 
     // Stage 14a: integration coordinator. One `OpenHlNode` per
     // running validator. Every committed block triggers a `tick`.
-    let coordinator = Arc::new(Mutex::new(OpenHlNode::new(
-        OpenHlNodeConfig::hyperliquid_default(),
-    )));
+    // Stage 14e: if a prior run persisted a coordinator snapshot,
+    // load it so the insurance fund balance, vault, and oracle
+    // refresh marker carry across restart. Mirrors the bridge
+    // snapshot pattern (Stage 13g).
+    let mut coordinator_inner = OpenHlNode::new(OpenHlNodeConfig::hyperliquid_default());
+    let coordinator_state_path = data_dir_path.join("coordinator").join("state.json");
+    if coordinator_state_path.exists() {
+        let bytes = std::fs::read(&coordinator_state_path)?;
+        let snap: CoordinatorSnapshot = serde_json::from_slice(&bytes).map_err(|e| {
+            eyre::eyre!("malformed coordinator snapshot at {coordinator_state_path:?}: {e}")
+        })?;
+        coordinator_inner.load_snapshot(snap);
+        println!(
+            "      loaded coordinator snapshot: fund={}, vault_shares={}, vault_assets={}, last_oracle_refresh_at={:?}",
+            snap.insurance_fund_balance,
+            snap.vault_total_shares,
+            snap.vault_total_assets,
+            snap.last_oracle_refresh_at,
+        );
+    } else {
+        println!("      no prior coordinator snapshot (fresh state)");
+    }
+    let coordinator = Arc::new(Mutex::new(coordinator_inner));
 
     // Stage 14b: register synthetic publishers and seed the oracle
     // so the per-block refresh has feeds to aggregate. In production
@@ -827,6 +847,28 @@ async fn run_reth_devnet(
         "persisted bridge snapshot ({} block(s)) → {}",
         chain_len,
         bridge_state_path.display()
+    );
+
+    // Stage 14e: persist the coordinator's load-bearing state alongside
+    // the bridge snapshot so the next boot resumes the insurance fund,
+    // vault, and oracle refresh marker.
+    let coordinator_snap = coordinator
+        .lock()
+        .map_err(|_| eyre::eyre!("coordinator mutex poisoned"))?
+        .snapshot();
+    if let Some(parent) = coordinator_state_path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    std::fs::write(
+        &coordinator_state_path,
+        serde_json::to_vec_pretty(&coordinator_snap)?,
+    )?;
+    println!(
+        "persisted coordinator snapshot (fund={}, vault_shares={}, vault_assets={}) → {}",
+        coordinator_snap.insurance_fund_balance,
+        coordinator_snap.vault_total_shares,
+        coordinator_snap.vault_total_assets,
+        coordinator_state_path.display()
     );
 
     // Clean shutdown regardless of the run_engine_app result above —

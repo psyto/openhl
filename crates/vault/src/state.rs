@@ -63,6 +63,23 @@ impl VaultState {
         }
     }
 
+    /// Reconstruct a vault from a persisted snapshot of its balances.
+    ///
+    /// Stage 14e — restart resilience: the bridge captures
+    /// `(total_shares, total_assets)` per snapshot and replays it
+    /// here on boot. Validity is the caller's responsibility — this
+    /// constructor performs no invariant checks because it can't
+    /// distinguish between a legitimate insolvent vault (shares > 0,
+    /// assets ≤ 0) and a corrupt snapshot.
+    #[must_use]
+    pub const fn restore(params: VaultParams, total_shares: u64, total_assets: i64) -> Self {
+        Self {
+            params,
+            total_shares,
+            total_assets,
+        }
+    }
+
     /// Borrow the vault's params.
     #[must_use]
     pub const fn params(&self) -> &VaultParams {

@@ -6344,6 +6344,8 @@ dependencies = [
  "openhl-oracle",
  "openhl-vault",
  "proptest",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]

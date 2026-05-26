@@ -13,9 +13,11 @@ openhl-funding     = { path = "../funding" }
 openhl-liquidation = { path = "../liquidation" }
 openhl-oracle      = { path = "../oracle" }
 openhl-vault       = { path = "../vault" }
+serde              = { workspace = true }
 
 [dev-dependencies]
-proptest = { workspace = true }
+proptest   = { workspace = true }
+serde_json = { workspace = true }
 
 [lints]
 workspace = true

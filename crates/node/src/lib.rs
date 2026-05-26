@@ -71,6 +71,7 @@ use openhl_oracle::{
     PriceObservation, PublisherKey,
 };
 use openhl_vault::{VaultParams, VaultState};
+use serde::{Deserialize, Serialize};
 
 /// Static configuration for the node. Set once at chain genesis;
 /// changing values mid-chain would fork the network.
@@ -124,6 +125,26 @@ pub struct TickInput<'a> {
     /// computed off-tick by the bridge from the vault's own perp
     /// positions.
     pub vault_total_assets: i64,
+}
+
+/// Snapshot of the [`OpenHlNode`]'s runtime state, for restart-time
+/// resume (Stage 14e). Saved to disk by the binary alongside the
+/// bridge's chain snapshot; restored via [`OpenHlNode::load_snapshot`]
+/// on the next boot before the engine app loop starts.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CoordinatorSnapshot {
+    /// Insurance fund balance carried over from the last run. The
+    /// scanner re-instantiates with this on load.
+    pub insurance_fund_balance: i64,
+    /// Total vault shares outstanding.
+    pub vault_total_shares: u64,
+    /// Total vault assets under management. May be negative if the
+    /// vault is insolvent — see [`VaultState::is_insolvent`].
+    pub vault_total_assets: i64,
+    /// Last block_time at which the oracle successfully refreshed.
+    /// Restoring this prevents an unnecessary refresh on the first
+    /// tick after restart when the interval hasn't elapsed.
+    pub last_oracle_refresh_at: Option<u64>,
 }
 
 /// Per-tick output — aggregated reports plus a snapshot of post-tick
@@ -310,6 +331,45 @@ impl OpenHlNode {
         }
     }
 
+    /// Capture the load-bearing fields for cross-restart resume
+    /// (Stage 14e). Mirrors the bridge's [`BridgeSnapshot`] —
+    /// deliberately small, covering only the fields that the next
+    /// boot can't reconstruct from config + per-block inputs.
+    ///
+    /// Excluded by design:
+    ///   - `config`: comes from the binary at boot.
+    ///   - `oracle.feeds` / `oracle.publishers`: feeds are re-ingested
+    ///     every block; publishers are re-registered by the binary at
+    ///     boot (the bridge owns the registry).
+    ///   - `scanner.params` / `vault.params`: come from config.
+    #[must_use]
+    pub fn snapshot(&self) -> CoordinatorSnapshot {
+        CoordinatorSnapshot {
+            insurance_fund_balance: self.scanner.fund_balance(),
+            vault_total_shares: self.vault.total_shares().0,
+            vault_total_assets: self.vault.total_assets().0,
+            last_oracle_refresh_at: self.last_oracle_refresh_at,
+        }
+    }
+
+    /// Apply a [`CoordinatorSnapshot`] to this node's runtime state.
+    /// Used immediately after `OpenHlNode::new` to resume from a prior
+    /// run's persisted snapshot. Publisher registrations and oracle
+    /// feed observations are NOT restored — those flow back through
+    /// `register_publisher` and `ingest_signed_observation` at boot.
+    pub fn load_snapshot(&mut self, snap: CoordinatorSnapshot) {
+        self.scanner = LiquidationScanner::new(
+            self.config.liquidation_params,
+            InsuranceFund::new(snap.insurance_fund_balance),
+        );
+        self.vault = VaultState::restore(
+            self.config.vault_params,
+            snap.vault_total_shares,
+            snap.vault_total_assets,
+        );
+        self.last_oracle_refresh_at = snap.last_oracle_refresh_at;
+    }
+
     fn maybe_refresh_oracle(
         &mut self,
         block_time: u64,
@@ -358,6 +418,42 @@ mod tests {
         assert_eq!(node.scanner().fund_balance(), 0);
         assert_eq!(node.vault().total_shares().0, 0);
         assert_eq!(node.vault().total_assets().0, 0);
+    }
+
+    #[test]
+    fn snapshot_round_trips_load_bearing_state() {
+        // Build up some non-default state, snapshot it, restore on a
+        // fresh node, and assert the load-bearing fields match.
+        let mut node = OpenHlNode::with_insurance_fund(
+            OpenHlNodeConfig::hyperliquid_default(),
+            InsuranceFund::new(750),
+        );
+        assert_eq!(node.scanner().fund_balance(), 750);
+        // Vault: pretend a depositor put 10_000 in (mints 10_000 shares at inception).
+        let _ = node.vault_mut().deposit(10_000).expect("inception deposit");
+        // last_oracle_refresh_at is private to this module — fine to
+        // set directly inside `mod tests`.
+        node.last_oracle_refresh_at = Some(12);
+
+        let snap = node.snapshot();
+        assert_eq!(snap.insurance_fund_balance, 750);
+        assert_eq!(snap.vault_total_shares, 10_000);
+        assert_eq!(snap.vault_total_assets, 10_000);
+        assert_eq!(snap.last_oracle_refresh_at, Some(12));
+
+        // Round-trip via serde to mirror the real on-disk path.
+        let bytes = serde_json::to_vec(&snap).expect("serialize");
+        let decoded: CoordinatorSnapshot = serde_json::from_slice(&bytes).expect("deserialize");
+        assert_eq!(decoded, snap);
+
+        let mut fresh = default_node();
+        assert_eq!(fresh.scanner().fund_balance(), 0);
+        assert_eq!(fresh.vault().total_shares().0, 0);
+        fresh.load_snapshot(decoded);
+        assert_eq!(fresh.scanner().fund_balance(), 750);
+        assert_eq!(fresh.vault().total_shares().0, 10_000);
+        assert_eq!(fresh.vault().total_assets().0, 10_000);
+        assert_eq!(fresh.last_oracle_refresh_at, Some(12));
     }
 
     #[test]
