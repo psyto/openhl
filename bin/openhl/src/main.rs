@@ -420,17 +420,22 @@ async fn run_reth_devnet(
         println!("      rpc bind         = {ip}:{port}");
         rpc_args.http_addr = ip;
         rpc_args.http_port = port;
-        // Stage 13l: overriding `--rpc-bind` is the signal that this
+        // Stage 13l/13n: overriding `--rpc-bind` is the signal that this
         // process shares a host with other openhl nodes. Reth's WS
         // (8546) and auth-RPC (8551) defaults would collide between
         // peers, so bind both to ephemeral ports (port 0 — OS picks).
-        // Operators who need stable WS/auth ports can switch to
-        // explicit flags later.
+        // The IPC endpoint at `/tmp/reth.ipc` is a single global path
+        // shared across processes — disable it entirely to avoid the
+        // collision (we don't use IPC yet anyway).
+        // Operators who need stable WS/auth ports or IPC can switch
+        // to explicit flags later.
         rpc_args.ws_addr = ip;
         rpc_args.ws_port = 0;
         rpc_args.auth_addr = ip;
         rpc_args.auth_port = 0;
+        rpc_args.ipcdisable = true;
         println!("      ws / auth bind   = {ip}:ephemeral (multi-node-safe)");
+        println!("      ipc              = disabled (multi-node-safe)");
     } else {
         println!("      rpc bind         = (Reth default 127.0.0.1:8545)");
     }
