@@ -731,18 +731,23 @@ async fn run_reth_devnet(
     });
     println!("      seeded clob bids/asks at 100/102 (mid 101)");
 
-    // Stage 14d: synthetic per-account snapshots. The bridge in a real
-    // perp-DEX would maintain these by applying CLOB fills + funding
-    // settlements per fill — that clearing layer is its own future
-    // stage. Until then we hand the scan a deterministic set: one
-    // healthy, one liquidatable, one underwater (see `synthetic_accounts`
-    // for the math). Both validators run the same function so both
-    // arrive at the same `ScanReport`.
-    let accounts = Arc::new(synthetic_accounts());
-    println!(
-        "      synthetic accounts = {} (healthy + liquidatable + underwater)",
-        accounts.len(),
-    );
+    // Stage 14d / 15b: synthetic per-account snapshots, now mutable.
+    // The bridge in a real perp DEX would maintain these by applying
+    // CLOB fills + funding settlements per fill — that clearing
+    // layer is its own future stage. For now we hand the tick a
+    // deterministic starting set (one healthy, one liquidatable,
+    // one underwater) and write funding settlements back into
+    // collateral after each tick (Stage 15b). Both validators
+    // run the same code on the same inputs → byte-identical
+    // post-tick balances.
+    let accounts = Arc::new(Mutex::new(synthetic_accounts()));
+    {
+        let accts = accounts.lock().expect("accounts mutex poisoned");
+        println!(
+            "      synthetic accounts = {} (healthy + liquidatable + underwater)",
+            accts.len(),
+        );
+    }
 
     let coordinator_for_hook = coordinator.clone();
     let publishers_for_hook = publishers.clone();
@@ -794,15 +799,54 @@ async fn run_reth_devnet(
                     Some(m) => (m, "clob"),
                     None => (MarkPrice(100), "stub-empty-book"),
                 };
+
+                // Stage 15b: snapshot the current mutable account
+                // state into a slice for the tick. Cloning is fine —
+                // 3 accounts is tiny and this avoids holding two
+                // mutex locks at once.
+                let snapshots: Vec<AccountSnapshot> = {
+                    let accts = accounts_for_hook
+                        .lock()
+                        .map_err(|_| eyre::eyre!("accounts mutex poisoned"))?;
+                    accts.clone()
+                };
+
                 let report = node.tick(TickInput {
                     block_height: height.0,
                     block_time,
                     mark,
-                    account_snapshots: accounts_for_hook.as_slice(),
+                    account_snapshots: &snapshots,
                     vault_total_assets,
                 });
                 println!("  mark = {} ({mark_source})", mark.0);
                 print_tick_report(&report);
+
+                // Stage 15b: apply funding settlements to the mutable
+                // account state. Each `Settlement.delta` adjusts the
+                // matching account's collateral; long-side positions
+                // typically gain when premium is negative (mark <
+                // index), short-side positions pay. Both validators
+                // apply the same deltas in the same order → identical
+                // post-tick balances.
+                if let Some(ref ft) = report.funding {
+                    let mut accts = accounts_for_hook
+                        .lock()
+                        .map_err(|_| eyre::eyre!("accounts mutex poisoned"))?;
+                    for settlement in &ft.settlements {
+                        if let Some(acct) =
+                            accts.iter_mut().find(|a| a.account == settlement.account)
+                        {
+                            let prev = acct.collateral.0;
+                            let next = prev.saturating_add(settlement.delta.0);
+                            acct.collateral = Notional(next);
+                            println!(
+                                "  funding apply: account {} collateral {} → {} (Δ={})",
+                                acct.account.0, prev, next, settlement.delta.0,
+                            );
+                        }
+                    }
+                }
+
                 let _ = hash; // hash currently unused; future stages may want it
                 Ok(())
             },
