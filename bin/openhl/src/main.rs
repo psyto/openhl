@@ -201,6 +201,17 @@ struct ValidatorEntry {
 }
 
 fn main() -> eyre::Result<()> {
+    // Initialise tracing so Malachite/libp2p events surface. Default
+    // filter `info,libp2p=warn` keeps multi-validator bring-up logs
+    // readable; override via `RUST_LOG` for deeper investigation.
+    let filter = tracing_subscriber::EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info,libp2p=warn"));
+    tracing_subscriber::fmt()
+        .with_env_filter(filter)
+        .with_target(true)
+        .try_init()
+        .ok();
+
     let cli = Cli::parse();
     match cli.command.unwrap_or(Command::Info) {
         Command::Info => {
@@ -409,6 +420,17 @@ async fn run_reth_devnet(
         println!("      rpc bind         = {ip}:{port}");
         rpc_args.http_addr = ip;
         rpc_args.http_port = port;
+        // Stage 13l: overriding `--rpc-bind` is the signal that this
+        // process shares a host with other openhl nodes. Reth's WS
+        // (8546) and auth-RPC (8551) defaults would collide between
+        // peers, so bind both to ephemeral ports (port 0 — OS picks).
+        // Operators who need stable WS/auth ports can switch to
+        // explicit flags later.
+        rpc_args.ws_addr = ip;
+        rpc_args.ws_port = 0;
+        rpc_args.auth_addr = ip;
+        rpc_args.auth_port = 0;
+        println!("      ws / auth bind   = {ip}:ephemeral (multi-node-safe)");
     } else {
         println!("      rpc bind         = (Reth default 127.0.0.1:8545)");
     }
