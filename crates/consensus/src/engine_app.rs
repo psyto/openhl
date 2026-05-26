@@ -7,6 +7,7 @@
 //! and (optionally) stop after N decisions for tests.
 
 use std::sync::Arc;
+use std::collections::HashSet;
 
 use eyre::eyre;
 use informalsystems_malachitebft_app::engine::host::Next;
@@ -57,6 +58,7 @@ where
     let mut current_parent = initial_parent;
     let mut current_height = initial_height;
     let history_min_height = initial_height;
+    let mut locally_built_heights: HashSet<OpenHlHeight> = HashSet::new();
 
     while let Some(msg) = channels.consensus.recv().await {
         match msg {
@@ -90,6 +92,7 @@ where
                 let attrs = default_attrs();
                 let id = bridge.build_payload(current_parent, attrs).await?;
                 let block = bridge.payload_ready(id).await?;
+                locally_built_heights.insert(height);
                 let value = OpenHlValue(block.hash);
                 let lpv =
                     informalsystems_malachitebft_app_channel::app::types::LocallyProposedValue::new(
@@ -140,32 +143,25 @@ where
             } => {
                 let hash = certificate.value_id;
 
-                // Stage 13n: follower-side bridge replication via
-                // deterministic recompute. The proposer's `GetValue`
-                // already populated its bridge's pending map for this
-                // height; the follower never called `build_payload` and
-                // would error in `commit` with "unknown hash". Rerunning
-                // `build_payload(current_parent, default_attrs())` here
-                // is safe because v0 payload building is a pure function
-                // of (parent, attrs): the timestamp falls out as
-                // `parent.timestamp + 1`, gas_limit/state_root copy from
-                // parent, base_fee is computed from the chain spec.
-                // Proposer-side: this is a benign duplicate insert in
-                // `pending` keyed on a fresh payload id; `commit` looks
-                // up by hash and finds the earlier entry.
-                // Once real EVM execution + mempool transactions land,
-                // payload building stops being deterministic — that
-                // stage replaces this with proposal-parts streaming.
-                let id = bridge.build_payload(current_parent, default_attrs()).await?;
-                let block = bridge.payload_ready(id).await?;
-                if block.hash != hash {
-                    return Err(eyre!(
-                        "Stage 13n: deterministic build_payload mismatch — \
-                         consensus decided {hash:?} but our recompute yielded {recomputed:?}; \
-                         the proposer's attrs or parent state diverged from ours",
-                        hash = hash,
-                        recomputed = block.hash,
-                    ));
+                // Stage 13n: follower-side bridge replication via deterministic
+                // recompute.
+                //
+                // Important: only nodes that did NOT run `GetValue` at this
+                // height should re-build. If proposer-side code re-builds here,
+                // bridge side effects can run twice (for example draining
+                // pending fills in LiveRethEvmBridge).
+                if !locally_built_heights.remove(&certificate.height) {
+                    let id = bridge.build_payload(current_parent, default_attrs()).await?;
+                    let block = bridge.payload_ready(id).await?;
+                    if block.hash != hash {
+                        return Err(eyre!(
+                            "Stage 13n: deterministic build_payload mismatch — \
+                             consensus decided {hash:?} but our recompute yielded {recomputed:?}; \
+                             the proposer's attrs or parent state diverged from ours",
+                            hash = hash,
+                            recomputed = block.hash,
+                        ));
+                    }
                 }
 
                 bridge.commit(hash).await?;
@@ -228,6 +224,7 @@ mod tests {
     use informalsystems_malachitebft_app::node::{Node as _, NodeHandle as _};
     use informalsystems_malachitebft_app::events::TxEvent;
     use informalsystems_malachitebft_app_channel::{AppMsg, Channels};
+    use informalsystems_malachitebft_core_types::{CommitCertificate, Round, VoteExtensions};
     use informalsystems_malachitebft_signing_ed25519::PrivateKey;
     use openhl_types::{ExecutedBlock, PayloadId, PayloadStatus};
     use rand::rngs::OsRng;
@@ -239,6 +236,7 @@ mod tests {
     #[derive(Debug, Default)]
     struct StubBridge {
         last_built: Mutex<Option<BlockHash>>,
+        build_calls: Mutex<usize>,
         committed: Mutex<Vec<BlockHash>>,
     }
 
@@ -251,6 +249,7 @@ mod tests {
         ) -> Result<PayloadId, BridgeError> {
             let hash = BlockHash([0x42u8; 32]);
             *self.last_built.lock().expect("poisoned") = Some(hash);
+            *self.build_calls.lock().expect("poisoned") += 1;
             Ok(PayloadId(1))
         }
 
@@ -380,6 +379,11 @@ mod tests {
             Some(decided_hash),
             "decided hash must match what we built",
         );
+        assert_eq!(
+            *bridge_for_check.build_calls.lock().unwrap(),
+            1,
+            "GetValue path should avoid duplicate build_payload on Decided for proposer heights",
+        );
 
         handle.kill(None).await.unwrap();
     }
@@ -446,6 +450,133 @@ mod tests {
         assert!(
             err.to_string().contains("consensus channel closed after 0 decisions"),
             "unexpected error: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn decided_after_get_value_does_not_rebuild_payload() {
+        let bridge = Arc::new(StubBridge::default());
+        let (tx_consensus, rx_consensus) = mpsc::channel(8);
+        let (tx_network, _rx_network) = mpsc::channel(4);
+        let channels = Channels {
+            consensus: rx_consensus,
+            network: tx_network,
+            events: TxEvent::new(),
+        };
+
+        let sk = PrivateKey::generate(OsRng);
+        let pk = sk.public_key();
+        let digest = Sha256::digest(pk.as_bytes());
+        let mut addr_bytes = [0u8; 20];
+        addr_bytes.copy_from_slice(&digest[12..32]);
+        let address = OpenHlAddress(addr_bytes);
+        let validator_set = OpenHlValidatorSet::new(vec![OpenHlValidator::new(address, pk, 1)]);
+
+        let app_task = tokio::spawn(run_engine_app(
+            bridge.clone(),
+            channels,
+            validator_set.clone(),
+            BlockHash([0u8; 32]),
+            OpenHlHeight::INITIAL,
+            1,
+        ));
+
+        let (gv_tx, gv_rx) = tokio::sync::oneshot::channel();
+        tx_consensus
+            .send(AppMsg::GetValue {
+                height: OpenHlHeight::INITIAL,
+                round: Round::new(0),
+                timeout: Duration::from_secs(1),
+                reply: gv_tx,
+            })
+            .await
+            .expect("send get value");
+        let proposed = gv_rx.await.expect("get value reply");
+        assert_eq!(proposed.value.0, BlockHash([0x42u8; 32]));
+
+        let (decided_tx, decided_rx) = tokio::sync::oneshot::channel();
+        tx_consensus
+            .send(AppMsg::Decided {
+                certificate: CommitCertificate {
+                    height: OpenHlHeight::INITIAL,
+                    round: Round::new(0),
+                    value_id: BlockHash([0x42u8; 32]),
+                    commit_signatures: Vec::new(),
+                },
+                extensions: VoteExtensions::default(),
+                reply: decided_tx,
+            })
+            .await
+            .expect("send decided");
+        drop(tx_consensus);
+
+        let _ = decided_rx.await.expect("decided reply");
+        let decisions = app_task
+            .await
+            .expect("app task join")
+            .expect("app task success");
+        assert_eq!(decisions, vec![BlockHash([0x42u8; 32])]);
+        assert_eq!(
+            *bridge.build_calls.lock().expect("poisoned"),
+            1,
+            "GetValue at this height must prevent duplicate build_payload in Decided",
+        );
+    }
+
+    #[tokio::test]
+    async fn decided_without_get_value_rebuilds_once_for_follower_path() {
+        let bridge = Arc::new(StubBridge::default());
+        let (tx_consensus, rx_consensus) = mpsc::channel(8);
+        let (tx_network, _rx_network) = mpsc::channel(4);
+        let channels = Channels {
+            consensus: rx_consensus,
+            network: tx_network,
+            events: TxEvent::new(),
+        };
+
+        let sk = PrivateKey::generate(OsRng);
+        let pk = sk.public_key();
+        let digest = Sha256::digest(pk.as_bytes());
+        let mut addr_bytes = [0u8; 20];
+        addr_bytes.copy_from_slice(&digest[12..32]);
+        let address = OpenHlAddress(addr_bytes);
+        let validator_set = OpenHlValidatorSet::new(vec![OpenHlValidator::new(address, pk, 1)]);
+
+        let app_task = tokio::spawn(run_engine_app(
+            bridge.clone(),
+            channels,
+            validator_set,
+            BlockHash([0u8; 32]),
+            OpenHlHeight::INITIAL,
+            1,
+        ));
+
+        let (decided_tx, decided_rx) = tokio::sync::oneshot::channel();
+        tx_consensus
+            .send(AppMsg::Decided {
+                certificate: CommitCertificate {
+                    height: OpenHlHeight::INITIAL,
+                    round: Round::new(0),
+                    value_id: BlockHash([0x42u8; 32]),
+                    commit_signatures: Vec::new(),
+                },
+                extensions: VoteExtensions::default(),
+                reply: decided_tx,
+            })
+            .await
+            .expect("send decided");
+        drop(tx_consensus);
+
+        let _ = decided_rx.await.expect("decided reply");
+        let decisions = app_task
+            .await
+            .expect("app task join")
+            .expect("app task success");
+        assert_eq!(decisions, vec![BlockHash([0x42u8; 32])]);
+        assert_eq!(
+            *bridge.build_calls.lock().expect("poisoned"),
+            1,
+            "Follower path should rebuild once in Decided when GetValue was not called",
         );
     }
 }
