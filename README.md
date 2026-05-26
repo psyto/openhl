@@ -56,6 +56,9 @@ Requires Rust 1.85+ (pinned via `rust-toolchain.toml`).
 
 For environment-sensitive diagnostics and manual integration checks, see
 [`docs/testing.md`](docs/testing.md).
+CI runs stable consensus tests by default (`cargo test -p openhl-consensus`);
+ignored diagnostics are reserved for manual non-sandbox runs
+(`cargo test -p openhl-consensus -- --ignored --nocapture`).
 
 ## License
 
