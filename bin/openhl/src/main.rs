@@ -39,7 +39,7 @@
 
 use std::net::IpAddr;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use alloy_genesis::Genesis;
@@ -651,6 +651,16 @@ async fn run_reth_devnet(
     let validator_set_for_engine = validator_set.clone();
     let rounds_usize = usize::try_from(rounds)
         .map_err(|_| eyre::eyre!("rounds value too large for usize on this target"))?;
+
+    // Stage 14a: integration coordinator. One `OpenHlNode` per
+    // running validator. Stage 14a only proves the pipe: every
+    // committed block triggers a `tick` and we print the report.
+    // Inputs are placeholders (no observation ingestion, no real
+    // CLOB mark, no account snapshots) — those land in 14b–14d.
+    let coordinator = Arc::new(Mutex::new(OpenHlNode::new(
+        OpenHlNodeConfig::hyperliquid_default(),
+    )));
+    let coordinator_for_hook = coordinator.clone();
     let app_task = tokio::spawn(async move {
         run_engine_app(
             bridge_for_engine,
@@ -659,6 +669,25 @@ async fn run_reth_devnet(
             initial_parent_for_consensus,
             initial_height_for_consensus,
             rounds_usize,
+            move |hash, height| {
+                let mut node = coordinator_for_hook
+                    .lock()
+                    .map_err(|_| eyre::eyre!("coordinator mutex poisoned"))?;
+                let vault_total_assets = node.vault().total_assets().0;
+                let report = node.tick(TickInput {
+                    block_height: height.0,
+                    block_time: wallclock_secs(),
+                    // Stage 14a: stub mark — CLOB mark plumbing lands in a
+                    // later sub-stage. Liquidation scan with no accounts
+                    // is a no-op so any mark works here.
+                    mark: MarkPrice(100),
+                    account_snapshots: &[],
+                    vault_total_assets,
+                });
+                print_tick_report(&report);
+                let _ = hash; // hash currently unused; future stages may want it
+                Ok(())
+            },
         )
         .await
     });

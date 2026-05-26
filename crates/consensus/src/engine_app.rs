@@ -42,17 +42,28 @@ const APP_REPLY_WAIT_LOG: &str = "engine_app: peer replied unsuccessfully (chann
 /// (Stage 13i), callers pass `OpenHlHeight(prior_decisions + 1)` so
 /// consensus log lines and any future multi-validator peers see a
 /// height that continues the prior chain instead of restarting at 1.
+/// Generic per-commit hook fired by [`run_engine_app`] after each
+/// successful `bridge.commit(hash)`. Stage 14a uses this to drive
+/// [`openhl_node::OpenHlNode::tick`] without leaking integration-layer
+/// types into the consensus crate — engine_app stays consensus-only
+/// and the binary plugs in the coordinator-tick closure.
+///
+/// The hook receives the committed block hash and its consensus height.
+/// If it returns `Err`, `run_engine_app` propagates the error.
 #[allow(clippy::too_many_lines)] // 12 AppMsg arms — laid out flat for lesson L11's match-by-match walk
-pub async fn run_engine_app<B>(
+#[allow(clippy::too_many_arguments)] // 7 args, all load-bearing — see doc comments
+pub async fn run_engine_app<B, F>(
     bridge: Arc<B>,
     mut channels: Channels<OpenHlContext>,
     validator_set: OpenHlValidatorSet,
     initial_parent: BlockHash,
     initial_height: OpenHlHeight,
     stop_after_decisions: usize,
+    mut on_committed: F,
 ) -> eyre::Result<Vec<BlockHash>>
 where
     B: ConsensusBridge + 'static,
+    F: FnMut(BlockHash, OpenHlHeight) -> eyre::Result<()> + Send,
 {
     let mut decided: Vec<BlockHash> = Vec::new();
     let mut current_parent = initial_parent;
@@ -165,6 +176,7 @@ where
                 }
 
                 bridge.commit(hash).await?;
+                on_committed(hash, certificate.height)?;
                 decided.push(hash);
                 current_parent = hash;
 
@@ -357,6 +369,7 @@ mod tests {
             BlockHash([0u8; 32]),
             OpenHlHeight::INITIAL,
             1,
+            |_hash, _height| Ok(()),
         ));
 
         let decisions = tokio::time::timeout(Duration::from_secs(15), app_task)
@@ -431,6 +444,7 @@ mod tests {
             BlockHash([0u8; 32]),
             OpenHlHeight(7),
             1,
+            |_hash, _height| Ok(()),
         ));
 
         let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
@@ -479,6 +493,7 @@ mod tests {
             BlockHash([0u8; 32]),
             OpenHlHeight::INITIAL,
             1,
+            |_hash, _height| Ok(()),
         ));
 
         let (gv_tx, gv_rx) = tokio::sync::oneshot::channel();
@@ -549,6 +564,7 @@ mod tests {
             BlockHash([0u8; 32]),
             OpenHlHeight::INITIAL,
             1,
+            |_hash, _height| Ok(()),
         ));
 
         let (decided_tx, decided_rx) = tokio::sync::oneshot::channel();
