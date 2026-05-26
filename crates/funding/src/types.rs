@@ -14,6 +14,7 @@
 //! premiums, and a separate `Notional` type for quote-currency deltas.
 
 use openhl_clob::AccountId;
+use serde::{Deserialize, Serialize};
 
 /// Scale factor for [`FundingRate`] and [`Premium`]. A raw value of
 /// `RATE_SCALE` represents `1.0` (i.e., 100%). With `1e9` we get 9 decimal
@@ -28,7 +29,7 @@ pub const RATE_SCALE: i64 = 1_000_000_000;
 /// `MarkPrice` is a single u64 not a signed-fixed-point, because prices are
 /// always positive (zero or negative price would be a system invariant
 /// violation handled upstream, not here).
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub struct MarkPrice(pub u64);
 
 /// Index price (off-chain oracle reference). Same scale as `MarkPrice`.
@@ -50,13 +51,13 @@ pub struct FundingRate(pub i64);
 /// Signed position size in base units. Positive = long, negative = short,
 /// zero = flat. Accounts with zero size aren't included in settlement
 /// snapshots — see [`Position`].
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub struct PositionSize(pub i64);
 
 /// Signed quote-currency delta. Positive = account receives, negative =
 /// account pays. Funding settlement produces one [`Notional`] per non-flat
 /// position per tick.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub struct Notional(pub i64);
 
 /// A single account's net position on the market. The funding state machine

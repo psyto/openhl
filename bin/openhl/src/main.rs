@@ -731,23 +731,32 @@ async fn run_reth_devnet(
     });
     println!("      seeded clob bids/asks at 100/102 (mid 101)");
 
-    // Stage 14d / 15b: synthetic per-account snapshots, now mutable.
-    // The bridge in a real perp DEX would maintain these by applying
-    // CLOB fills + funding settlements per fill — that clearing
-    // layer is its own future stage. For now we hand the tick a
-    // deterministic starting set (one healthy, one liquidatable,
-    // one underwater) and write funding settlements back into
-    // collateral after each tick (Stage 15b). Both validators
-    // run the same code on the same inputs → byte-identical
-    // post-tick balances.
-    let accounts = Arc::new(Mutex::new(synthetic_accounts()));
-    {
-        let accts = accounts.lock().expect("accounts mutex poisoned");
+    // Stage 14d / 15b / 15c: synthetic per-account snapshots, mutable
+    // and now persisted across restart. On boot, prefer a previously-
+    // saved account map; fall back to the deterministic
+    // `synthetic_accounts()` seed if no snapshot exists. At shutdown
+    // we write the current state back to disk so the next run picks
+    // up where this one left off (Stage 15b's funding-driven collateral
+    // changes survive reboot).
+    let accounts_state_path = data_dir_path.join("accounts").join("state.json");
+    let initial_accounts = if accounts_state_path.exists() {
+        let bytes = std::fs::read(&accounts_state_path)?;
+        let loaded: Vec<AccountSnapshot> = serde_json::from_slice(&bytes).map_err(|e| {
+            eyre::eyre!("malformed accounts snapshot at {accounts_state_path:?}: {e}")
+        })?;
         println!(
-            "      synthetic accounts = {} (healthy + liquidatable + underwater)",
-            accts.len(),
+            "      loaded accounts snapshot = {} account(s) from {}",
+            loaded.len(),
+            accounts_state_path.display(),
         );
-    }
+        loaded
+    } else {
+        println!(
+            "      synthetic accounts = 3 (healthy + liquidatable + underwater, fresh seed)",
+        );
+        synthetic_accounts()
+    };
+    let accounts = Arc::new(Mutex::new(initial_accounts));
 
     let coordinator_for_hook = coordinator.clone();
     let publishers_for_hook = publishers.clone();
@@ -918,6 +927,27 @@ async fn run_reth_devnet(
         coordinator_snap.vault_total_shares,
         coordinator_snap.vault_total_assets,
         coordinator_state_path.display()
+    );
+
+    // Stage 15c: persist the mutable account map so funding accrual
+    // (Stage 15b) survives restart. Without this, a reboot would re-
+    // seed from `synthetic_accounts()` and erase every per-block
+    // collateral change.
+    let accounts_snap: Vec<AccountSnapshot> = accounts
+        .lock()
+        .map_err(|_| eyre::eyre!("accounts mutex poisoned"))?
+        .clone();
+    if let Some(parent) = accounts_state_path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    std::fs::write(
+        &accounts_state_path,
+        serde_json::to_vec_pretty(&accounts_snap)?,
+    )?;
+    println!(
+        "persisted accounts snapshot ({} account(s)) → {}",
+        accounts_snap.len(),
+        accounts_state_path.display()
     );
 
     // Clean shutdown regardless of the run_engine_app result above —

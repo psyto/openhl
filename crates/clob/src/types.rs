@@ -6,9 +6,11 @@
 
 use core::fmt;
 
+use serde::{Deserialize, Serialize};
+
 /// Account identifier. Opaque to the CLOB; chain integration maps these to
 /// EVM addresses, validator addresses, or whatever the chain uses.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub struct AccountId(pub u64);
 
 /// Sequential order identifier. Caller allocates; the book doesn't generate.

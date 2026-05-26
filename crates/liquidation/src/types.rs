@@ -16,6 +16,7 @@
 
 use openhl_clob::{AccountId, Qty, Side};
 use openhl_funding::{MarkPrice, Notional, PositionSize};
+use serde::{Deserialize, Serialize};
 
 /// Scale factor for [`MarginRatio`] — basis points (1 bp = 0.01%).
 ///
@@ -63,7 +64,7 @@ pub enum MarginHealth {
 /// `avg_entry` is the volume-weighted average price at which the account
 /// opened its current net position. The owning layer (vault / clearing)
 /// is responsible for maintaining this across fills.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AccountSnapshot {
     pub account: AccountId,
     pub position_size: PositionSize,

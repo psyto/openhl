@@ -6247,6 +6247,7 @@ name = "openhl-clob"
 version = "0.1.0"
 dependencies = [
  "proptest",
+ "serde",
 ]
 
 [[package]]
@@ -6323,6 +6324,7 @@ version = "0.1.0"
 dependencies = [
  "openhl-clob",
  "proptest",
+ "serde",
 ]
 
 [[package]]
@@ -6332,6 +6334,7 @@ dependencies = [
  "openhl-clob",
  "openhl-funding",
  "proptest",
+ "serde",
 ]
 
 [[package]]

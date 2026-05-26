@@ -10,6 +10,7 @@ authors      = { workspace = true }
 [dependencies]
 openhl-clob    = { path = "../clob" }
 openhl-funding = { path = "../funding" }
+serde          = { workspace = true }
 
 [dev-dependencies]
 proptest = { workspace = true }
