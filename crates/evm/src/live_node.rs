@@ -74,7 +74,11 @@ pub struct LiveRethEvmBridge<P> {
     /// (Stage 16b). Indexed by [`AccountId`] for O(1) update; the
     /// `accounts_snapshot()` accessor returns a deterministically-
     /// sorted `Vec` for downstream consumers (scan, ADL, funding).
-    accounts: Mutex<HashMap<AccountId, Account>>,
+    ///
+    /// `Arc<Mutex<...>>` (Stage 17c) so the EVM-side deposit
+    /// precompile can hold a clone of the same map. Same shared-Arc
+    /// pattern as `clob` and `pending_fills`.
+    accounts: Arc<Mutex<HashMap<AccountId, Account>>>,
 }
 
 #[derive(Debug, Default)]
@@ -104,6 +108,13 @@ impl<P> LiveRethEvmBridge<P> {
         // would match but their fills would be silently dropped (Stage 9c+).
         crate::precompiles::install_fill_sink(Arc::clone(&pending_fills));
 
+        // Stage 17c: shared account map for the EVM-side deposit precompile.
+        // Same pattern as clob + fill_sink — bridge writes via `deposit` /
+        // `apply_fills_to_accounts`, EVM reads/writes via the precompile;
+        // both touch the same Arc.
+        let accounts = Arc::new(Mutex::new(HashMap::new()));
+        crate::precompiles::install_accounts(Arc::clone(&accounts));
+
         Self {
             provider,
             chain_spec,
@@ -112,7 +123,7 @@ impl<P> LiveRethEvmBridge<P> {
             pending_fills,
             engine_handle: None,
             state: Mutex::new(State::default()),
-            accounts: Mutex::new(HashMap::new()),
+            accounts,
         }
     }
 

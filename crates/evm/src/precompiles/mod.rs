@@ -23,7 +23,10 @@ use alloy_evm::revm::precompile::{
     Precompile, PrecompileId, PrecompileOutput, PrecompileResult, Precompiles,
 };
 use alloy_primitives::{address, Address, Bytes};
+use openhl_clearing::Account;
 use openhl_clob::{AccountId, Book, Fill, Order, OrderId, OrderType, Price, Qty, Side};
+use openhl_funding::Notional;
+use std::collections::HashMap;
 use std::sync::{
     atomic::{AtomicU64, Ordering},
     Arc, Mutex, RwLock,
@@ -48,8 +51,30 @@ pub const CLOB_READ_BEST_BID: Address = address!("0x0000000000000000000000000000
 /// IDs start at 1.
 pub const CLOB_PLACE_ORDER: Address = address!("0x0000000000000000000000000000000000000c1c");
 
+/// Address of the "deposit collateral" precompile (Stage 17c).
+///
+/// Solidity call shape (ABI-aligned 64-byte input):
+/// `call(gas, 0x...0c1d, calldata=(uint64 account, int64 amount), ...) → uint256 new_balance`
+///
+/// `amount` is signed (encoded as a 32-byte two's-complement big-endian
+/// integer); positive credits the account's collateral, negative debits.
+/// The returned `new_balance` is the post-deposit collateral as a
+/// signed 256-bit integer. A return of 0 means "rejected" — currently
+/// only triggered when no account map is installed; in production it
+/// would also fire on malformed input or unauthorized accounts.
+///
+/// Same caveat as `clob_place_order` (and a known v0 limitation): the
+/// mutation lands in the bridge's account map regardless of whether
+/// the calling EVM transaction reverts. Tying mutations to the
+/// transaction's success is a future hardening item.
+pub const OPENHL_DEPOSIT: Address = address!("0x0000000000000000000000000000000000000c1d");
+
 /// The minimum gas charge for invoking a CLOB precompile. Tuned later.
 const CLOB_BASE_GAS_COST: u64 = 500;
+
+/// Base gas for the deposit precompile (Stage 17c). Same magnitude as
+/// the CLOB precompiles; tuned later.
+const DEPOSIT_BASE_GAS_COST: u64 = 500;
 
 /// Monotonic order-ID counter for orders placed via the EVM. Starts at 1
 /// so the sentinel value 0 (returned on rejection) is distinguishable from
@@ -106,6 +131,25 @@ pub fn install_fill_sink(sink: Arc<Mutex<Vec<Fill>>>) {
 /// Clear the installed fill sink. Test-only typical use; idempotent.
 pub fn uninstall_fill_sink() {
     *FILL_SINK.write().expect("FILL_SINK rwlock poisoned") = None;
+}
+
+/// Process-global handle to the bridge's per-account state map (Stage
+/// 17c). When installed, the deposit precompile mutates this same map
+/// that `LiveRethEvmBridge::deposit` / `submit_order` write to, so an
+/// EVM-side deposit and a Rust-side bridge deposit are equivalent
+/// state changes.
+static ACCOUNTS_STATE: RwLock<Option<Arc<Mutex<HashMap<AccountId, Account>>>>> =
+    RwLock::new(None);
+
+/// Install the account map the deposit precompile should mutate.
+/// Companion to `install_clob` / `install_fill_sink`; same lifecycle.
+pub fn install_accounts(accounts: Arc<Mutex<HashMap<AccountId, Account>>>) {
+    *ACCOUNTS_STATE.write().expect("ACCOUNTS_STATE rwlock poisoned") = Some(accounts);
+}
+
+/// Clear the installed account map. Test-only typical use; idempotent.
+pub fn uninstall_accounts() {
+    *ACCOUNTS_STATE.write().expect("ACCOUNTS_STATE rwlock poisoned") = None;
 }
 
 /// Read the currently-installed CLOB's best bid. Returns `None` if no CLOB
@@ -237,6 +281,82 @@ fn u64_from_be_chunk(chunk: &[u8]) -> u64 {
     u64::from_be_bytes(buf)
 }
 
+/// Read a big-endian signed i64 from a 32-byte ABI chunk. Solidity's
+/// `int256` encoding is sign-extended to 32 bytes; we take the
+/// upper 24 bytes as the sign-extension and the last 8 bytes as the
+/// magnitude. Values outside `i64` range saturate.
+fn i64_from_be_chunk(chunk: &[u8]) -> i64 {
+    debug_assert!(chunk.len() == 32);
+    // Sign-extension check: bytes 0..24 must all match the sign bit
+    // of byte 24 for the value to fit in i64. If they don't, we
+    // saturate to i64::MIN or i64::MAX.
+    let sign_byte = chunk[24];
+    let sign_ext = if sign_byte & 0x80 != 0 { 0xff } else { 0x00 };
+    if chunk[..24].iter().any(|&b| b != sign_ext) {
+        return if sign_byte & 0x80 != 0 { i64::MIN } else { i64::MAX };
+    }
+    let mut buf = [0u8; 8];
+    buf.copy_from_slice(&chunk[24..32]);
+    i64::from_be_bytes(buf)
+}
+
+/// Deposit collateral on behalf of an account (Stage 17c).
+///
+/// Calldata (64 bytes):
+///   bytes  0..32  account_id (last 8 bytes are the u64; upper bytes ignored)
+///   bytes 32..64  amount     (full 32-byte sign-extended int256)
+///
+/// Returns 32 bytes: the post-deposit collateral as a big-endian
+/// `int256` (sign-extended). Returns all zeros when rejected (no
+/// account map installed, or input shorter than 64 bytes).
+#[allow(clippy::unnecessary_wraps)]
+pub(crate) fn deposit(input: &[u8], _gas_limit: u64, _reservoir: u64) -> PrecompileResult {
+    let mut out = vec![0u8; 32];
+
+    if input.len() < 64 {
+        return Ok(PrecompileOutput::new(
+            DEPOSIT_BASE_GAS_COST,
+            Bytes::from(out),
+            0,
+        ));
+    }
+
+    let account_id = u64_from_be_chunk(&input[0..32]);
+    let amount = i64_from_be_chunk(&input[32..64]);
+
+    let state = ACCOUNTS_STATE
+        .read()
+        .expect("ACCOUNTS_STATE rwlock poisoned");
+    let Some(accounts) = state.as_ref() else {
+        return Ok(PrecompileOutput::new(
+            DEPOSIT_BASE_GAS_COST,
+            Bytes::from(out),
+            0,
+        ));
+    };
+
+    let mut map = accounts.lock().expect("accounts mutex poisoned");
+    let acct = map
+        .entry(AccountId(account_id))
+        .or_insert_with(|| Account::flat(AccountId(account_id)));
+    acct.collateral = Notional(acct.collateral.0.saturating_add(amount));
+    let new_balance = acct.collateral.0;
+    drop(map);
+    drop(state);
+
+    // Encode i64 → 32-byte sign-extended big-endian.
+    let sign_ext: u8 = if new_balance < 0 { 0xff } else { 0x00 };
+    for b in &mut out[..24] {
+        *b = sign_ext;
+    }
+    out[24..32].copy_from_slice(&new_balance.to_be_bytes());
+    Ok(PrecompileOutput::new(
+        DEPOSIT_BASE_GAS_COST,
+        Bytes::from(out),
+        0,
+    ))
+}
+
 /// Build a `Precompiles` set that extends Reth's standard precompiles with
 /// openhl's CLOB-reading + CLOB-writing additions. The base set is parameterized
 /// over the hardfork's spec id so we inherit Ethereum's evolution (e.g., the
@@ -254,6 +374,11 @@ pub fn openhl_precompiles(base: &Precompiles) -> Precompiles {
             PrecompileId::custom("clob_place_order"),
             CLOB_PLACE_ORDER,
             place_order,
+        ),
+        Precompile::new(
+            PrecompileId::custom("openhl_deposit"),
+            OPENHL_DEPOSIT,
+            deposit,
         ),
     ]);
     precompiles
@@ -453,6 +578,74 @@ mod tests {
     /// fills produced by a `place_order` call flow into the sink. This is the
     /// hook the bridge relies on to surface EVM-placed fills in the next
     /// `build_payload`. With no sink installed, fills are still produced but
+    /// Stage 17c: build 64-byte deposit calldata `(uint64 account,
+    /// int64 amount)` ABI-aligned to 32-byte chunks.
+    fn deposit_calldata(account: u64, amount: i64) -> Vec<u8> {
+        let mut input = vec![0u8; 64];
+        input[24..32].copy_from_slice(&account.to_be_bytes());
+        // Sign-extend amount into bytes 32..64.
+        let sign_byte = if amount < 0 { 0xff } else { 0x00 };
+        for b in &mut input[32..56] {
+            *b = sign_byte;
+        }
+        input[56..64].copy_from_slice(&amount.to_be_bytes());
+        input
+    }
+
+    /// Stage 17c: without an installed account map, deposit returns
+    /// the zero sentinel — same shape as `place_order` / `read_best_bid`.
+    #[test]
+    fn deposit_returns_zero_when_no_accounts_installed() {
+        let _g = TEST_SERIALIZER.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        uninstall_accounts();
+
+        let calldata = deposit_calldata(42, 500);
+        let r = deposit(&calldata, 100_000, 0).expect("precompile must not error");
+        assert_eq!(r.bytes.len(), 32);
+        assert_eq!(U256::from_be_slice(&r.bytes[..32]), U256::ZERO);
+        assert_eq!(r.gas_used, DEPOSIT_BASE_GAS_COST);
+    }
+
+    /// Stage 17c: a first-time deposit creates the flat account
+    /// and credits collateral. Returns the new balance encoded as
+    /// a 32-byte sign-extended int.
+    #[test]
+    fn deposit_creates_account_and_credits_balance() {
+        let _g = TEST_SERIALIZER.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let accounts = Arc::new(Mutex::new(HashMap::new()));
+        install_accounts(Arc::clone(&accounts));
+
+        let calldata = deposit_calldata(42, 750);
+        let r = deposit(&calldata, 100_000, 0).unwrap();
+        // 32-byte big-endian decoding of a positive i64 = 750.
+        let mut buf = [0u8; 8];
+        buf.copy_from_slice(&r.bytes[24..32]);
+        assert_eq!(i64::from_be_bytes(buf), 750);
+
+        let map = accounts.lock().unwrap();
+        let acct = map.get(&AccountId(42)).expect("account created on deposit");
+        assert_eq!(acct.collateral, Notional(750));
+
+        uninstall_accounts();
+    }
+
+    /// Stage 17c: a negative amount debits the balance.
+    #[test]
+    fn deposit_accepts_negative_amount_as_debit() {
+        let _g = TEST_SERIALIZER.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let accounts = Arc::new(Mutex::new(HashMap::new()));
+        install_accounts(Arc::clone(&accounts));
+
+        let _ = deposit(&deposit_calldata(7, 1000), 100_000, 0).unwrap();
+        let r = deposit(&deposit_calldata(7, -250), 100_000, 0).unwrap();
+
+        let mut buf = [0u8; 8];
+        buf.copy_from_slice(&r.bytes[24..32]);
+        assert_eq!(i64::from_be_bytes(buf), 750);
+
+        uninstall_accounts();
+    }
+
     /// silently dropped — verified by the round-trip test above (which never
     /// installs a sink yet still observes book state changes).
     #[test]
