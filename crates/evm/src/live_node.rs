@@ -191,6 +191,23 @@ impl<P> LiveRethEvmBridge<P> {
         out
     }
 
+    /// Mutate the bridge-owned account map under its lock. Stage 16c
+    /// uses this to (a) seed the demo's starting accounts at boot and
+    /// (b) write per-tick funding settlements / liquidation closes /
+    /// ADL records back into the same map the snapshot reads from.
+    ///
+    /// The closure receives `&mut HashMap<AccountId, Account>` so
+    /// callers can both update existing entries and insert new ones.
+    /// Returning `R` lets the caller bubble values out (e.g., counts,
+    /// `Result`s) without re-locking.
+    pub fn with_accounts_mut<F, R>(&self, f: F) -> R
+    where
+        F: FnOnce(&mut HashMap<AccountId, Account>) -> R,
+    {
+        let mut accts = self.accounts.lock().expect("accounts mutex poisoned");
+        f(&mut accts)
+    }
+
     /// Inspect (read-only) the fills attached to a built payload. Returns
     /// `None` if the payload id is unknown. Production code would encode
     /// these as EVM-executable transactions before they reach the block

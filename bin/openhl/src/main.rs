@@ -50,6 +50,7 @@ use informalsystems_malachitebft_signing_ed25519::PrivateKey;
 use openhl_consensus::run_engine_app;
 use openhl_consensus::run_single_validator;
 use openhl_consensus::OpenHlPrivateKeyFile;
+use openhl_clearing::Account;
 use openhl_clob::{AccountId as ClobAccountId, Order, OrderId, OrderType, Price, Qty, Side};
 use openhl_evm::{BridgeSnapshot, InMemoryEvmBridge, LiveRethEvmBridge, OpenHlExecutorBuilder};
 use k256::ecdsa::{signature::Signer, SigningKey};
@@ -731,37 +732,36 @@ async fn run_reth_devnet(
     });
     println!("      seeded clob bids/asks at 100/102 (mid 101)");
 
-    // Stage 14d / 15b / 15c: synthetic per-account snapshots, mutable
-    // and now persisted across restart. On boot, prefer a previously-
-    // saved account map; fall back to the deterministic
-    // `synthetic_accounts()` seed if no snapshot exists. At shutdown
-    // we write the current state back to disk so the next run picks
-    // up where this one left off (Stage 15b's funding-driven collateral
-    // changes survive reboot).
-    let accounts_state_path = data_dir_path.join("accounts").join("state.json");
-    let initial_accounts = if accounts_state_path.exists() {
-        let bytes = std::fs::read(&accounts_state_path)?;
-        let loaded: Vec<AccountSnapshot> = serde_json::from_slice(&bytes).map_err(|e| {
-            eyre::eyre!("malformed accounts snapshot at {accounts_state_path:?}: {e}")
-        })?;
+    // Stage 16c: the bridge now owns the per-account map. If a prior
+    // run persisted accounts (inside `bridge/state.json` since 16b),
+    // they already came back via `load_snapshot`. Otherwise we seed
+    // the demo's three starting accounts directly into the bridge —
+    // the same `(healthy, liquidatable, underwater)` triple the prior
+    // synthetic seed produced. A future stage will replace this
+    // direct injection with real fills + an EVM-level deposit, but
+    // both validators running identical seeding code keeps the
+    // determinism contract intact.
+    let accounts_already_loaded = !bridge.accounts_snapshot().is_empty();
+    if accounts_already_loaded {
         println!(
-            "      loaded accounts snapshot = {} account(s) from {}",
-            loaded.len(),
-            accounts_state_path.display(),
+            "      accounts             = {} loaded from bridge snapshot",
+            bridge.accounts_snapshot().len(),
         );
-        loaded
     } else {
+        bridge.with_accounts_mut(|accts| {
+            for seed in seed_accounts() {
+                accts.insert(seed.account, seed);
+            }
+        });
         println!(
-            "      synthetic accounts = 3 (healthy + liquidatable + underwater, fresh seed)",
+            "      accounts             = {} seeded into bridge (healthy + liquidatable + underwater)",
+            bridge.accounts_snapshot().len(),
         );
-        synthetic_accounts()
-    };
-    let accounts = Arc::new(Mutex::new(initial_accounts));
+    }
 
     let coordinator_for_hook = coordinator.clone();
     let publishers_for_hook = publishers.clone();
     let bridge_for_hook = bridge.clone();
-    let accounts_for_hook = accounts.clone();
     let app_task = tokio::spawn(async move {
         run_engine_app(
             bridge_for_engine,
@@ -808,16 +808,20 @@ async fn run_reth_devnet(
                     None => (MarkPrice(100), "stub-empty-book"),
                 };
 
-                // Stage 15b: snapshot the current mutable account
-                // state into a slice for the tick. Cloning is fine —
-                // 3 accounts is tiny and this avoids holding two
-                // mutex locks at once.
-                let snapshots: Vec<AccountSnapshot> = {
-                    let accts = accounts_for_hook
-                        .lock()
-                        .map_err(|_| eyre::eyre!("accounts mutex poisoned"))?;
-                    accts.clone()
-                };
+                // Stage 16c: read the bridge-owned accounts into a
+                // tick-input slice. `Account` and `AccountSnapshot`
+                // are structurally identical (same fields, same
+                // types); the conversion is a field-by-field copy.
+                let snapshots: Vec<AccountSnapshot> = bridge_for_hook
+                    .accounts_snapshot()
+                    .into_iter()
+                    .map(|a| AccountSnapshot {
+                        account: a.account,
+                        position_size: a.position_size,
+                        avg_entry: a.avg_entry,
+                        collateral: a.collateral,
+                    })
+                    .collect();
 
                 let report = node.tick(TickInput {
                     block_height: height.0,
@@ -829,116 +833,95 @@ async fn run_reth_devnet(
                 println!("  mark = {} ({mark_source})", mark.0);
                 print_tick_report(&report);
 
-                // Stage 15b: apply funding settlements to the mutable
-                // account state. Each `Settlement.delta` adjusts the
-                // matching account's collateral; long-side positions
-                // typically gain when premium is negative (mark <
-                // index), short-side positions pay. Both validators
-                // apply the same deltas in the same order → identical
-                // post-tick balances.
+                // Stage 15b → 16c: apply funding settlements back to
+                // the bridge-owned account map. The bridge is the
+                // sole source of truth for per-account state — every
+                // delta lands there.
                 if let Some(ref ft) = report.funding {
-                    let mut accts = accounts_for_hook
-                        .lock()
-                        .map_err(|_| eyre::eyre!("accounts mutex poisoned"))?;
-                    for settlement in &ft.settlements {
-                        if let Some(acct) =
-                            accts.iter_mut().find(|a| a.account == settlement.account)
-                        {
-                            let prev = acct.collateral.0;
-                            let next = prev.saturating_add(settlement.delta.0);
-                            acct.collateral = Notional(next);
-                            println!(
-                                "  funding apply: account {} collateral {} → {} (Δ={})",
-                                acct.account.0, prev, next, settlement.delta.0,
-                            );
-                        }
-                    }
-                }
-
-                // Stage 15d: apply scan records (full close per
-                // outcome) and then ADL records (partial close + the
-                // counterparty's pnl_paid added to their collateral).
-                // The scanner already mutated the insurance fund
-                // balance inside the coordinator during `scan()` —
-                // we only touch per-account position/collateral here.
-                // The synthetic seed is designed so scan and ADL
-                // never target the same account from one tick (see
-                // `synthetic_accounts`).
-                if !report.liquidation.records.is_empty()
-                    || report
-                        .adl
-                        .as_ref()
-                        .is_some_and(|a| !a.records.is_empty())
-                {
-                    let mut accts = accounts_for_hook
-                        .lock()
-                        .map_err(|_| eyre::eyre!("accounts mutex poisoned"))?;
-                    for rec in &report.liquidation.records {
-                        if let Some(acct) = accts
-                            .iter_mut()
-                            .find(|a| a.account == rec.close_order.account)
-                        {
-                            let prev_coll = acct.collateral.0;
-                            match rec.outcome {
-                                CloseOutcomeKind::Solvent(sc) => {
-                                    acct.position_size = PositionSize(0);
-                                    acct.collateral = Notional(sc.residual_to_account);
-                                    println!(
-                                        "  liquidation apply: account {} closed (solvent) coll {} → {} (fee {} to fund)",
-                                        acct.account.0,
-                                        prev_coll,
-                                        sc.residual_to_account,
-                                        sc.fee_to_fund,
-                                    );
-                                }
-                                CloseOutcomeKind::Underwater(uc) => {
-                                    acct.position_size = PositionSize(0);
-                                    acct.collateral = Notional(0);
-                                    println!(
-                                        "  liquidation apply: account {} closed (underwater) coll {} → 0 (fund covered shortfall {}, fee {})",
-                                        acct.account.0,
-                                        prev_coll,
-                                        uc.shortfall_to_fund,
-                                        uc.fee_to_fund,
-                                    );
-                                }
-                            }
-                        }
-                    }
-                    if let Some(ref ar) = report.adl {
-                        for rec in &ar.records {
-                            if let Some(acct) = accts
-                                .iter_mut()
-                                .find(|a| a.account == rec.close_order.account)
-                            {
-                                let prev_size = acct.position_size.0;
-                                let prev_coll = acct.collateral.0;
-                                let qty = i64::try_from(rec.close_order.qty.0).unwrap_or(i64::MAX);
-                                // close_order.side is the *close*
-                                // side; Sell against a long shrinks
-                                // its positive size, Buy against a
-                                // short shrinks its negative size
-                                // toward zero.
-                                let new_size = match rec.close_order.side {
-                                    Side::Sell => prev_size.saturating_sub(qty),
-                                    Side::Buy => prev_size.saturating_add(qty),
-                                };
-                                acct.position_size = PositionSize(new_size);
-                                acct.collateral =
-                                    Notional(prev_coll.saturating_add(rec.pnl_paid));
+                    bridge_for_hook.with_accounts_mut(|accts| {
+                        for settlement in &ft.settlements {
+                            if let Some(acct) = accts.get_mut(&settlement.account) {
+                                let prev = acct.collateral.0;
+                                let next = prev.saturating_add(settlement.delta.0);
+                                acct.collateral = Notional(next);
                                 println!(
-                                    "  adl apply: account {} size {} → {} coll {} → {} (pnl_paid={}, haircut={})",
-                                    acct.account.0,
-                                    prev_size,
-                                    new_size,
-                                    prev_coll,
-                                    prev_coll.saturating_add(rec.pnl_paid),
-                                    rec.pnl_paid,
-                                    rec.haircut,
+                                    "  funding apply: account {} collateral {} → {} (Δ={})",
+                                    acct.account.0, prev, next, settlement.delta.0,
                                 );
                             }
                         }
-                    }
+                    });
+                }
+
+                // Stage 15d → 16c: liquidation + ADL records also
+                // go through the bridge. Same disjoint-target
+                // invariant: the synthetic seed is designed so
+                // scan and ADL never target the same account from
+                // one tick's snapshot.
+                let has_liq = !report.liquidation.records.is_empty();
+                let has_adl = report
+                    .adl
+                    .as_ref()
+                    .is_some_and(|a| !a.records.is_empty());
+                if has_liq || has_adl {
+                    bridge_for_hook.with_accounts_mut(|accts| {
+                        for rec in &report.liquidation.records {
+                            if let Some(acct) = accts.get_mut(&rec.close_order.account) {
+                                let prev_coll = acct.collateral.0;
+                                match rec.outcome {
+                                    CloseOutcomeKind::Solvent(sc) => {
+                                        acct.position_size = PositionSize(0);
+                                        acct.collateral = Notional(sc.residual_to_account);
+                                        println!(
+                                            "  liquidation apply: account {} closed (solvent) coll {} → {} (fee {} to fund)",
+                                            acct.account.0,
+                                            prev_coll,
+                                            sc.residual_to_account,
+                                            sc.fee_to_fund,
+                                        );
+                                    }
+                                    CloseOutcomeKind::Underwater(uc) => {
+                                        acct.position_size = PositionSize(0);
+                                        acct.collateral = Notional(0);
+                                        println!(
+                                            "  liquidation apply: account {} closed (underwater) coll {} → 0 (fund covered shortfall {}, fee {})",
+                                            acct.account.0,
+                                            prev_coll,
+                                            uc.shortfall_to_fund,
+                                            uc.fee_to_fund,
+                                        );
+                                    }
+                                }
+                            }
+                        }
+                        if let Some(ref ar) = report.adl {
+                            for rec in &ar.records {
+                                if let Some(acct) = accts.get_mut(&rec.close_order.account) {
+                                    let prev_size = acct.position_size.0;
+                                    let prev_coll = acct.collateral.0;
+                                    let qty = i64::try_from(rec.close_order.qty.0)
+                                        .unwrap_or(i64::MAX);
+                                    let new_size = match rec.close_order.side {
+                                        Side::Sell => prev_size.saturating_sub(qty),
+                                        Side::Buy => prev_size.saturating_add(qty),
+                                    };
+                                    acct.position_size = PositionSize(new_size);
+                                    acct.collateral =
+                                        Notional(prev_coll.saturating_add(rec.pnl_paid));
+                                    println!(
+                                        "  adl apply: account {} size {} → {} coll {} → {} (pnl_paid={}, haircut={})",
+                                        acct.account.0,
+                                        prev_size,
+                                        new_size,
+                                        prev_coll,
+                                        prev_coll.saturating_add(rec.pnl_paid),
+                                        rec.pnl_paid,
+                                        rec.haircut,
+                                    );
+                                }
+                            }
+                        }
+                    });
                 }
 
                 let _ = hash; // hash currently unused; future stages may want it
@@ -1014,25 +997,12 @@ async fn run_reth_devnet(
         coordinator_state_path.display()
     );
 
-    // Stage 15c: persist the mutable account map so funding accrual
-    // (Stage 15b) survives restart. Without this, a reboot would re-
-    // seed from `synthetic_accounts()` and erase every per-block
-    // collateral change.
-    let accounts_snap: Vec<AccountSnapshot> = accounts
-        .lock()
-        .map_err(|_| eyre::eyre!("accounts mutex poisoned"))?
-        .clone();
-    if let Some(parent) = accounts_state_path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-    std::fs::write(
-        &accounts_state_path,
-        serde_json::to_vec_pretty(&accounts_snap)?,
-    )?;
+    // Stage 16c: per-account state is now persisted inside the
+    // bridge snapshot above. The standalone `accounts/state.json`
+    // file from 15c is no longer written — the bridge owns the
+    // map.
     println!(
-        "persisted accounts snapshot ({} account(s)) → {}",
-        accounts_snap.len(),
-        accounts_state_path.display()
+        "      (accounts now persisted inside bridge snapshot — see `.accounts`)"
     );
 
     // Clean shutdown regardless of the run_engine_app result above —
@@ -1271,7 +1241,9 @@ const SYNTHETIC_FEEDS: &[(u32, u8, u64)] = &[
 ];
 
 /// Stage 14d synthetic accounts, revised in Stage 15d so scan and ADL
-/// don't both target the same account from one tick's snapshot. With
+/// don't both target the same account from one tick's snapshot, and
+/// retargeted in Stage 16c to seed `openhl_clearing::Account` into the
+/// bridge-owned map (was: a local `Vec<AccountSnapshot>`). With
 /// mark=101 and the default `LiquidationParams` (initial 10%,
 /// maintenance 2%) every validator's per-block scan should classify:
 ///
@@ -1290,22 +1262,24 @@ const SYNTHETIC_FEEDS: &[(u32, u8, u64)] = &[
 ///
 /// Same determinism story as the publishers and book seeds: every
 /// validator runs this same data through the same scan and ADL and
-/// arrives at the same records.
-fn synthetic_accounts() -> Vec<AccountSnapshot> {
+/// arrives at the same records. A future stage will replace this
+/// direct injection with real CLOB fills + an EVM-level collateral
+/// deposit primitive.
+fn seed_accounts() -> Vec<Account> {
     vec![
-        AccountSnapshot {
+        Account {
             account: ClobAccountId(10),
             position_size: PositionSize(10),
             avg_entry: MarkPrice(100),
             collateral: Notional(200),
         },
-        AccountSnapshot {
+        Account {
             account: ClobAccountId(20),
             position_size: PositionSize(10),
             avg_entry: MarkPrice(105),
             collateral: Notional(50),
         },
-        AccountSnapshot {
+        Account {
             account: ClobAccountId(30),
             position_size: PositionSize(-100),
             avg_entry: MarkPrice(50),

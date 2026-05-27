@@ -6218,6 +6218,7 @@ dependencies = [
  "informalsystems-malachitebft-app",
  "informalsystems-malachitebft-signing-ed25519",
  "k256",
+ "openhl-clearing",
  "openhl-clob",
  "openhl-consensus",
  "openhl-evm",

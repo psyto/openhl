@@ -12,6 +12,7 @@ name = "openhl"
 path = "src/main.rs"
 
 [dependencies]
+openhl-clearing    = { path = "../../crates/clearing" }
 openhl-clob        = { path = "../../crates/clob" }
 openhl-consensus   = { path = "../../crates/consensus" }
 openhl-evm         = { path = "../../crates/evm" }
