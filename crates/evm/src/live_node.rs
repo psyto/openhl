@@ -208,6 +208,23 @@ impl<P> LiveRethEvmBridge<P> {
         f(&mut accts)
     }
 
+    /// Credit `amount` quote-currency to `account`'s collateral
+    /// (Stage 17b). Creates the account in its flat state if it
+    /// doesn't exist yet — a real perp DEX deposit would land via
+    /// an EVM-side `deposit(account, amount)` call from a USDC
+    /// transfer; this is the bridge-layer hook that instruction
+    /// would invoke. Returns the new collateral balance.
+    ///
+    /// `amount` is signed to allow future withdrawal paths
+    /// (negative amount = debit), but Stage 17b only uses the
+    /// positive direction. Overflow is `saturating_add`.
+    pub fn deposit(&self, account: AccountId, amount: i64) -> openhl_funding::Notional {
+        let mut accts = self.accounts.lock().expect("accounts mutex poisoned");
+        let acct = accts.entry(account).or_insert_with(|| Account::flat(account));
+        acct.collateral = openhl_funding::Notional(acct.collateral.0.saturating_add(amount));
+        acct.collateral
+    }
+
     /// Inspect (read-only) the fills attached to a built payload. Returns
     /// `None` if the payload id is unknown. Production code would encode
     /// these as EVM-executable transactions before they reach the block
@@ -665,6 +682,35 @@ mod tests {
         assert_eq!(taker.position_size, PositionSize(-5));
         assert_eq!(taker.avg_entry, MarkPrice(100));
         assert_eq!(taker.collateral, Notional(0));
+    }
+
+    /// Stage 17b: `deposit` credits an account, creating it if
+    /// missing.
+    #[test]
+    fn deposit_creates_flat_account_and_credits_collateral() {
+        use openhl_clob::AccountId;
+        use openhl_funding::{Notional, PositionSize};
+
+        let bridge = LiveRethEvmBridge::new((), dev_chain_spec());
+
+        // First deposit on a never-seen account creates it flat
+        // (size 0, avg_entry 0) and credits collateral.
+        let balance = bridge.deposit(AccountId(42), 500);
+        assert_eq!(balance, Notional(500));
+
+        let snap = bridge.accounts_snapshot();
+        assert_eq!(snap.len(), 1);
+        assert_eq!(snap[0].account, AccountId(42));
+        assert_eq!(snap[0].position_size, PositionSize(0));
+        assert_eq!(snap[0].collateral, Notional(500));
+
+        // Second deposit adds.
+        let balance = bridge.deposit(AccountId(42), 250);
+        assert_eq!(balance, Notional(750));
+
+        // Negative amount (withdrawal) debits.
+        let balance = bridge.deposit(AccountId(42), -100);
+        assert_eq!(balance, Notional(650));
     }
 
     /// Stage 16b: bridge snapshot round-trips the account map.

@@ -750,15 +750,20 @@ async fn run_reth_devnet(
         );
         seed_mark_orders(&bridge);
         println!("      mark book            = Buy@100 / Sell@102 (mid 101)");
-        bridge.with_accounts_mut(|accts| {
-            for (id, coll) in [(10, 200), (20, 50), (30, 100)] {
-                if let Some(a) = accts.get_mut(&ClobAccountId(id)) {
-                    a.collateral = Notional(coll);
-                }
-            }
-        });
+        // Stage 17b: deposit collateral via the bridge's deposit
+        // primitive instead of mutating the account map directly.
+        // This is the bridge-layer hook an EVM-side
+        // `deposit(account, amount)` instruction would call once
+        // we have a real on-chain collateral flow.
+        for (id, coll) in [(10, 200), (20, 50), (30, 100)] {
+            let new_balance = bridge.deposit(ClobAccountId(id), coll);
+            println!(
+                "      deposit              = account {id} → collateral {}",
+                new_balance.0,
+            );
+        }
         println!(
-            "      accounts             = {} produced via fills + collateral seed",
+            "      accounts             = {} (3 from fills + MM 999)",
             bridge.accounts_snapshot().len(),
         );
     }
