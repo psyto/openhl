@@ -6302,6 +6302,7 @@ dependencies = [
  "alloy-rpc-types-engine",
  "async-trait",
  "eyre",
+ "openhl-clearing",
  "openhl-clob",
  "openhl-consensus",
  "openhl-funding",

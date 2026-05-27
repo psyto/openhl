@@ -33,8 +33,10 @@ use alloy_consensus::Header;
 use alloy_primitives::{Address, B256};
 use alloy_rpc_types_engine::ForkchoiceState;
 use async_trait::async_trait;
-use openhl_clob::{Book, Fill, FillResult, Order};
+use openhl_clearing::{apply_fill, Account};
+use openhl_clob::{AccountId, Book, Fill, FillResult, Order};
 use openhl_consensus::bridge::{BridgeError, ConsensusBridge};
+use openhl_funding::Notional;
 use openhl_types::{BlockHash, ExecutedBlock, PayloadAttrs, PayloadId, PayloadStatus};
 use reth_chainspec::{ChainSpec, EthChainSpec};
 use reth_consensus::HeaderValidator;
@@ -68,6 +70,11 @@ pub struct LiveRethEvmBridge<P> {
     /// `HashMap` — fine for unit tests, but RPC clients won't see new heads.
     engine_handle: Option<ConsensusEngineHandle<EthEngineTypes>>,
     state: Mutex<State>,
+    /// Per-account perp state, mutated by every fill the bridge sees
+    /// (Stage 16b). Indexed by [`AccountId`] for O(1) update; the
+    /// `accounts_snapshot()` accessor returns a deterministically-
+    /// sorted `Vec` for downstream consumers (scan, ADL, funding).
+    accounts: Mutex<HashMap<AccountId, Account>>,
 }
 
 #[derive(Debug, Default)]
@@ -105,6 +112,7 @@ impl<P> LiveRethEvmBridge<P> {
             pending_fills,
             engine_handle: None,
             state: Mutex::new(State::default()),
+            accounts: Mutex::new(HashMap::new()),
         }
     }
 
@@ -134,7 +142,9 @@ impl<P> LiveRethEvmBridge<P> {
     }
 
     /// Submit an order to the CLOB. Resulting fills are buffered in
-    /// `pending_fills` until the next `build_payload` drains them.
+    /// `pending_fills` until the next `build_payload` drains them,
+    /// AND (Stage 16b) routed through `openhl-clearing::apply_fill`
+    /// to update per-account position + collateral state.
     pub fn submit_order(&self, order: Order) -> FillResult {
         let mut book = self.clob.lock().expect("clob mutex poisoned");
         let result = book.submit(order);
@@ -143,8 +153,42 @@ impl<P> LiveRethEvmBridge<P> {
                 .lock()
                 .expect("pending_fills mutex poisoned")
                 .extend(result.fills.iter().copied());
+            self.apply_fills_to_accounts(&result.fills);
         }
         result
+    }
+
+    /// Walk a freshly produced fill list and update both the maker
+    /// and taker accounts. Stage 16b — the bridge is now the owning
+    /// layer for per-account perp state.
+    fn apply_fills_to_accounts(&self, fills: &[Fill]) {
+        let mut accts = self.accounts.lock().expect("accounts mutex poisoned");
+        for fill in fills {
+            let taker_side = fill.maker_side.opposite();
+
+            let maker = accts
+                .entry(fill.maker_account)
+                .or_insert_with(|| Account::flat(fill.maker_account));
+            let maker_realized = apply_fill(maker, fill.price, fill.qty, fill.maker_side);
+            maker.collateral = Notional(maker.collateral.0.saturating_add(maker_realized));
+
+            let taker = accts
+                .entry(fill.taker_account)
+                .or_insert_with(|| Account::flat(fill.taker_account));
+            let taker_realized = apply_fill(taker, fill.price, fill.qty, taker_side);
+            taker.collateral = Notional(taker.collateral.0.saturating_add(taker_realized));
+        }
+    }
+
+    /// Snapshot the current per-account state as a deterministically
+    /// sorted `Vec` (by `AccountId` ascending). Downstream tick
+    /// consumers (Stage 16c) read this each block.
+    #[must_use]
+    pub fn accounts_snapshot(&self) -> Vec<Account> {
+        let accts = self.accounts.lock().expect("accounts mutex poisoned");
+        let mut out: Vec<Account> = accts.values().copied().collect();
+        out.sort_by_key(|a| a.account.0);
+        out
     }
 
     /// Inspect (read-only) the fills attached to a built payload. Returns
@@ -186,11 +230,16 @@ impl<P> LiveRethEvmBridge<P> {
         Some(openhl_funding::MarkPrice((bid.0 + ask.0) / 2))
     }
 
-    /// Snapshot of the bridge's committed-chain state (Stage 13g).
+    /// Snapshot of the bridge's committed-chain state (Stage 13g)
+    /// plus per-account perp state (Stage 16b).
     ///
     /// Captures only the load-bearing fields for cross-restart resume:
     ///   - `chain`: every block consensus has committed so far.
     ///   - `head`: the most recent committed block hash, if any.
+    ///   - `accounts`: every account that has ever appeared in a
+    ///     fill, with its current `(position_size, avg_entry,
+    ///     collateral)`. Sorted by `account.0` for stable on-disk
+    ///     diffs.
     ///
     /// Deliberately excludes:
     ///   - `next_payload_id`: a monotonic counter for in-flight
@@ -205,21 +254,29 @@ impl<P> LiveRethEvmBridge<P> {
     #[must_use]
     pub fn snapshot(&self) -> BridgeSnapshot {
         let s = self.state.lock().expect("state mutex poisoned");
+        let accounts = self.accounts_snapshot();
         BridgeSnapshot {
             chain: s.chain.clone(),
             head: s.head,
+            accounts,
         }
     }
 
     /// Replace the bridge's committed-chain state with `snapshot`
-    /// (Stage 13g). Pending payloads and the fill buffer are NOT
-    /// touched — they remain whatever the caller's bridge was holding
-    /// before the load. Typical use is to call this immediately after
-    /// `LiveRethEvmBridge::new` and before consensus starts.
+    /// (Stage 13g + 16b). Pending payloads and the fill buffer are
+    /// NOT touched — they remain whatever the caller's bridge was
+    /// holding before the load. Typical use is to call this
+    /// immediately after `LiveRethEvmBridge::new` and before
+    /// consensus starts.
     pub fn load_snapshot(&self, snapshot: BridgeSnapshot) {
         let mut s = self.state.lock().expect("state mutex poisoned");
         s.chain = snapshot.chain;
         s.head = snapshot.head;
+        let mut accts = self.accounts.lock().expect("accounts mutex poisoned");
+        accts.clear();
+        for acct in snapshot.accounts {
+            accts.insert(acct.account, acct);
+        }
     }
 }
 
@@ -235,15 +292,23 @@ impl<P> LiveRethEvmBridge<P> {
 pub struct BridgeSnapshot {
     pub chain: HashMap<B256, Header>,
     pub head: Option<B256>,
+    /// Per-account perp state, persisted so that restart preserves
+    /// the cumulative effect of every fill the bridge has applied
+    /// (Stage 16b). `#[serde(default)]` so old on-disk snapshots
+    /// (Stage 13g..15c era) deserialize cleanly into an empty
+    /// account map.
+    #[serde(default)]
+    pub accounts: Vec<Account>,
 }
 
 impl BridgeSnapshot {
-    /// Empty snapshot — no blocks committed, no head.
+    /// Empty snapshot — no blocks committed, no head, no accounts.
     #[must_use]
     pub fn empty() -> Self {
         Self {
             chain: HashMap::new(),
             head: None,
+            accounts: Vec::new(),
         }
     }
 }
@@ -531,6 +596,89 @@ mod tests {
             order_type: OrderType::Limit { price: Price(103) },
         });
         assert_eq!(bridge.current_mark(), Some(MarkPrice(101)));
+    }
+
+    /// Stage 16b: a crossing taker against a resting maker should
+    /// produce two accounts in the bridge's account map, each with
+    /// the correct position direction.
+    #[test]
+    fn submit_order_routes_fills_through_apply_fill() {
+        use openhl_clob::{AccountId, OrderId, OrderType, Price, Qty, Side};
+        use openhl_funding::{MarkPrice, Notional, PositionSize};
+
+        let bridge = LiveRethEvmBridge::new((), dev_chain_spec());
+
+        // Maker (account 1) rests a Buy limit at 100.
+        bridge.submit_order(Order {
+            id: OrderId(1),
+            account: AccountId(1),
+            side: Side::Buy,
+            qty: Qty(5),
+            order_type: OrderType::Limit { price: Price(100) },
+        });
+        // Resting only — no fill yet, no accounts touched.
+        assert!(bridge.accounts_snapshot().is_empty());
+
+        // Taker (account 2) crosses with a Sell market for 5.
+        bridge.submit_order(Order {
+            id: OrderId(2),
+            account: AccountId(2),
+            side: Side::Sell,
+            qty: Qty(5),
+            order_type: OrderType::Market,
+        });
+
+        let snapshot = bridge.accounts_snapshot();
+        assert_eq!(snapshot.len(), 2, "both accounts should now exist");
+
+        // Sorted ascending by account_id.
+        let maker = snapshot[0];
+        let taker = snapshot[1];
+        assert_eq!(maker.account, AccountId(1));
+        assert_eq!(taker.account, AccountId(2));
+
+        // Maker bought 5 @ 100 → long 5, avg_entry 100, no realized
+        // PnL (opening from flat).
+        assert_eq!(maker.position_size, PositionSize(5));
+        assert_eq!(maker.avg_entry, MarkPrice(100));
+        assert_eq!(maker.collateral, Notional(0));
+
+        // Taker sold 5 @ 100 → short 5, avg_entry 100, no realized
+        // PnL.
+        assert_eq!(taker.position_size, PositionSize(-5));
+        assert_eq!(taker.avg_entry, MarkPrice(100));
+        assert_eq!(taker.collateral, Notional(0));
+    }
+
+    /// Stage 16b: bridge snapshot round-trips the account map.
+    #[test]
+    fn snapshot_round_trips_accounts() {
+        use openhl_clob::{AccountId, OrderId, OrderType, Price, Qty, Side};
+
+        let bridge = LiveRethEvmBridge::new((), dev_chain_spec());
+        bridge.submit_order(Order {
+            id: OrderId(1),
+            account: AccountId(7),
+            side: Side::Buy,
+            qty: Qty(3),
+            order_type: OrderType::Limit { price: Price(100) },
+        });
+        bridge.submit_order(Order {
+            id: OrderId(2),
+            account: AccountId(8),
+            side: Side::Sell,
+            qty: Qty(3),
+            order_type: OrderType::Market,
+        });
+
+        let snap = bridge.snapshot();
+        assert_eq!(snap.accounts.len(), 2);
+
+        // Restore on a fresh bridge.
+        let bridge2 = LiveRethEvmBridge::new((), dev_chain_spec());
+        bridge2.load_snapshot(snap);
+        assert_eq!(bridge2.accounts_snapshot().len(), 2);
+        assert_eq!(bridge2.accounts_snapshot(), bridge.accounts_snapshot());
     }
 
     /// END-TO-END Stage 7b: bootstrap a real Reth node, hand its provider to

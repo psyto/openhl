@@ -69,6 +69,12 @@ pub struct Fill {
     pub taker_account: AccountId,
     pub price: Price,
     pub qty: Qty,
+    /// Side of the *maker*'s resting order (Buy = the maker was
+    /// buying = their position long-increases). The taker's side
+    /// is the opposite. Carried explicitly so downstream consumers
+    /// (the bridge, `openhl-clearing::apply_fill`) don't have to
+    /// re-look-up the original order.
+    pub maker_side: Side,
 }
 
 /// Result of submitting a taker order.

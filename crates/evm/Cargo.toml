@@ -11,6 +11,7 @@ authors      = { workspace = true }
 openhl-consensus         = { workspace = true }
 openhl-types             = { workspace = true }
 openhl-clob              = { workspace = true }
+openhl-clearing          = { workspace = true }
 openhl-funding           = { workspace = true }
 async-trait              = { workspace = true }
 eyre                     = { workspace = true }

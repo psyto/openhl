@@ -259,6 +259,9 @@ fn match_at_level(
         taker_account: taker.account,
         price,
         qty: fill_qty,
+        // RestingOrder is on the opposite side of the book from the
+        // taker crossing it.
+        maker_side: taker.side.opposite(),
     };
 
     maker.qty.0 -= fill_qty.0;
