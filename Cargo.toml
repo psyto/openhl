@@ -9,6 +9,7 @@ members = [
     "crates/funding",
     "crates/liquidation",
     "crates/vault",
+    "crates/clearing",
     "crates/evm",
     "crates/consensus",
     "crates/node",
@@ -31,6 +32,7 @@ openhl-oracle      = { path = "crates/oracle" }
 openhl-funding     = { path = "crates/funding" }
 openhl-liquidation = { path = "crates/liquidation" }
 openhl-vault       = { path = "crates/vault" }
+openhl-clearing    = { path = "crates/clearing" }
 openhl-evm         = { path = "crates/evm" }
 openhl-consensus   = { path = "crates/consensus" }
 openhl-node        = { path = "crates/node" }

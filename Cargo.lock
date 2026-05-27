@@ -6243,6 +6243,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "openhl-clearing"
+version = "0.1.0"
+dependencies = [
+ "openhl-clob",
+ "openhl-funding",
+ "proptest",
+ "serde",
+]
+
+[[package]]
 name = "openhl-clob"
 version = "0.1.0"
 dependencies = [
