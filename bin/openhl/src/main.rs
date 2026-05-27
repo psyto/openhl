@@ -50,7 +50,6 @@ use informalsystems_malachitebft_signing_ed25519::PrivateKey;
 use openhl_consensus::run_engine_app;
 use openhl_consensus::run_single_validator;
 use openhl_consensus::OpenHlPrivateKeyFile;
-use openhl_clearing::Account;
 use openhl_clob::{AccountId as ClobAccountId, Order, OrderId, OrderType, Price, Qty, Side};
 use openhl_evm::{BridgeSnapshot, InMemoryEvmBridge, LiveRethEvmBridge, OpenHlExecutorBuilder};
 use k256::ecdsa::{signature::Signer, SigningKey};
@@ -709,52 +708,57 @@ async fn run_reth_devnet(
     );
     let publishers = Arc::new(publishers);
 
-    // Stage 14c: seed the bridge's CLOB with a tight two-sided
-    // book so `bridge.current_mark()` returns a meaningful mid
-    // every tick. Same determinism story as the synthetic
-    // publishers: every validator runs this same code path at
-    // boot, so every validator's book starts at (bid=100, ask=102)
-    // → mark=101. Without these orders the book is empty and the
-    // tick falls back to a stub mark.
-    let _ = bridge.submit_order(Order {
-        id: OrderId(1),
-        account: ClobAccountId(1),
-        side: Side::Buy,
-        qty: Qty(10),
-        order_type: OrderType::Limit { price: Price(100) },
-    });
-    let _ = bridge.submit_order(Order {
-        id: OrderId(2),
-        account: ClobAccountId(2),
-        side: Side::Sell,
-        qty: Qty(10),
-        order_type: OrderType::Limit { price: Price(102) },
-    });
-    println!("      seeded clob bids/asks at 100/102 (mid 101)");
-
-    // Stage 16c: the bridge now owns the per-account map. If a prior
-    // run persisted accounts (inside `bridge/state.json` since 16b),
-    // they already came back via `load_snapshot`. Otherwise we seed
-    // the demo's three starting accounts directly into the bridge —
-    // the same `(healthy, liquidatable, underwater)` triple the prior
-    // synthetic seed produced. A future stage will replace this
-    // direct injection with real fills + an EVM-level deposit, but
-    // both validators running identical seeding code keeps the
-    // determinism contract intact.
+    // Stage 17a: seed accounts via real CLOB fills instead of
+    // direct map injection (the 16c approach). A market-maker
+    // account (999) rests three limit orders; accounts 10, 20,
+    // and 30 each cross with a market taker. The bridge's
+    // `submit_order` routes each resulting fill through
+    // `openhl-clearing::apply_fill` (Stage 16b), so the account
+    // map populates organically. The MM ends up with whatever
+    // net position the trades leave it with — for these inputs:
+    // long 80 @ avg 50 with +1040 realized PnL from closing its
+    // short into the 30-side trade.
+    //
+    // After the fills land, two token resting orders give
+    // `current_mark()` a midpoint (Buy @ 100, Sell @ 102, mid
+    // 101) since the three trades exhausted all the matched
+    // liquidity. Then `with_accounts_mut` seeds collaterals on
+    // the three target accounts — a placeholder for an
+    // eventual EVM-side deposit primitive.
+    //
+    // Account 999's mere presence shifts the cascade shape from
+    // the 16c synthetic: 999 is Safe + ADL-eligible (high
+    // positive PnL at the live mark), so it ranks ahead of
+    // account 10 in ADL's score order. Deficit absorption hits
+    // 999 first.
     let accounts_already_loaded = !bridge.accounts_snapshot().is_empty();
     if accounts_already_loaded {
         println!(
             "      accounts             = {} loaded from bridge snapshot",
             bridge.accounts_snapshot().len(),
         );
+        // The mark-providing token orders are not part of the
+        // bridge's persisted state (the CLOB book itself doesn't
+        // snapshot today), so re-seed them on every boot.
+        seed_mark_orders(&bridge);
+        println!("      mark book            = re-seeded (Buy@100 / Sell@102)");
     } else {
+        let fills_count = seed_accounts_via_fills(&bridge);
+        println!(
+            "      seed fills           = {} (MM-account 999 ↔ accounts 10/20/30)",
+            fills_count,
+        );
+        seed_mark_orders(&bridge);
+        println!("      mark book            = Buy@100 / Sell@102 (mid 101)");
         bridge.with_accounts_mut(|accts| {
-            for seed in seed_accounts() {
-                accts.insert(seed.account, seed);
+            for (id, coll) in [(10, 200), (20, 50), (30, 100)] {
+                if let Some(a) = accts.get_mut(&ClobAccountId(id)) {
+                    a.collateral = Notional(coll);
+                }
             }
         });
         println!(
-            "      accounts             = {} seeded into bridge (healthy + liquidatable + underwater)",
+            "      accounts             = {} produced via fills + collateral seed",
             bridge.accounts_snapshot().len(),
         );
     }
@@ -1240,52 +1244,108 @@ const SYNTHETIC_FEEDS: &[(u32, u8, u64)] = &[
     (3, 3, 103),
 ];
 
-/// Stage 14d synthetic accounts, revised in Stage 15d so scan and ADL
-/// don't both target the same account from one tick's snapshot, and
-/// retargeted in Stage 16c to seed `openhl_clearing::Account` into the
-/// bridge-owned map (was: a local `Vec<AccountSnapshot>`). With
-/// mark=101 and the default `LiquidationParams` (initial 10%,
-/// maintenance 2%) every validator's per-block scan should classify:
+/// Stage 17a: drive account creation through real CLOB fills instead
+/// of `with_accounts_mut` injection. A market-maker account (id 999)
+/// rests three limit orders; accounts 10, 20, and 30 take them as
+/// market orders. The bridge's `submit_order` routes each fill
+/// through `openhl-clearing::apply_fill`, so the account map
+/// populates as a by-product of the trades.
 ///
-///   - account 10: long 10 @ 100, collateral 200 → safe + ADL-eligible
-///       PnL = +10, equity = 210, ratio 21% > 10% → Safe
-///       PnL > 0 → eligible to absorb deficit via ADL
+/// Sequence (deterministic across validators — both nodes execute
+/// this identically on boot):
 ///
-///   - account 20: long 10 @ 105, collateral 50 → liquidatable
-///       PnL = (101−105)·10 = −40, equity = 10, ratio ≈ 1% < 2%
-///       → Liquidatable; PnL ≤ 0 → NOT ADL-eligible (so scan
-///       and ADL never target it from the same snapshot)
+///   1. MM Sell-limit 10 @ 100 → account 10 Buy-market 10
+///   2. MM Sell-limit 10 @ 105 → account 20 Buy-market 10
+///   3. MM Buy-limit 100 @ 50 → account 30 Sell-market 100
 ///
-///   - account 30: short 100 @ 50, collateral 100 → underwater
-///       PnL = (50−101)·100 = −5100, equity ≈ −5000 → negative
-///       equity; not ADL-eligible
+/// Resulting positions:
+///   - account 10: long 10 @ 100
+///   - account 20: long 10 @ 105
+///   - account 30: short 100 @ 50
+///   - account 999: long 80 @ 50, +1040 realized PnL (closes its
+///     short 20 @ 102 against step 3's Buy-100-@-50, then opens
+///     long 80 @ 50). The MM is now a real participant — Safe and
+///     ADL-eligible because of its large positive unrealized PnL
+///     at the live mark.
 ///
-/// Same determinism story as the publishers and book seeds: every
-/// validator runs this same data through the same scan and ADL and
-/// arrives at the same records. A future stage will replace this
-/// direct injection with real CLOB fills + an EVM-level collateral
-/// deposit primitive.
-fn seed_accounts() -> Vec<Account> {
-    vec![
-        Account {
-            account: ClobAccountId(10),
-            position_size: PositionSize(10),
-            avg_entry: MarkPrice(100),
-            collateral: Notional(200),
-        },
-        Account {
-            account: ClobAccountId(20),
-            position_size: PositionSize(10),
-            avg_entry: MarkPrice(105),
-            collateral: Notional(50),
-        },
-        Account {
-            account: ClobAccountId(30),
-            position_size: PositionSize(-100),
-            avg_entry: MarkPrice(50),
-            collateral: Notional(100),
-        },
-    ]
+/// Returns the total number of fills produced.
+#[allow(clippy::too_many_lines)]
+fn seed_accounts_via_fills<P>(bridge: &LiveRethEvmBridge<P>) -> usize {
+    let mut fills = 0;
+
+    let r = bridge.submit_order(Order {
+        id: OrderId(1001),
+        account: ClobAccountId(999),
+        side: Side::Sell,
+        qty: Qty(10),
+        order_type: OrderType::Limit { price: Price(100) },
+    });
+    fills += r.fills.len();
+    let r = bridge.submit_order(Order {
+        id: OrderId(1002),
+        account: ClobAccountId(10),
+        side: Side::Buy,
+        qty: Qty(10),
+        order_type: OrderType::Market,
+    });
+    fills += r.fills.len();
+
+    let r = bridge.submit_order(Order {
+        id: OrderId(1003),
+        account: ClobAccountId(999),
+        side: Side::Sell,
+        qty: Qty(10),
+        order_type: OrderType::Limit { price: Price(105) },
+    });
+    fills += r.fills.len();
+    let r = bridge.submit_order(Order {
+        id: OrderId(1004),
+        account: ClobAccountId(20),
+        side: Side::Buy,
+        qty: Qty(10),
+        order_type: OrderType::Market,
+    });
+    fills += r.fills.len();
+
+    let r = bridge.submit_order(Order {
+        id: OrderId(1005),
+        account: ClobAccountId(999),
+        side: Side::Buy,
+        qty: Qty(100),
+        order_type: OrderType::Limit { price: Price(50) },
+    });
+    fills += r.fills.len();
+    let r = bridge.submit_order(Order {
+        id: OrderId(1006),
+        account: ClobAccountId(30),
+        side: Side::Sell,
+        qty: Qty(100),
+        order_type: OrderType::Market,
+    });
+    fills += r.fills.len();
+
+    fills
+}
+
+/// Stage 17a: place two token resting orders so `current_mark()`
+/// has a bid + ask to compute a midpoint. The
+/// `seed_accounts_via_fills` sequence exhausts all matched
+/// liquidity, leaving the book empty.
+fn seed_mark_orders<P>(bridge: &LiveRethEvmBridge<P>) {
+    let _ = bridge.submit_order(Order {
+        id: OrderId(2001),
+        account: ClobAccountId(1),
+        side: Side::Buy,
+        qty: Qty(1),
+        order_type: OrderType::Limit { price: Price(100) },
+    });
+    let _ = bridge.submit_order(Order {
+        id: OrderId(2002),
+        account: ClobAccountId(2),
+        side: Side::Sell,
+        qty: Qty(1),
+        order_type: OrderType::Limit { price: Price(102) },
+    });
 }
 
 fn short_hash(h: &BlockHash) -> String {
