@@ -153,6 +153,14 @@ pub struct CoordinatorSnapshot {
     /// extra settlement on the first tick after restart when the
     /// interval hasn't elapsed.
     pub funding_last_settled_at: u64,
+    /// Cached oracle aggregate from the last successful refresh
+    /// (Stage 16d). Persisting it means the funding clock and any
+    /// other consumer of `oracle.current_price()` keep working
+    /// across restart instead of silently pausing until the next
+    /// refresh interval elapses. `#[serde(default)]` so older
+    /// on-disk coordinator snapshots deserialize as `None`.
+    #[serde(default)]
+    pub cached_oracle_price: Option<AggregatedPrice>,
 }
 
 /// Per-tick output — aggregated reports plus a snapshot of post-tick
@@ -391,6 +399,7 @@ impl OpenHlNode {
             vault_total_assets: self.vault.total_assets().0,
             last_oracle_refresh_at: self.last_oracle_refresh_at,
             funding_last_settled_at: self.funding_clock.last_settled_at(),
+            cached_oracle_price: self.oracle.current(),
         }
     }
 
@@ -414,6 +423,9 @@ impl OpenHlNode {
             snap.funding_last_settled_at,
         );
         self.last_oracle_refresh_at = snap.last_oracle_refresh_at;
+        if let Some(price) = snap.cached_oracle_price {
+            self.oracle.restore_current(price);
+        }
     }
 
     fn maybe_refresh_oracle(
@@ -483,6 +495,12 @@ mod tests {
 
         // Pretend the funding clock has settled once at block_time 9.
         node.funding_clock = FundingClock::new(node.config.funding_params, 9);
+        // Stage 16d: also pretend the oracle has a cached price.
+        node.oracle.restore_current(AggregatedPrice {
+            index: openhl_funding::IndexPrice(102),
+            computed_at: 12,
+            feeds_used: 3,
+        });
 
         let snap = node.snapshot();
         assert_eq!(snap.insurance_fund_balance, 750);
@@ -490,6 +508,10 @@ mod tests {
         assert_eq!(snap.vault_total_assets, 10_000);
         assert_eq!(snap.last_oracle_refresh_at, Some(12));
         assert_eq!(snap.funding_last_settled_at, 9);
+        assert_eq!(
+            snap.cached_oracle_price.map(|p| p.index.0),
+            Some(102),
+        );
 
         // Round-trip via serde to mirror the real on-disk path.
         let bytes = serde_json::to_vec(&snap).expect("serialize");
@@ -500,12 +522,17 @@ mod tests {
         assert_eq!(fresh.scanner().fund_balance(), 0);
         assert_eq!(fresh.vault().total_shares().0, 0);
         assert_eq!(fresh.funding_clock.last_settled_at(), 0);
+        assert_eq!(fresh.oracle().current_price(), None);
         fresh.load_snapshot(decoded);
         assert_eq!(fresh.scanner().fund_balance(), 750);
         assert_eq!(fresh.vault().total_shares().0, 10_000);
         assert_eq!(fresh.vault().total_assets().0, 10_000);
         assert_eq!(fresh.last_oracle_refresh_at, Some(12));
         assert_eq!(fresh.funding_clock.last_settled_at(), 9);
+        assert_eq!(
+            fresh.oracle().current_price(),
+            Some(openhl_funding::IndexPrice(102)),
+        );
     }
 
     #[test]

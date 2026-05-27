@@ -18,6 +18,7 @@
 //! CLOB-derived mark price to compute the per-interval funding rate.
 
 use openhl_funding::IndexPrice;
+use serde::{Deserialize, Serialize};
 
 /// Bps scale factor. 1 bp = 0.01%; `DEVIATION_SCALE` = 10⁴ means
 /// `100% = 10_000 bps`. Mirrors `MARGIN_SCALE` from `openhl-liquidation`
@@ -120,7 +121,7 @@ impl PriceObservation {
 
 /// The aggregator's output — one canonical index price plus the
 /// metadata callers need to audit/decide whether to use it.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AggregatedPrice {
     /// The aggregated index price (median of fresh non-deviating feeds).
     pub index: IndexPrice,

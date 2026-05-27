@@ -158,6 +158,17 @@ impl OracleState {
         self.current.map(|c| c.index)
     }
 
+    /// Replace the cached aggregate. Stage 16d — used by the
+    /// integration coordinator's `load_snapshot` to restore the
+    /// previous run's price; without this, callers that gate
+    /// behavior on `current_price().is_some()` (the funding clock,
+    /// for one) silently disable themselves across restart until
+    /// the next refresh interval elapses. Production callers
+    /// shouldn't reach for this outside the restart path.
+    pub const fn restore_current(&mut self, price: AggregatedPrice) {
+        self.current = Some(price);
+    }
+
     /// Validate and store one observation **without** verifying its
     /// signature. The `signature` field is ignored entirely.
     ///

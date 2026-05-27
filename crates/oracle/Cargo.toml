@@ -10,6 +10,7 @@ authors      = { workspace = true }
 [dependencies]
 openhl-funding = { path = "../funding" }
 k256           = { version = "0.13", default-features = false, features = ["ecdsa", "std", "precomputed-tables"] }
+serde          = { workspace = true }
 
 [dev-dependencies]
 proptest = { workspace = true }

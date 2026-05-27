@@ -32,8 +32,11 @@ pub const RATE_SCALE: i64 = 1_000_000_000;
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub struct MarkPrice(pub u64);
 
+// IndexPrice derive lives below; both gain serde in Stage 16d for
+// cached-oracle-price persistence.
+
 /// Index price (off-chain oracle reference). Same scale as `MarkPrice`.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub struct IndexPrice(pub u64);
 
 /// Premium = `(mark - index) / index`, scaled by [`RATE_SCALE`].
