@@ -1046,6 +1046,95 @@ mod tests {
         drop(handle);
     }
 
+    /// **Stage 17d**: mirror of the CLOB precompile test above, but for
+    /// `openhl_deposit`. Proves the load-bearing wiring:
+    ///
+    ///   1. `LiveRethEvmBridge::new` calls
+    ///      `precompiles::install_accounts(Arc::clone(&accounts))`,
+    ///      so the bridge's account-map `Arc` becomes the precompile
+    ///      module's `ACCOUNTS_STATE` global.
+    ///   2. A call to the `deposit` precompile function mutates that
+    ///      same map, observable via `bridge.accounts_snapshot()`.
+    ///
+    /// Like the CLOB end-to-end test, this calls the precompile
+    /// function directly with synthesized calldata rather than going
+    /// through a full EVM transaction. A Solidity-side test would
+    /// add transaction signing + pool submission + block production
+    /// on top — that's its own stage. What this test pins is the
+    /// architecture-level claim that a smart contract calling the
+    /// precompile address sees the same accounts the bridge writes
+    /// to.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn deposit_precompile_mutates_bridge_accounts() {
+        use crate::precompiles::{deposit, uninstall_accounts, uninstall_clob, uninstall_fill_sink};
+        use crate::OpenHlExecutorBuilder;
+        use openhl_clob::AccountId;
+        use openhl_funding::Notional;
+        use reth_node_ethereum::node::EthereumAddOns;
+
+        // Start from a clean global state — earlier tests may have
+        // left an accounts map installed.
+        uninstall_accounts();
+        uninstall_clob();
+        uninstall_fill_sink();
+
+        let runtime = Runtime::test();
+        let chain_spec = dev_chain_spec();
+        let node_config = NodeConfig::test().dev().with_chain(chain_spec.clone());
+
+        let handle = NodeBuilder::new(node_config)
+            .testing_node(runtime)
+            .with_types::<EthereumNode>()
+            .with_components(EthereumNode::components().executor(OpenHlExecutorBuilder))
+            .with_add_ons(EthereumAddOns::default())
+            .launch()
+            .await
+            .expect("launch of custom-EVM node failed");
+
+        // Constructing the bridge installs the accounts Arc as the
+        // precompile module's ACCOUNTS_STATE global.
+        let bridge = LiveRethEvmBridge::new(handle.node.provider.clone(), chain_spec);
+        assert!(
+            bridge.accounts_snapshot().is_empty(),
+            "fresh bridge has no accounts yet",
+        );
+
+        // Build deposit calldata: (uint64 account=7, int64 amount=1000).
+        let mut calldata = vec![0u8; 64];
+        calldata[24..32].copy_from_slice(&7u64.to_be_bytes());
+        // amount = 1000, sign-extended (positive — upper 24 bytes stay zero).
+        calldata[56..64].copy_from_slice(&1000_i64.to_be_bytes());
+
+        let r = deposit(&calldata, 100_000, 0).expect("deposit must not error");
+        // Returned balance encoded as 32-byte sign-extended int.
+        let mut buf = [0u8; 8];
+        buf.copy_from_slice(&r.bytes[24..32]);
+        assert_eq!(i64::from_be_bytes(buf), 1000);
+
+        // The bridge's view now reflects the deposit: a single
+        // account 7 with collateral 1000. This is what proves the
+        // shared `Arc<Mutex<HashMap<...>>>` between the bridge and
+        // the precompile global.
+        let snap = bridge.accounts_snapshot();
+        assert_eq!(snap.len(), 1);
+        assert_eq!(snap[0].account, AccountId(7));
+        assert_eq!(snap[0].collateral, Notional(1000));
+
+        // A second deposit accumulates.
+        let mut calldata2 = vec![0u8; 64];
+        calldata2[24..32].copy_from_slice(&7u64.to_be_bytes());
+        calldata2[56..64].copy_from_slice(&250_i64.to_be_bytes());
+        let _ = deposit(&calldata2, 100_000, 0).unwrap();
+
+        let snap = bridge.accounts_snapshot();
+        assert_eq!(snap[0].collateral, Notional(1250));
+
+        uninstall_accounts();
+        uninstall_clob();
+        uninstall_fill_sink();
+        drop(handle);
+    }
+
     /// **Stage 7d**: with a Reth `ConsensusEngineHandle` installed, `commit`
     /// sends a `ForkchoiceUpdated` to the in-process Engine API. The bridge's
     /// own bookkeeping still happens (so existing callers don't regress), but
