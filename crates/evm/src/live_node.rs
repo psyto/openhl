@@ -226,14 +226,45 @@ impl<P> LiveRethEvmBridge<P> {
     /// transfer; this is the bridge-layer hook that instruction
     /// would invoke. Returns the new collateral balance.
     ///
-    /// `amount` is signed to allow future withdrawal paths
-    /// (negative amount = debit), but Stage 17b only uses the
-    /// positive direction. Overflow is `saturating_add`.
+    /// `amount` is signed; positive credits, negative debits.
+    /// No balance check on debits — for safety-checked withdrawals
+    /// use [`Self::withdraw`]. Overflow is `saturating_add`.
     pub fn deposit(&self, account: AccountId, amount: i64) -> openhl_funding::Notional {
         let mut accts = self.accounts.lock().expect("accounts mutex poisoned");
         let acct = accts.entry(account).or_insert_with(|| Account::flat(account));
         acct.collateral = openhl_funding::Notional(acct.collateral.0.saturating_add(amount));
         acct.collateral
+    }
+
+    /// Debit `amount` quote-currency from `account`'s collateral
+    /// (Stage 17e). Returns the new balance on success; `None` if
+    /// the account doesn't exist or its current balance is less
+    /// than `amount`.
+    ///
+    /// `amount` is unsigned by API contract — callers expressing
+    /// "I want to take 100 out" never accidentally credit by
+    /// passing a negative. The internal subtraction goes through
+    /// `i64` so an `amount` larger than `i64::MAX` saturates to
+    /// "rejected" via the balance check.
+    ///
+    /// Balance check is against raw collateral (Stage 17e
+    /// limitation) — a margin-aware withdraw would also enforce
+    /// `collateral - amount >= initial_margin_requirement(account)`,
+    /// but that's the clearing-house layer's job, not the
+    /// bridge's. v0 callers are responsible for the margin check.
+    pub fn withdraw(
+        &self,
+        account: AccountId,
+        amount: u64,
+    ) -> Option<openhl_funding::Notional> {
+        let mut accts = self.accounts.lock().expect("accounts mutex poisoned");
+        let acct = accts.get_mut(&account)?;
+        let amount_i64 = i64::try_from(amount).ok()?;
+        if acct.collateral.0 < amount_i64 {
+            return None;
+        }
+        acct.collateral = openhl_funding::Notional(acct.collateral.0 - amount_i64);
+        Some(acct.collateral)
     }
 
     /// Inspect (read-only) the fills attached to a built payload. Returns
@@ -724,6 +755,31 @@ mod tests {
         assert_eq!(balance, Notional(650));
     }
 
+    /// Stage 17e: `withdraw` is rejection-safe on missing accounts
+    /// and insufficient balance; debits on success.
+    #[test]
+    fn withdraw_rejects_or_debits_correctly() {
+        use openhl_clob::AccountId;
+        use openhl_funding::Notional;
+
+        let bridge = LiveRethEvmBridge::new((), dev_chain_spec());
+
+        // Unknown account → None.
+        assert_eq!(bridge.withdraw(AccountId(1), 100), None);
+
+        // Deposit first, then withdraw less than balance.
+        let _ = bridge.deposit(AccountId(1), 500);
+        assert_eq!(bridge.withdraw(AccountId(1), 200), Some(Notional(300)));
+
+        // Withdraw more than balance → None, balance untouched.
+        assert_eq!(bridge.withdraw(AccountId(1), 1000), None);
+        let snap = bridge.accounts_snapshot();
+        assert_eq!(snap[0].collateral, Notional(300));
+
+        // Withdraw to exactly zero → Some(0).
+        assert_eq!(bridge.withdraw(AccountId(1), 300), Some(Notional(0)));
+    }
+
     /// Stage 16b: bridge snapshot round-trips the account map.
     #[test]
     fn snapshot_round_trips_accounts() {
@@ -1128,6 +1184,83 @@ mod tests {
 
         let snap = bridge.accounts_snapshot();
         assert_eq!(snap[0].collateral, Notional(1250));
+
+        uninstall_accounts();
+        uninstall_clob();
+        uninstall_fill_sink();
+        drop(handle);
+    }
+
+    /// **Stage 17e**: companion to the deposit precompile e2e test —
+    /// boots a real Reth node, deposits, then withdraws via the
+    /// withdraw precompile, asserting the bridge sees the debit.
+    /// Pins the same architectural claim for the withdraw side.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn withdraw_precompile_debits_bridge_accounts() {
+        use crate::precompiles::{
+            deposit, uninstall_accounts, uninstall_clob, uninstall_fill_sink, withdraw,
+        };
+        use crate::OpenHlExecutorBuilder;
+        use openhl_clob::AccountId;
+        use openhl_funding::Notional;
+        use reth_node_ethereum::node::EthereumAddOns;
+
+        uninstall_accounts();
+        uninstall_clob();
+        uninstall_fill_sink();
+
+        let runtime = Runtime::test();
+        let chain_spec = dev_chain_spec();
+        let node_config = NodeConfig::test().dev().with_chain(chain_spec.clone());
+
+        let handle = NodeBuilder::new(node_config)
+            .testing_node(runtime)
+            .with_types::<EthereumNode>()
+            .with_components(EthereumNode::components().executor(OpenHlExecutorBuilder))
+            .with_add_ons(EthereumAddOns::default())
+            .launch()
+            .await
+            .expect("launch of custom-EVM node failed");
+
+        let bridge = LiveRethEvmBridge::new(handle.node.provider.clone(), chain_spec);
+
+        // Seed via deposit precompile so account 9 exists with
+        // collateral 2000.
+        let mut deposit_calldata = vec![0u8; 64];
+        deposit_calldata[24..32].copy_from_slice(&9u64.to_be_bytes());
+        deposit_calldata[56..64].copy_from_slice(&2000_i64.to_be_bytes());
+        let _ = deposit(&deposit_calldata, 100_000, 0).unwrap();
+        assert_eq!(
+            bridge.accounts_snapshot()[0].collateral,
+            Notional(2000),
+        );
+
+        // Withdraw 750 via the withdraw precompile.
+        let mut withdraw_calldata = vec![0u8; 64];
+        withdraw_calldata[24..32].copy_from_slice(&9u64.to_be_bytes());
+        withdraw_calldata[56..64].copy_from_slice(&750_u64.to_be_bytes());
+        let r = withdraw(&withdraw_calldata, 100_000, 0).unwrap();
+        let mut buf = [0u8; 8];
+        buf.copy_from_slice(&r.bytes[24..32]);
+        assert_eq!(i64::from_be_bytes(buf), 1250);
+
+        // Bridge sees the debit.
+        let snap = bridge.accounts_snapshot();
+        assert_eq!(snap[0].account, AccountId(9));
+        assert_eq!(snap[0].collateral, Notional(1250));
+
+        // Insufficient-balance rejection is also observable through
+        // the bridge: try to withdraw 5000 from a balance of 1250.
+        let mut withdraw_too_much = vec![0u8; 64];
+        withdraw_too_much[24..32].copy_from_slice(&9u64.to_be_bytes());
+        withdraw_too_much[56..64].copy_from_slice(&5000_u64.to_be_bytes());
+        let r = withdraw(&withdraw_too_much, 100_000, 0).unwrap();
+        assert!(r.bytes.iter().all(|&b| b == 0), "rejection returns zeros");
+        assert_eq!(
+            bridge.accounts_snapshot()[0].collateral,
+            Notional(1250),
+            "balance unchanged on rejected withdraw",
+        );
 
         uninstall_accounts();
         uninstall_clob();

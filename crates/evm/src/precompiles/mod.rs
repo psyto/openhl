@@ -69,12 +69,39 @@ pub const CLOB_PLACE_ORDER: Address = address!("0x000000000000000000000000000000
 /// transaction's success is a future hardening item.
 pub const OPENHL_DEPOSIT: Address = address!("0x0000000000000000000000000000000000000c1d");
 
+/// Address of the "withdraw collateral" precompile (Stage 17e).
+///
+/// Solidity call shape (ABI-aligned 64-byte input):
+/// `call(gas, 0x...0c1e, calldata=(uint64 account, uint64 amount), ...) → uint256 new_balance_or_zero`
+///
+/// Returns the new collateral balance as a 32-byte sign-extended
+/// int. Returns `1` packed in the rightmost byte (i.e., a 32-byte
+/// value equal to `1`) is technically achievable for a real balance
+/// of 1, so callers should distinguish success from rejection by
+/// comparing against the pre-call balance rather than reading the
+/// return alone.
+///
+/// **The zero-return is overloaded with success:** if the post-
+/// withdraw balance happens to be exactly 0 (the caller drained
+/// the account), the return is also 0. Future hardening should
+/// use a richer return shape — for v0 the simplicity wins.
+///
+/// Rejections (no account map installed, account doesn't exist,
+/// insufficient balance, input shorter than 64 bytes) return all
+/// zeros. Same caveat as the other write precompiles: the
+/// withdrawal lands regardless of whether the calling EVM
+/// transaction reverts.
+pub const OPENHL_WITHDRAW: Address = address!("0x0000000000000000000000000000000000000c1e");
+
 /// The minimum gas charge for invoking a CLOB precompile. Tuned later.
 const CLOB_BASE_GAS_COST: u64 = 500;
 
 /// Base gas for the deposit precompile (Stage 17c). Same magnitude as
 /// the CLOB precompiles; tuned later.
 const DEPOSIT_BASE_GAS_COST: u64 = 500;
+
+/// Base gas for the withdraw precompile (Stage 17e). Same magnitude.
+const WITHDRAW_BASE_GAS_COST: u64 = 500;
 
 /// Monotonic order-ID counter for orders placed via the EVM. Starts at 1
 /// so the sentinel value 0 (returned on rejection) is distinguishable from
@@ -357,6 +384,85 @@ pub(crate) fn deposit(input: &[u8], _gas_limit: u64, _reservoir: u64) -> Precomp
     ))
 }
 
+/// Withdraw collateral from an account (Stage 17e). Companion to
+/// [`deposit`].
+///
+/// Calldata (64 bytes):
+///   bytes  0..32  account_id (last 8 bytes are the u64)
+///   bytes 32..64  amount     (last 8 bytes are the u64; upper bytes ignored)
+///
+/// Returns 32 bytes: the post-withdraw collateral as a big-endian
+/// sign-extended int256 on success. Returns all zeros when
+/// rejected (no map installed, account doesn't exist, insufficient
+/// balance, input shorter than 64 bytes). Note: a successful
+/// withdraw that drains to exactly 0 also returns 0 — callers
+/// distinguishing success from rejection should read the
+/// pre-call balance separately.
+#[allow(clippy::unnecessary_wraps)]
+pub(crate) fn withdraw(input: &[u8], _gas_limit: u64, _reservoir: u64) -> PrecompileResult {
+    let mut out = vec![0u8; 32];
+
+    if input.len() < 64 {
+        return Ok(PrecompileOutput::new(
+            WITHDRAW_BASE_GAS_COST,
+            Bytes::from(out),
+            0,
+        ));
+    }
+
+    let account_id = u64_from_be_chunk(&input[0..32]);
+    let amount = u64_from_be_chunk(&input[32..64]);
+
+    let state = ACCOUNTS_STATE
+        .read()
+        .expect("ACCOUNTS_STATE rwlock poisoned");
+    let Some(accounts) = state.as_ref() else {
+        return Ok(PrecompileOutput::new(
+            WITHDRAW_BASE_GAS_COST,
+            Bytes::from(out),
+            0,
+        ));
+    };
+
+    let mut map = accounts.lock().expect("accounts mutex poisoned");
+    let Some(acct) = map.get_mut(&AccountId(account_id)) else {
+        return Ok(PrecompileOutput::new(
+            WITHDRAW_BASE_GAS_COST,
+            Bytes::from(out),
+            0,
+        ));
+    };
+    let Ok(amount_i64) = i64::try_from(amount) else {
+        return Ok(PrecompileOutput::new(
+            WITHDRAW_BASE_GAS_COST,
+            Bytes::from(out),
+            0,
+        ));
+    };
+    if acct.collateral.0 < amount_i64 {
+        return Ok(PrecompileOutput::new(
+            WITHDRAW_BASE_GAS_COST,
+            Bytes::from(out),
+            0,
+        ));
+    }
+    acct.collateral = Notional(acct.collateral.0 - amount_i64);
+    let new_balance = acct.collateral.0;
+    drop(map);
+    drop(state);
+
+    let sign_ext: u8 = if new_balance < 0 { 0xff } else { 0x00 };
+    for b in &mut out[..24] {
+        *b = sign_ext;
+    }
+    out[24..32].copy_from_slice(&new_balance.to_be_bytes());
+    Ok(PrecompileOutput::new(
+        WITHDRAW_BASE_GAS_COST,
+        Bytes::from(out),
+        0,
+    ))
+}
+
 /// Build a `Precompiles` set that extends Reth's standard precompiles with
 /// openhl's CLOB-reading + CLOB-writing additions. The base set is parameterized
 /// over the hardfork's spec id so we inherit Ethereum's evolution (e.g., the
@@ -379,6 +485,11 @@ pub fn openhl_precompiles(base: &Precompiles) -> Precompiles {
             PrecompileId::custom("openhl_deposit"),
             OPENHL_DEPOSIT,
             deposit,
+        ),
+        Precompile::new(
+            PrecompileId::custom("openhl_withdraw"),
+            OPENHL_WITHDRAW,
+            withdraw,
         ),
     ]);
     precompiles
@@ -625,6 +736,85 @@ mod tests {
         let map = accounts.lock().unwrap();
         let acct = map.get(&AccountId(42)).expect("account created on deposit");
         assert_eq!(acct.collateral, Notional(750));
+
+        uninstall_accounts();
+    }
+
+    /// Stage 17e: build 64-byte withdraw calldata `(uint64 account,
+    /// uint64 amount)` ABI-aligned to 32-byte chunks.
+    fn withdraw_calldata(account: u64, amount: u64) -> Vec<u8> {
+        let mut input = vec![0u8; 64];
+        input[24..32].copy_from_slice(&account.to_be_bytes());
+        input[56..64].copy_from_slice(&amount.to_be_bytes());
+        input
+    }
+
+    /// Stage 17e: with no map installed, withdraw returns zero
+    /// like its companion precompiles.
+    #[test]
+    fn withdraw_returns_zero_when_no_accounts_installed() {
+        let _g = TEST_SERIALIZER.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        uninstall_accounts();
+
+        let r = withdraw(&withdraw_calldata(42, 100), 100_000, 0).unwrap();
+        assert_eq!(r.bytes.len(), 32);
+        assert_eq!(U256::from_be_slice(&r.bytes[..32]), U256::ZERO);
+        assert_eq!(r.gas_used, WITHDRAW_BASE_GAS_COST);
+    }
+
+    /// Stage 17e: withdraw rejects an unknown account.
+    #[test]
+    fn withdraw_rejects_unknown_account() {
+        let _g = TEST_SERIALIZER.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let accounts = Arc::new(Mutex::new(HashMap::new()));
+        install_accounts(Arc::clone(&accounts));
+
+        let r = withdraw(&withdraw_calldata(42, 100), 100_000, 0).unwrap();
+        assert_eq!(U256::from_be_slice(&r.bytes[..32]), U256::ZERO);
+        assert!(accounts.lock().unwrap().is_empty(), "no account materialized");
+
+        uninstall_accounts();
+    }
+
+    /// Stage 17e: withdraw rejects when balance is insufficient.
+    #[test]
+    fn withdraw_rejects_insufficient_balance() {
+        let _g = TEST_SERIALIZER.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let accounts = Arc::new(Mutex::new(HashMap::new()));
+        install_accounts(Arc::clone(&accounts));
+
+        let _ = deposit(&deposit_calldata(7, 100), 100_000, 0).unwrap();
+        // Try to take more than is there.
+        let r = withdraw(&withdraw_calldata(7, 250), 100_000, 0).unwrap();
+        assert_eq!(U256::from_be_slice(&r.bytes[..32]), U256::ZERO);
+        // Balance untouched.
+        assert_eq!(
+            accounts.lock().unwrap().get(&AccountId(7)).unwrap().collateral,
+            Notional(100)
+        );
+
+        uninstall_accounts();
+    }
+
+    /// Stage 17e: happy path — deposit, then withdraw, balance
+    /// reflected in the return AND in the map.
+    #[test]
+    fn withdraw_debits_balance_on_success() {
+        let _g = TEST_SERIALIZER.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let accounts = Arc::new(Mutex::new(HashMap::new()));
+        install_accounts(Arc::clone(&accounts));
+
+        let _ = deposit(&deposit_calldata(7, 1000), 100_000, 0).unwrap();
+        let r = withdraw(&withdraw_calldata(7, 300), 100_000, 0).unwrap();
+
+        let mut buf = [0u8; 8];
+        buf.copy_from_slice(&r.bytes[24..32]);
+        assert_eq!(i64::from_be_bytes(buf), 700);
+
+        assert_eq!(
+            accounts.lock().unwrap().get(&AccountId(7)).unwrap().collateral,
+            Notional(700)
+        );
 
         uninstall_accounts();
     }
