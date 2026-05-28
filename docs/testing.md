@@ -127,3 +127,35 @@ diff \
   <(jq -S '.chain | keys' /tmp/openhl-b/bridge/state.json)
 # no output → identical
 ```
+
+### Generalizing to N validators
+
+The bring-up generalizes to any validator count — the binary reads
+the full set from `--validators` and dials every peer except itself.
+Verified at N=3 (alice/bob/carol):
+
+1. Generate three keys: run each node once single-validator
+   (`--data-dir` distinct, no `--validators`, `--rounds 1`), then
+   stop. Each writes `<data-dir>/validator-key.json`.
+2. Write a `validators.json` with all three `pubkey_hex` entries and
+   three distinct `peer_multiaddr`s (e.g., tcp/27656, /27657, /27658).
+3. Wipe everything except `validator-key.json` in each data dir.
+4. Boot all three with the shared file, matching `--listen-addr`s,
+   and distinct `--rpc-bind`s.
+
+Each process logs `persistent peers = 2 peer(s)` with two `dial[N]`
+lines (self filtered from the three-entry set). With three
+equal-weight validators, Malachite's >2/3 quorum needs all three to
+vote, so all three must be live. On success every node's
+`bridge/state.json` (chain map + accounts) and
+`coordinator/state.json` are byte-identical:
+
+```bash
+diff <(jq -S . /tmp/v-a/coordinator/state.json) \
+     <(jq -S . /tmp/v-b/coordinator/state.json)   # no output
+diff <(jq -S . /tmp/v-a/coordinator/state.json) \
+     <(jq -S . /tmp/v-c/coordinator/state.json)   # no output
+```
+
+No code is N-specific; the dial-list construction (Stage 13l) and
+the consensus validator set already handle arbitrary N.
