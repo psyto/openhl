@@ -2,7 +2,7 @@
 
 An open-source reference implementation of a Hyperliquid-shape L1: BFT consensus + EVM execution + a CLOB matching engine, with first-class vault primitives.
 
-**Status:** Modules 1–5 shipped at the state-machine level, and the **live per-block integration cascade now runs end-to-end** across two validators. A two-validator BFT devnet (Stages 13l–13n) commits matching block hashes over libp2p; on every committed block the integration coordinator drives oracle aggregation, liquidation scan, ADL absorption, vault mark-to-market, and funding settlement (Stages 14a–15d). Account positions evolve: funding settlements adjust collateral, liquidation/ADL close out unhealthy positions, the safety net converges to a resolved state — all deterministic, all byte-identical between validators, all persistent across restart. See the build arc below.
+**Status:** Modules 1–5 shipped at the state-machine level, the **live per-block integration cascade runs end-to-end** across two validators, and a **clearing layer** now drives per-account position state from real CLOB fills. A two-validator BFT devnet (Stages 13l–13n) commits matching block hashes over libp2p; on every committed block the integration coordinator drives oracle aggregation, liquidation scan, ADL absorption, vault mark-to-market, and funding settlement (Stages 14a–15e). Account positions are produced by actual fills routed through `openhl-clearing::apply_fill` and owned by the bridge (Stages 16a–17a); collateral moves through `deposit`/`withdraw` primitives exposed both as bridge methods and as EVM precompiles (Stages 17b–17e). Funding settlements adjust collateral, liquidation/ADL close out unhealthy positions, the safety net converges to a resolved state — all deterministic, all byte-identical between validators, all persistent across restart. See the build arc below.
 
 ## Why
 
@@ -10,7 +10,7 @@ Hyperliquid's protocol stack (HyperBFT consensus, HyperCore matching engine, Hyp
 
 ## Architecture
 
-Five subsystems, ten library crates plus the node binary. The split is deliberately load-bearing: pure state machines (clob, funding, vault) are I/O-free and deterministic; the I/O boundary (evm, consensus, node) talks to the outside world and calls into the pure crates.
+Six subsystems, eleven library crates plus the node binary. The split is deliberately load-bearing: pure state machines (clob, funding, vault, clearing) are I/O-free and deterministic; the I/O boundary (evm, consensus, node) talks to the outside world and calls into the pure crates.
 
 ```
 bin/openhl/                          thin binary, calls crates/node
@@ -22,6 +22,7 @@ crates/
 ├── funding/       Module 4 — funding-rate calc + settlement
 ├── liquidation/              liquidation engine
 ├── vault/         Module 5 — protocol-native vault primitive
+├── clearing/      Module 6 — per-account position bookkeeping (apply_fill)
 ├── evm/           Module 3 — Reth integration + core↔EVM precompiles
 ├── consensus/     Module 1 — Malachite BFT app-side wiring
 └── node/                     assembles consensus + evm + clob into Node::run()
@@ -40,6 +41,7 @@ See [`docs/architecture.md`](docs/architecture.md) for the full design, and `doc
 | 3 | Core ↔ EVM precompiles | `evm`, `clob` | ✅ Stage 9a–9e + 9c+ + 9d |
 | 4 | Funding, oracle, liquidations | `funding`, `oracle`, `liquidation` | ✅ Stage 8b (funding) + 10a–10d (liquidation margin, insurance fund, scanner, ADL) + 11–11b (oracle aggregation + signed observations); driven per-block via Stages 14a–15d |
 | 5 | Protocol-native vault primitive | `vault` | ✅ Stage 12 (share-based collateral pooling); marked-to-market per block via Stage 14a |
+| 6 | Clearing layer (positions + collateral) | `clearing`, `evm` | ✅ Stage 16a–16d (apply_fill + bridge-owned accounts) + 17a (real fills create accounts) + 17b–17e (deposit/withdraw primitives + EVM precompiles) |
 
 v0 milestone: single-validator devnet produces blocks end-to-end. **Achieved** at the end of Module 1 / Stage 7d.
 
@@ -47,7 +49,14 @@ Two-validator BFT milestone: two `openhl reth-devnet` processes reach consensus 
 
 v1 milestone: per-block integration cascade runs across both validators — oracle aggregation → liquidation scan → ADL → vault mark-to-market → funding settlement → record application back to positions. **Achieved** at Stage 15d. Both validators arrive at byte-identical post-tick account state; the full safety net cascades from underwater positions to a resolved zero-position chain state in a single block on the synthetic seed. Coordinator state (insurance fund, vault NAV, oracle refresh marker, funding clock) and account state both persist across restart.
 
-What's still synthetic / next: account snapshots and the CLOB seed are deterministic boot-time fixtures rather than products of real fills, so position changes from incoming market orders aren't yet plumbed through (that's the clearing-layer next stage). The follower-side bridge replication uses Stage 13n's deterministic-recompute shortcut, which expires once `build_payload` starts pulling mempool transactions.
+Clearing-layer milestone: per-account positions are produced by real CLOB fills (not direct injection), owned by the bridge, persisted across restart, and collateral moves through `deposit`/`withdraw` primitives callable both from Rust and from EVM smart contracts via precompiles. **Achieved** at Stage 17e.
+
+What's still synthetic / next:
+- **The trade seed is contrived.** A market-maker account (id 999) takes the other side of the demo's three positions at boot, including an unrealistic deep-underwater short. A realistic multi-account scenario closer to live market dynamics is the next step.
+- **No Solidity-side transaction test yet.** The deposit/withdraw precompiles are tested by calling the precompile function directly against a real Reth node; a full test that deploys a contract and submits a transaction calling the precompile from within EVM bytecode is a follow-up.
+- **Withdraw isn't margin-aware.** The balance check is against raw collateral, not free collateral after the initial-margin requirement.
+- **Precompile mutations aren't revert-aware.** Like `clob_place_order`, a deposit/withdraw lands in bridge state even if the calling EVM transaction reverts — tying it to transaction success needs Reth state-revert hooks.
+- **Follower-side bridge replication** uses Stage 13n's deterministic-recompute shortcut, which expires once `build_payload` starts pulling mempool transactions.
 
 ## Build
 
