@@ -25,6 +25,19 @@ Notable diagnostics:
 - `node::tests::start_engine_emits_initial_consensus_message`
 - `node::tests::start_engine_emits_listening_event`
 
+The Stage 17f Solidity-side precompile tests live in `openhl-evm` and
+are ignored because they read from `precompiles::ACCOUNTS_STATE`, a
+process-global the bridge installs on construction — any other test
+that builds a `LiveRethEvmBridge` in parallel overwrites it. Run them
+single-threaded:
+
+```bash
+cargo test -p openhl-evm via_evm_bytecode -- --ignored --test-threads=1
+```
+
+- `live_node::tests::deposit_via_evm_bytecode_mutates_bridge_accounts`
+- `live_node::tests::withdraw_via_evm_bytecode_debits_bridge_accounts`
+
 ## Startup fail-fast behavior
 
 `OpenHlNode::start()` now waits for the first consensus app message by

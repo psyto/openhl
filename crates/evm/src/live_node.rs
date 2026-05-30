@@ -1268,6 +1268,269 @@ mod tests {
         drop(handle);
     }
 
+    /// **Stage 17f**: drive the deposit precompile from inside EVM bytecode.
+    /// Earlier stages (17c–17e) proved that calling the precompile *function*
+    /// directly mutates the bridge's account map. They did NOT prove that a
+    /// contract whose bytecode issues a `CALL` to the precompile address
+    /// reaches the same code path through the EVM's precompile dispatch.
+    ///
+    /// This test closes that gap. We deploy a 26-byte wrapper that forwards
+    /// its calldata to `OPENHL_DEPOSIT` via `CALL` and returns the precompile's
+    /// 32-byte response, then execute a transaction against it through the
+    /// same `OpenHlEvmFactory` Reth wires into every block. The transaction
+    /// succeeds, its return matches what the precompile produced, AND the
+    /// bridge's account map carries the credit — proving the bytecode →
+    /// `CALL` → `openhl_precompiles` dispatch → state mutation path is whole.
+    ///
+    /// We don't boot a Reth node here: the precompile registration is in
+    /// the factory, the account-map handoff is in `LiveRethEvmBridge::new`,
+    /// and neither needs a running node to exercise. Earlier tests already
+    /// confirm the factory is the same one Reth installs at boot.
+    ///
+    /// `#[ignore]`: the precompile module's `ACCOUNTS_STATE` is a process
+    /// global. Any other test that constructs a `LiveRethEvmBridge` in
+    /// parallel will overwrite it, derailing this test's precompile call.
+    /// Run via `cargo test -p openhl-evm -- --ignored --test-threads=1`.
+    #[test]
+    #[ignore]
+    fn deposit_via_evm_bytecode_mutates_bridge_accounts() {
+        use crate::precompiles::{
+            uninstall_accounts, uninstall_clob, uninstall_fill_sink, OPENHL_DEPOSIT,
+        };
+        use crate::OpenHlEvmFactory;
+        use alloy_evm::revm::{
+            context::{result::ExecutionResult, TxEnv},
+            database::{CacheDB, EmptyDB},
+            primitives::{Address, Bytes, TxKind, U256},
+            state::{AccountInfo, Bytecode},
+        };
+        use alloy_evm::{Evm, EvmEnv, EvmFactory};
+        use openhl_clob::AccountId;
+        use openhl_funding::Notional;
+
+        uninstall_accounts();
+        uninstall_clob();
+        uninstall_fill_sink();
+
+        // Construct the bridge — this installs its account-map Arc as
+        // the precompile module's `ACCOUNTS_STATE` global. No Reth node
+        // needed for this leg of the test (see test docstring).
+        let bridge = LiveRethEvmBridge::new((), dev_chain_spec());
+        assert!(bridge.accounts_snapshot().is_empty());
+
+        // Pre-load the wrapper bytecode at a fixed contract address and
+        // fund a caller EOA. The caller doesn't need much — `gas_price`
+        // is 0, no value is sent — but a non-empty balance dodges any
+        // pre-pay checks.
+        let contract_addr = Address::from([0xc0; 20]);
+        let caller_addr = Address::from([0xca; 20]);
+        let mut db = CacheDB::new(EmptyDB::default());
+        db.insert_account_info(
+            contract_addr,
+            AccountInfo {
+                nonce: 1,
+                code: Some(Bytecode::new_raw(Bytes::from(wrapper_bytecode_for(
+                    OPENHL_DEPOSIT,
+                )))),
+                ..Default::default()
+            },
+        );
+        db.insert_account_info(
+            caller_addr,
+            AccountInfo {
+                balance: U256::from(1_000_000_000u64),
+                ..Default::default()
+            },
+        );
+
+        // Same factory Reth installs via `OpenHlExecutorBuilder`. Default
+        // `EvmEnv` selects `SpecId::OSAKA`, which dispatches to the prague
+        // branch of `precompiles_for` — our precompiles get registered.
+        let mut evm = OpenHlEvmFactory.create_evm(db, EvmEnv::default());
+
+        // Deposit calldata: (uint64 account=42, int64 amount=1000).
+        let mut calldata = vec![0u8; 64];
+        calldata[24..32].copy_from_slice(&42u64.to_be_bytes());
+        calldata[56..64].copy_from_slice(&1000_i64.to_be_bytes());
+
+        let tx = TxEnv {
+            caller: caller_addr,
+            kind: TxKind::Call(contract_addr),
+            data: Bytes::from(calldata),
+            gas_limit: 1_000_000,
+            ..Default::default()
+        };
+        let result = evm.transact(tx).expect("evm.transact must not error");
+
+        let output = match result.result {
+            ExecutionResult::Success { output, .. } => output.into_data(),
+            other => panic!("expected Success, got {other:?}"),
+        };
+        // Wrapper returns exactly the precompile's 32-byte response.
+        assert_eq!(output.len(), 32);
+        let mut buf = [0u8; 8];
+        buf.copy_from_slice(&output[24..32]);
+        assert_eq!(
+            i64::from_be_bytes(buf),
+            1000,
+            "wrapper must return the precompile's new-balance int64",
+        );
+
+        // The bridge's map carries the credit — the bytecode → CALL
+        // dispatch reached the same `ACCOUNTS_STATE` global the bridge
+        // shares with the precompile module.
+        let snap = bridge.accounts_snapshot();
+        assert_eq!(snap.len(), 1);
+        assert_eq!(snap[0].account, AccountId(42));
+        assert_eq!(snap[0].collateral, Notional(1000));
+
+        uninstall_accounts();
+        uninstall_clob();
+        uninstall_fill_sink();
+    }
+
+    /// **Stage 17f companion**: same path as the deposit test, but
+    /// targeting `OPENHL_WITHDRAW`. Seeds collateral via the bridge's
+    /// own `deposit` (Rust API) so the EVM-side withdraw has something
+    /// to drain — and asserts both the wrapper's return and the
+    /// bridge's debited balance.
+    ///
+    /// `#[ignore]` for the same parallel-test reason as
+    /// [`deposit_via_evm_bytecode_mutates_bridge_accounts`].
+    #[test]
+    #[ignore]
+    fn withdraw_via_evm_bytecode_debits_bridge_accounts() {
+        use crate::precompiles::{
+            uninstall_accounts, uninstall_clob, uninstall_fill_sink, OPENHL_WITHDRAW,
+        };
+        use crate::OpenHlEvmFactory;
+        use alloy_evm::revm::{
+            context::{result::ExecutionResult, TxEnv},
+            database::{CacheDB, EmptyDB},
+            primitives::{Address, Bytes, TxKind, U256},
+            state::{AccountInfo, Bytecode},
+        };
+        use alloy_evm::{Evm, EvmEnv, EvmFactory};
+        use openhl_clob::AccountId;
+        use openhl_funding::Notional;
+
+        uninstall_accounts();
+        uninstall_clob();
+        uninstall_fill_sink();
+
+        let bridge = LiveRethEvmBridge::new((), dev_chain_spec());
+        // Seed account 9 with 2000 collateral via the bridge's Rust API
+        // (Stage 17b primitive). The EVM-side withdraw must see this.
+        let _ = bridge.deposit(AccountId(9), 2000);
+
+        let contract_addr = Address::from([0xc1; 20]);
+        let caller_addr = Address::from([0xcb; 20]);
+        let mut db = CacheDB::new(EmptyDB::default());
+        db.insert_account_info(
+            contract_addr,
+            AccountInfo {
+                nonce: 1,
+                code: Some(Bytecode::new_raw(Bytes::from(wrapper_bytecode_for(
+                    OPENHL_WITHDRAW,
+                )))),
+                ..Default::default()
+            },
+        );
+        db.insert_account_info(
+            caller_addr,
+            AccountInfo {
+                balance: U256::from(1_000_000_000u64),
+                ..Default::default()
+            },
+        );
+
+        let mut evm = OpenHlEvmFactory.create_evm(db, EvmEnv::default());
+
+        // Withdraw calldata: (uint64 account=9, uint64 amount=750).
+        let mut calldata = vec![0u8; 64];
+        calldata[24..32].copy_from_slice(&9u64.to_be_bytes());
+        calldata[56..64].copy_from_slice(&750_u64.to_be_bytes());
+
+        let tx = TxEnv {
+            caller: caller_addr,
+            kind: TxKind::Call(contract_addr),
+            data: Bytes::from(calldata),
+            gas_limit: 1_000_000,
+            ..Default::default()
+        };
+        let result = evm.transact(tx).expect("evm.transact must not error");
+
+        let output = match result.result {
+            ExecutionResult::Success { output, .. } => output.into_data(),
+            other => panic!("expected Success, got {other:?}"),
+        };
+        assert_eq!(output.len(), 32);
+        let mut buf = [0u8; 8];
+        buf.copy_from_slice(&output[24..32]);
+        assert_eq!(
+            i64::from_be_bytes(buf),
+            1250,
+            "wrapper must return post-withdraw balance (2000 - 750)",
+        );
+
+        let snap = bridge.accounts_snapshot();
+        assert_eq!(snap.len(), 1);
+        assert_eq!(snap[0].account, AccountId(9));
+        assert_eq!(snap[0].collateral, Notional(1250));
+
+        uninstall_accounts();
+        uninstall_clob();
+        uninstall_fill_sink();
+    }
+
+    /// Build a minimal 26-byte wrapper contract that forwards all its
+    /// calldata to `precompile` via `CALL`, then returns the first 32
+    /// bytes of the precompile's response. Equivalent to the Solidity:
+    ///
+    /// ```solidity
+    /// fallback() external returns (bytes memory) {
+    ///     (bool ok, bytes memory ret) = precompile.call(msg.data);
+    ///     require(ok);
+    ///     return ret;
+    /// }
+    /// ```
+    ///
+    /// The precompile address is encoded into bytes 16..18 (the `PUSH2`
+    /// operand). All known openhl precompile addresses fit in 16 bits
+    /// (`0x0c1b`..`0x0c1e`), so a fixed `PUSH2` is enough.
+    fn wrapper_bytecode_for(precompile: alloy_primitives::Address) -> Vec<u8> {
+        let raw = precompile.into_array();
+        // Sanity-check the assumption: only the low 2 bytes may be non-zero.
+        assert!(
+            raw[..18].iter().all(|&b| b == 0),
+            "wrapper helper only handles 16-bit precompile addresses",
+        );
+        let lo = u16::from_be_bytes([raw[18], raw[19]]).to_be_bytes();
+        vec![
+            // Copy all calldata into memory[0..calldatasize].
+            0x36, // CALLDATASIZE
+            0x60, 0x00, // PUSH1 0
+            0x60, 0x00, // PUSH1 0
+            0x37, // CALLDATACOPY
+            // CALL(gas, addr, value=0, in_off=0, in_size=calldatasize,
+            //      out_off=0, out_size=32). Args pushed in reverse so
+            //      `gas` lands on top.
+            0x60, 0x20, // PUSH1 32   out_size
+            0x60, 0x00, // PUSH1 0    out_off
+            0x36, // CALLDATASIZE       in_size
+            0x60, 0x00, // PUSH1 0    in_off
+            0x60, 0x00, // PUSH1 0    value
+            0x61, lo[0], lo[1], // PUSH2 <precompile_lo>
+            0x5a, // GAS
+            0xf1, // CALL
+            0x50, // POP (discard the success flag — precompile never fails)
+            // Return memory[0..32], which CALL already populated.
+            0x60, 0x20, // PUSH1 32
+            0x60, 0x00, // PUSH1 0
+            0xf3, // RETURN
+        ]
+    }
+
     /// **Stage 7d**: with a Reth `ConsensusEngineHandle` installed, `commit`
     /// sends a `ForkchoiceUpdated` to the in-process Engine API. The bridge's
     /// own bookkeeping still happens (so existing callers don't regress), but
