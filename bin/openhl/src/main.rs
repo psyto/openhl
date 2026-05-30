@@ -708,29 +708,26 @@ async fn run_reth_devnet(
     );
     let publishers = Arc::new(publishers);
 
-    // Stage 17a: seed accounts via real CLOB fills instead of
-    // direct map injection (the 16c approach). A market-maker
-    // account (999) rests three limit orders; accounts 10, 20,
-    // and 30 each cross with a market taker. The bridge's
-    // `submit_order` routes each resulting fill through
-    // `openhl-clearing::apply_fill` (Stage 16b), so the account
-    // map populates organically. The MM ends up with whatever
-    // net position the trades leave it with — for these inputs:
-    // long 80 @ avg 50 with +1040 realized PnL from closing its
-    // short into the 30-side trade.
+    // Stage 17h: seed five accounts via real CLOB fills, all
+    // trading at the same fair price (100). Replaces the Stage 17a
+    // single-MM seed (account 999 taking absurd off-market orders).
+    // The cascade-inducing PnL now comes from the mark drift in
+    // `seed_mark_orders` — exactly how real markets generate
+    // winners and losers.
     //
-    // After the fills land, two token resting orders give
-    // `current_mark()` a midpoint (Buy @ 100, Sell @ 102, mid
-    // 101) since the three trades exhausted all the matched
-    // liquidity. Then `with_accounts_mut` seeds collaterals on
-    // the three target accounts — a placeholder for an
-    // eventual EVM-side deposit primitive.
+    // Cast: Alice (10), Bob (20), Carol (30) are demo traders going
+    // long; Dave (40), Eve (50) are makers taking the other side.
+    // After the seed sequence, the mark book opens at midpoint 96
+    // (Buy@95 / Sell@97), and the deposit phase funds collateral
+    // (200, 50, 100, 300, 200) such that on the first tick:
+    //   - Bob is Liquidatable (scan target),
+    //   - Carol is Underwater (ADL target),
+    //   - Dave + Eve are ADL-eligible counterparties (Safe + positive uPnL),
+    //   - Alice rides through Safe.
     //
-    // Account 999's mere presence shifts the cascade shape from
-    // the 16c synthetic: 999 is Safe + ADL-eligible (high
-    // positive PnL at the live mark), so it ranks ahead of
-    // account 10 in ADL's score order. Deficit absorption hits
-    // 999 first.
+    // Scan and ADL never share an account in a single tick — the
+    // disjoint-target invariant the `apply records` logic below
+    // relies on is preserved across the retire-the-MM rewrite.
     let accounts_already_loaded = !bridge.accounts_snapshot().is_empty();
     if accounts_already_loaded {
         println!(
@@ -741,21 +738,21 @@ async fn run_reth_devnet(
         // bridge's persisted state (the CLOB book itself doesn't
         // snapshot today), so re-seed them on every boot.
         seed_mark_orders(&bridge);
-        println!("      mark book            = re-seeded (Buy@100 / Sell@102)");
+        println!("      mark book            = re-seeded (Buy@95 / Sell@97)");
     } else {
         let fills_count = seed_accounts_via_fills(&bridge);
         println!(
-            "      seed fills           = {} (MM-account 999 ↔ accounts 10/20/30)",
+            "      seed fills           = {} (Alice/Bob/Carol take longs from Dave + Eve @ price 100)",
             fills_count,
         );
         seed_mark_orders(&bridge);
-        println!("      mark book            = Buy@100 / Sell@102 (mid 101)");
+        println!("      mark book            = Buy@95 / Sell@97 (mid 96 — 4-point drift)");
         // Stage 17b: deposit collateral via the bridge's deposit
         // primitive instead of mutating the account map directly.
         // This is the bridge-layer hook an EVM-side
         // `deposit(account, amount)` instruction would call once
         // we have a real on-chain collateral flow.
-        for (id, coll) in [(10, 200), (20, 50), (30, 100)] {
+        for (id, coll) in [(10, 200), (20, 50), (30, 100), (40, 300), (50, 200)] {
             let new_balance = bridge.deposit(ClobAccountId(id), coll);
             println!(
                 "      deposit              = account {id} → collateral {}",
@@ -763,7 +760,7 @@ async fn run_reth_devnet(
             );
         }
         println!(
-            "      accounts             = {} (3 from fills + MM 999)",
+            "      accounts             = {} (3 traders + 2 makers, no MM)",
             bridge.accounts_snapshot().len(),
         );
     }
@@ -1249,38 +1246,57 @@ const SYNTHETIC_FEEDS: &[(u32, u8, u64)] = &[
     (3, 3, 103),
 ];
 
-/// Stage 17a: drive account creation through real CLOB fills instead
-/// of `with_accounts_mut` injection. A market-maker account (id 999)
-/// rests three limit orders; accounts 10, 20, and 30 take them as
-/// market orders. The bridge's `submit_order` routes each fill
-/// through `openhl-clearing::apply_fill`, so the account map
-/// populates as a by-product of the trades.
+/// Stage 17h: five-account market scenario. Replaces the Stage 17a
+/// single-MM seed (account 999 taking absurd off-market orders) with
+/// a realistic shape: every trade in the seed sequence happens at
+/// the same fair price (100), and the cascade-inducing PnL comes
+/// from the mark moving in [`seed_mark_orders`] — exactly how real
+/// markets generate winners and losers.
 ///
 /// Sequence (deterministic across validators — both nodes execute
-/// this identically on boot):
+/// this identically on boot, every order at price 100):
 ///
-///   1. MM Sell-limit 10 @ 100 → account 10 Buy-market 10
-///   2. MM Sell-limit 10 @ 105 → account 20 Buy-market 10
-///   3. MM Buy-limit 100 @ 50 → account 30 Sell-market 100
+///   1. Dave (40) Sell-limit 10 → Alice (10) Buy-market 10
+///   2. Dave (40) Sell-limit 10 → Bob   (20) Buy-market 10
+///   3. Dave (40) Sell-limit 30 → Carol (30) Buy-market 30
+///   4. Eve  (50) Sell-limit 20 → Carol (30) Buy-market 20
 ///
-/// Resulting positions:
-///   - account 10: long 10 @ 100
-///   - account 20: long 10 @ 105
-///   - account 30: short 100 @ 50
-///   - account 999: long 80 @ 50, +1040 realized PnL (closes its
-///     short 20 @ 102 against step 3's Buy-100-@-50, then opens
-///     long 80 @ 50). The MM is now a real participant — Safe and
-///     ADL-eligible because of its large positive unrealized PnL
-///     at the live mark.
+/// Resulting positions (avg_entry = 100 for everyone):
+///   - Alice (10): long 10  — safe trader with margin to spare
+///   - Bob   (20): long 10  — thinly-collateralised, drops below
+///                            maintenance once mark moves
+///   - Carol (30): long 50  — large position, equity goes negative
+///                            once mark moves (the underwater case)
+///   - Dave  (40): short 50 — counterparty to rounds 1–3; ADL-
+///                            eligible after mark drift gives him
+///                            positive uPnL
+///   - Eve   (50): short 20 — counterparty to round 4's tail;
+///                            also ADL-eligible
+///
+/// At the post-boot mark (96, see [`seed_mark_orders`]) and the
+/// post-boot collateral deposits (200, 50, 100, 300, 200) the
+/// `MarginHealth` shakes out to:
+///   - Alice: Safe          (MR ≈ 16.7%)
+///   - Bob:   Liquidatable  (MR ≈ 1.0%, < 2% maintenance) — scan
+///   - Carol: Underwater    (equity = −100)                — ADL
+///   - Dave:  Safe          (MR ≈ 10.4%, +200 uPnL)        — ADL ctp
+///   - Eve:   Safe          (MR ≈ 14.6%, +80  uPnL)        — ADL ctp
+///
+/// **Disjoint-target invariant.** Scan targets {Bob}, ADL targets
+/// {Carol}, ADL counterparties are drawn from {Dave, Eve}. All
+/// three sets are disjoint, so the per-tick `apply records` logic
+/// in `main.rs` (which assumes scan and ADL don't double-touch one
+/// account) keeps its precondition.
 ///
 /// Returns the total number of fills produced.
 #[allow(clippy::too_many_lines)]
 fn seed_accounts_via_fills<P>(bridge: &LiveRethEvmBridge<P>) -> usize {
     let mut fills = 0;
 
+    // Round 1 — Dave makes Sell 10 @ 100; Alice takes long 10.
     let r = bridge.submit_order(Order {
         id: OrderId(1001),
-        account: ClobAccountId(999),
+        account: ClobAccountId(40),
         side: Side::Sell,
         qty: Qty(10),
         order_type: OrderType::Limit { price: Price(100) },
@@ -1295,12 +1311,13 @@ fn seed_accounts_via_fills<P>(bridge: &LiveRethEvmBridge<P>) -> usize {
     });
     fills += r.fills.len();
 
+    // Round 2 — Dave makes another Sell 10 @ 100; Bob takes long 10.
     let r = bridge.submit_order(Order {
         id: OrderId(1003),
-        account: ClobAccountId(999),
+        account: ClobAccountId(40),
         side: Side::Sell,
         qty: Qty(10),
-        order_type: OrderType::Limit { price: Price(105) },
+        order_type: OrderType::Limit { price: Price(100) },
     });
     fills += r.fills.len();
     let r = bridge.submit_order(Order {
@@ -1312,19 +1329,39 @@ fn seed_accounts_via_fills<P>(bridge: &LiveRethEvmBridge<P>) -> usize {
     });
     fills += r.fills.len();
 
+    // Round 3 — Dave makes Sell 30 @ 100; Carol takes long 30.
+    // Dave is now short 50 total, all at avg 100.
     let r = bridge.submit_order(Order {
         id: OrderId(1005),
-        account: ClobAccountId(999),
-        side: Side::Buy,
-        qty: Qty(100),
-        order_type: OrderType::Limit { price: Price(50) },
+        account: ClobAccountId(40),
+        side: Side::Sell,
+        qty: Qty(30),
+        order_type: OrderType::Limit { price: Price(100) },
     });
     fills += r.fills.len();
     let r = bridge.submit_order(Order {
         id: OrderId(1006),
         account: ClobAccountId(30),
+        side: Side::Buy,
+        qty: Qty(30),
+        order_type: OrderType::Market,
+    });
+    fills += r.fills.len();
+
+    // Round 4 — Eve makes Sell 20 @ 100; Carol tops up to long 50.
+    let r = bridge.submit_order(Order {
+        id: OrderId(1007),
+        account: ClobAccountId(50),
         side: Side::Sell,
-        qty: Qty(100),
+        qty: Qty(20),
+        order_type: OrderType::Limit { price: Price(100) },
+    });
+    fills += r.fills.len();
+    let r = bridge.submit_order(Order {
+        id: OrderId(1008),
+        account: ClobAccountId(30),
+        side: Side::Buy,
+        qty: Qty(20),
         order_type: OrderType::Market,
     });
     fills += r.fills.len();
@@ -1332,24 +1369,28 @@ fn seed_accounts_via_fills<P>(bridge: &LiveRethEvmBridge<P>) -> usize {
     fills
 }
 
-/// Stage 17a: place two token resting orders so `current_mark()`
-/// has a bid + ask to compute a midpoint. The
+/// Stage 17h: place two token resting orders so `current_mark()`
+/// has a bid + ask to compute a midpoint. With trade-time price
+/// 100 and these mark orders at 95/97 (mid 96), every position
+/// opened by [`seed_accounts_via_fills`] picks up a 4-point uPnL
+/// drift — what generates the cascade. The
 /// `seed_accounts_via_fills` sequence exhausts all matched
-/// liquidity, leaving the book empty.
+/// liquidity, leaving the book empty, so neither of these orders
+/// crosses anything.
 fn seed_mark_orders<P>(bridge: &LiveRethEvmBridge<P>) {
     let _ = bridge.submit_order(Order {
         id: OrderId(2001),
         account: ClobAccountId(1),
         side: Side::Buy,
         qty: Qty(1),
-        order_type: OrderType::Limit { price: Price(100) },
+        order_type: OrderType::Limit { price: Price(95) },
     });
     let _ = bridge.submit_order(Order {
         id: OrderId(2002),
         account: ClobAccountId(2),
         side: Side::Sell,
         qty: Qty(1),
-        order_type: OrderType::Limit { price: Price(102) },
+        order_type: OrderType::Limit { price: Price(97) },
     });
 }
 
