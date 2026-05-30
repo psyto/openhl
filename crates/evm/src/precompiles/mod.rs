@@ -32,6 +32,9 @@ use std::sync::{
     Arc, Mutex, RwLock,
 };
 
+mod revert_guard;
+pub use revert_guard::OpenHlRevertGuard;
+
 /// Address of the "read best bid" precompile.
 ///
 /// Solidity call shape: `staticcall(gas, 0x...0c1b, calldata=empty, ...) → (price: u256, qty: u256)`
@@ -188,6 +191,86 @@ pub fn current_best_bid() -> Option<(openhl_clob::Price, openhl_clob::Qty)> {
     let clob = state.as_ref()?;
     let book = clob.lock().expect("clob mutex poisoned");
     book.best_bid_with_qty()
+}
+
+/// Stage 17i: in-memory snapshot of every mutating bridge global —
+/// `{accounts, book, pending_fills}`. Used by [`revert_guard`] to
+/// roll back precompile mutations when the calling EVM frame
+/// reverts.
+///
+/// All three fields are `Option` so a snapshot is meaningful even
+/// before any of the globals are installed (e.g., the read-only
+/// CLOB precompile under tests that haven't wired in the account
+/// map).
+#[derive(Debug, Default)]
+pub(crate) struct BridgeStateSnapshot {
+    accounts: Option<HashMap<AccountId, Account>>,
+    book: Option<Book>,
+    fills: Option<Vec<Fill>>,
+}
+
+/// Clone the contents of every currently-installed mutating global.
+/// Cheap for v0 (5-account dev state); a production rewrite would
+/// move to per-mutation journal entries instead of whole-state
+/// clones, mirroring REVM's storage journal.
+#[must_use]
+pub(crate) fn snapshot_bridge_state() -> BridgeStateSnapshot {
+    let accounts = {
+        let state = ACCOUNTS_STATE
+            .read()
+            .expect("ACCOUNTS_STATE rwlock poisoned");
+        state
+            .as_ref()
+            .map(|a| a.lock().expect("accounts mutex poisoned").clone())
+    };
+    let book = {
+        let state = CLOB_STATE.read().expect("CLOB_STATE rwlock poisoned");
+        state
+            .as_ref()
+            .map(|c| c.lock().expect("clob mutex poisoned").clone())
+    };
+    let fills = {
+        let state = FILL_SINK.read().expect("FILL_SINK rwlock poisoned");
+        state
+            .as_ref()
+            .map(|f| f.lock().expect("fill_sink mutex poisoned").clone())
+    };
+    BridgeStateSnapshot {
+        accounts,
+        book,
+        fills,
+    }
+}
+
+/// Overwrite the contents of every installed mutating global with
+/// the values captured by [`snapshot_bridge_state`]. Preserves the
+/// `Arc` identity (so consumers holding a clone of the Arc see the
+/// restored state); only the data behind the lock is replaced.
+///
+/// `None` fields are skipped — if a global wasn't installed at
+/// snapshot time, this leaves whatever's currently installed in
+/// place.
+pub(crate) fn restore_bridge_state(snap: BridgeStateSnapshot) {
+    if let Some(snap_accounts) = snap.accounts {
+        let state = ACCOUNTS_STATE
+            .read()
+            .expect("ACCOUNTS_STATE rwlock poisoned");
+        if let Some(arc) = state.as_ref() {
+            *arc.lock().expect("accounts mutex poisoned") = snap_accounts;
+        }
+    }
+    if let Some(snap_book) = snap.book {
+        let state = CLOB_STATE.read().expect("CLOB_STATE rwlock poisoned");
+        if let Some(arc) = state.as_ref() {
+            *arc.lock().expect("clob mutex poisoned") = snap_book;
+        }
+    }
+    if let Some(snap_fills) = snap.fills {
+        let state = FILL_SINK.read().expect("FILL_SINK rwlock poisoned");
+        if let Some(arc) = state.as_ref() {
+            *arc.lock().expect("fill_sink mutex poisoned") = snap_fills;
+        }
+    }
 }
 
 /// Reads the best bid (highest-priced buy order's price + total qty at that

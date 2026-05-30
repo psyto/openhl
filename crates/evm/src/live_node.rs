@@ -1586,6 +1586,215 @@ mod tests {
         ]
     }
 
+    /// Variant of [`wrapper_bytecode_for`] that replaces the terminating
+    /// `RETURN` with `REVERT`. The precompile call still executes (and
+    /// without [`OpenHlRevertGuard`] would still mutate the bridge's
+    /// account map), but the calling frame reverts — so a revert-aware
+    /// EVM should roll the precompile mutation back.
+    fn reverting_wrapper_bytecode_for(precompile: alloy_primitives::Address) -> Vec<u8> {
+        let mut bytecode = wrapper_bytecode_for(precompile);
+        let last = bytecode.len() - 1;
+        assert_eq!(bytecode[last], 0xf3, "wrapper must terminate in RETURN");
+        bytecode[last] = 0xfd; // REVERT
+        bytecode
+    }
+
+    /// **Stage 17i**: when a contract calls the deposit precompile and
+    /// then `REVERT`s, the precompile's mutation must roll back. The
+    /// [`OpenHlRevertGuard`] inspector implements this by snapshotting
+    /// the bridge globals at every call-frame entry and restoring on
+    /// revert. Without it, the deposit would land in `bridge.accounts`
+    /// even though the EVM rolled back the calling tx — a real
+    /// double-spend / mint-collateral vector.
+    ///
+    /// This test pairs with [`deposit_via_evm_bytecode_persists_on_return`]
+    /// to confirm the inspector restores ONLY on revert and lets
+    /// successful calls commit normally.
+    ///
+    /// `#[ignore]` for the same parallel-test reason as the Stage 17f
+    /// tests: `ACCOUNTS_STATE` is process-global.
+    #[test]
+    #[ignore]
+    fn deposit_via_evm_bytecode_rolls_back_on_revert() {
+        use crate::precompiles::{
+            uninstall_accounts, uninstall_clob, uninstall_fill_sink, OpenHlRevertGuard,
+            OPENHL_DEPOSIT,
+        };
+        use crate::OpenHlEvmFactory;
+        use alloy_evm::revm::{
+            context::{result::ExecutionResult, TxEnv},
+            database::{CacheDB, EmptyDB},
+            primitives::{Address, Bytes, TxKind, U256},
+            state::{AccountInfo, Bytecode},
+        };
+        use alloy_evm::{Evm, EvmEnv, EvmFactory};
+
+        uninstall_accounts();
+        uninstall_clob();
+        uninstall_fill_sink();
+
+        // Same bridge wiring as the Stage 17f tests — install_accounts
+        // runs in `new`, pointing the precompile global at this
+        // bridge's account map.
+        let bridge = LiveRethEvmBridge::new((), dev_chain_spec());
+        assert!(bridge.accounts_snapshot().is_empty());
+
+        let contract_addr = Address::from([0xd0; 20]);
+        let caller_addr = Address::from([0xda; 20]);
+        let mut db = CacheDB::new(EmptyDB::default());
+        db.insert_account_info(
+            contract_addr,
+            AccountInfo {
+                nonce: 1,
+                code: Some(Bytecode::new_raw(Bytes::from(
+                    reverting_wrapper_bytecode_for(OPENHL_DEPOSIT),
+                ))),
+                ..Default::default()
+            },
+        );
+        db.insert_account_info(
+            caller_addr,
+            AccountInfo {
+                balance: U256::from(1_000_000_000u64),
+                ..Default::default()
+            },
+        );
+
+        let guard = OpenHlRevertGuard::new();
+        let mut evm = OpenHlEvmFactory.create_evm_with_inspector(db, EvmEnv::default(), guard);
+        evm.enable_inspector();
+
+        // (uint64 account=42, int64 amount=1000).
+        let mut calldata = vec![0u8; 64];
+        calldata[24..32].copy_from_slice(&42u64.to_be_bytes());
+        calldata[56..64].copy_from_slice(&1000_i64.to_be_bytes());
+
+        let tx = TxEnv {
+            caller: caller_addr,
+            kind: TxKind::Call(contract_addr),
+            data: Bytes::from(calldata),
+            gas_limit: 1_000_000,
+            ..Default::default()
+        };
+        let result = evm.transact(tx).expect("evm.transact must not error");
+
+        // The transaction reverted — the EVM returns Revert with the
+        // wrapper's return data (still the precompile's 1000 balance,
+        // exposed as revert data).
+        match result.result {
+            ExecutionResult::Revert { output, .. } => {
+                assert_eq!(output.len(), 32);
+                let mut buf = [0u8; 8];
+                buf.copy_from_slice(&output[24..32]);
+                assert_eq!(
+                    i64::from_be_bytes(buf),
+                    1000,
+                    "precompile still computed the deposit; only post-call EVM state was rolled back",
+                );
+            }
+            other => panic!("expected Revert, got {other:?}"),
+        }
+
+        // The key assertion: the bridge sees NO mutation. Without
+        // the revert guard, account 42 would carry collateral 1000.
+        assert!(
+            bridge.accounts_snapshot().is_empty(),
+            "OpenHlRevertGuard must roll back the precompile's mutation on REVERT",
+        );
+
+        uninstall_accounts();
+        uninstall_clob();
+        uninstall_fill_sink();
+    }
+
+    /// **Stage 17i companion**: with the same inspector wired in,
+    /// a deposit-then-RETURN flow MUST still commit the mutation.
+    /// Otherwise the guard would over-rollback and break the happy
+    /// path that Stages 17c–17f already proved.
+    ///
+    /// `#[ignore]` for the same parallel-test reason.
+    #[test]
+    #[ignore]
+    fn deposit_via_evm_bytecode_persists_on_return() {
+        use crate::precompiles::{
+            uninstall_accounts, uninstall_clob, uninstall_fill_sink, OpenHlRevertGuard,
+            OPENHL_DEPOSIT,
+        };
+        use crate::OpenHlEvmFactory;
+        use alloy_evm::revm::{
+            context::{result::ExecutionResult, TxEnv},
+            database::{CacheDB, EmptyDB},
+            primitives::{Address, Bytes, TxKind, U256},
+            state::{AccountInfo, Bytecode},
+        };
+        use alloy_evm::{Evm, EvmEnv, EvmFactory};
+        use openhl_clob::AccountId;
+        use openhl_funding::Notional;
+
+        uninstall_accounts();
+        uninstall_clob();
+        uninstall_fill_sink();
+
+        let bridge = LiveRethEvmBridge::new((), dev_chain_spec());
+
+        let contract_addr = Address::from([0xd1; 20]);
+        let caller_addr = Address::from([0xdb; 20]);
+        let mut db = CacheDB::new(EmptyDB::default());
+        db.insert_account_info(
+            contract_addr,
+            AccountInfo {
+                nonce: 1,
+                code: Some(Bytecode::new_raw(Bytes::from(wrapper_bytecode_for(
+                    OPENHL_DEPOSIT,
+                )))),
+                ..Default::default()
+            },
+        );
+        db.insert_account_info(
+            caller_addr,
+            AccountInfo {
+                balance: U256::from(1_000_000_000u64),
+                ..Default::default()
+            },
+        );
+
+        let guard = OpenHlRevertGuard::new();
+        let mut evm = OpenHlEvmFactory.create_evm_with_inspector(db, EvmEnv::default(), guard);
+        evm.enable_inspector();
+
+        let mut calldata = vec![0u8; 64];
+        calldata[24..32].copy_from_slice(&7u64.to_be_bytes());
+        calldata[56..64].copy_from_slice(&500_i64.to_be_bytes());
+
+        let tx = TxEnv {
+            caller: caller_addr,
+            kind: TxKind::Call(contract_addr),
+            data: Bytes::from(calldata),
+            gas_limit: 1_000_000,
+            ..Default::default()
+        };
+        let result = evm.transact(tx).expect("evm.transact must not error");
+
+        match result.result {
+            ExecutionResult::Success { output, .. } => {
+                let data = output.into_data();
+                assert_eq!(data.len(), 32);
+            }
+            other => panic!("expected Success, got {other:?}"),
+        }
+
+        // Happy path: bridge sees the deposit, inspector did not
+        // over-rollback.
+        let snap = bridge.accounts_snapshot();
+        assert_eq!(snap.len(), 1);
+        assert_eq!(snap[0].account, AccountId(7));
+        assert_eq!(snap[0].collateral, Notional(500));
+
+        uninstall_accounts();
+        uninstall_clob();
+        uninstall_fill_sink();
+    }
+
     /// **Stage 7d**: with a Reth `ConsensusEngineHandle` installed, `commit`
     /// sends a `ForkchoiceUpdated` to the in-process Engine API. The bridge's
     /// own bookkeeping still happens (so existing callers don't regress), but

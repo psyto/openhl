@@ -13,7 +13,7 @@ use crate::types::{
     AccountId, Fill, FillResult, Order, OrderId, OrderType, Price, Qty, Side,
 };
 
-#[derive(Debug, Default)]
+#[derive(Clone, Debug, Default)]
 pub struct Book {
     /// Bids: `Reverse<Price>` key gives best-first iteration (highest first).
     bids: BTreeMap<Reverse<Price>, VecDeque<RestingOrder>>,
