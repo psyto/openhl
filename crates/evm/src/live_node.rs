@@ -237,21 +237,22 @@ impl<P> LiveRethEvmBridge<P> {
     }
 
     /// Debit `amount` quote-currency from `account`'s collateral
-    /// (Stage 17e). Returns the new balance on success; `None` if
-    /// the account doesn't exist or its current balance is less
-    /// than `amount`.
+    /// (Stage 17e, margin-aware as of 17g). Returns the new balance
+    /// on success; `None` if the account doesn't exist, the
+    /// requested amount doesn't fit in `i64`, or the withdraw would
+    /// leave collateral below the position's initial-margin
+    /// requirement.
     ///
     /// `amount` is unsigned by API contract — callers expressing
     /// "I want to take 100 out" never accidentally credit by
-    /// passing a negative. The internal subtraction goes through
-    /// `i64` so an `amount` larger than `i64::MAX` saturates to
-    /// "rejected" via the balance check.
+    /// passing a negative.
     ///
-    /// Balance check is against raw collateral (Stage 17e
-    /// limitation) — a margin-aware withdraw would also enforce
-    /// `collateral - amount >= initial_margin_requirement(account)`,
-    /// but that's the clearing-house layer's job, not the
-    /// bridge's. v0 callers are responsible for the margin check.
+    /// The margin check uses
+    /// [`openhl_clearing::initial_margin_requirement`] at
+    /// [`openhl_clearing::DEFAULT_INITIAL_MARGIN_BPS`] (1000 bps,
+    /// matching `LiquidationParams::hyperliquid_default`). For a
+    /// flat account `IM_req == 0` and behaviour reduces to the
+    /// raw-balance check that Stage 17e shipped.
     pub fn withdraw(
         &self,
         account: AccountId,
@@ -260,7 +261,15 @@ impl<P> LiveRethEvmBridge<P> {
         let mut accts = self.accounts.lock().expect("accounts mutex poisoned");
         let acct = accts.get_mut(&account)?;
         let amount_i64 = i64::try_from(amount).ok()?;
-        if acct.collateral.0 < amount_i64 {
+        let im_req = openhl_clearing::initial_margin_requirement(
+            acct,
+            openhl_clearing::DEFAULT_INITIAL_MARGIN_BPS,
+        );
+        // Reject if the post-withdraw balance would dip below IM.
+        // `checked_sub` against amount + im_req in a single i128
+        // avoids the intermediate-overflow corner.
+        let post = i128::from(acct.collateral.0) - i128::from(amount_i64);
+        if post < i128::from(im_req) {
             return None;
         }
         acct.collateral = openhl_funding::Notional(acct.collateral.0 - amount_i64);
@@ -778,6 +787,52 @@ mod tests {
 
         // Withdraw to exactly zero → Some(0).
         assert_eq!(bridge.withdraw(AccountId(1), 300), Some(Notional(0)));
+    }
+
+    /// Stage 17g: `withdraw` is now margin-aware. An account with an
+    /// open position can only withdraw down to its initial-margin
+    /// requirement; raw-collateral semantics survive for flat
+    /// accounts.
+    #[test]
+    fn withdraw_respects_initial_margin_for_open_position() {
+        use openhl_clob::{AccountId, OrderId, OrderType, Price, Qty, Side};
+        use openhl_funding::Notional;
+
+        let bridge = LiveRethEvmBridge::new((), dev_chain_spec());
+
+        // Maker (account 1) rests Buy 10 @ 100; taker crosses with a
+        // matching Sell. Account 1 ends with size=10, avg_entry=100,
+        // realized PnL 0 (opening from flat).
+        bridge.submit_order(Order {
+            id: OrderId(1),
+            account: AccountId(1),
+            side: Side::Buy,
+            qty: Qty(10),
+            order_type: OrderType::Limit { price: Price(100) },
+        });
+        bridge.submit_order(Order {
+            id: OrderId(2),
+            account: AccountId(2),
+            side: Side::Sell,
+            qty: Qty(10),
+            order_type: OrderType::Market,
+        });
+
+        // Fund account 1: collateral = 500. IM_req for the position
+        // is |10| × 100 × 1000 / 10000 = 100. Free collateral = 400.
+        let _ = bridge.deposit(AccountId(1), 500);
+
+        // One quote above free collateral → reject, balance untouched.
+        assert_eq!(bridge.withdraw(AccountId(1), 401), None);
+        let snap = bridge.accounts_snapshot();
+        let acct1 = snap.iter().find(|a| a.account == AccountId(1)).unwrap();
+        assert_eq!(acct1.collateral, Notional(500));
+
+        // Exactly to the IM line — succeeds. Post balance equals IM_req.
+        assert_eq!(bridge.withdraw(AccountId(1), 400), Some(Notional(100)));
+
+        // Any further withdrawal violates IM — reject.
+        assert_eq!(bridge.withdraw(AccountId(1), 1), None);
     }
 
     /// Stage 16b: bridge snapshot round-trips the account map.

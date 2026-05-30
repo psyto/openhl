@@ -439,7 +439,16 @@ pub(crate) fn withdraw(input: &[u8], _gas_limit: u64, _reservoir: u64) -> Precom
             0,
         ));
     };
-    if acct.collateral.0 < amount_i64 {
+    // Stage 17g: margin-aware. Reject if the post-withdraw balance
+    // would dip below the position's initial-margin requirement at
+    // `avg_entry`. For a flat position `im_req == 0` and this
+    // collapses to the original raw-collateral check.
+    let im_req = openhl_clearing::initial_margin_requirement(
+        acct,
+        openhl_clearing::DEFAULT_INITIAL_MARGIN_BPS,
+    );
+    let post = i128::from(acct.collateral.0) - i128::from(amount_i64);
+    if post < i128::from(im_req) {
         return Ok(PrecompileOutput::new(
             WITHDRAW_BASE_GAS_COST,
             Bytes::from(out),
@@ -815,6 +824,63 @@ mod tests {
             accounts.lock().unwrap().get(&AccountId(7)).unwrap().collateral,
             Notional(700)
         );
+
+        uninstall_accounts();
+    }
+
+    /// Stage 17g: with an open position installed, the precompile
+    /// rejects a withdraw that would breach the initial-margin
+    /// requirement — same rule the bridge enforces. A boundary
+    /// withdraw (post-balance == IM_req) is allowed; one more quote
+    /// is not.
+    #[test]
+    fn withdraw_precompile_respects_initial_margin() {
+        use openhl_clearing::DEFAULT_INITIAL_MARGIN_BPS;
+        use openhl_funding::{MarkPrice, PositionSize};
+
+        let _g = TEST_SERIALIZER.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let accounts = Arc::new(Mutex::new(HashMap::new()));
+        install_accounts(Arc::clone(&accounts));
+
+        // Open-position account: size=10, avg_entry=100, collateral=500.
+        // IM_req at default 1000 bps = 10*100*1000/10000 = 100, so
+        // free collateral = 400.
+        accounts.lock().unwrap().insert(
+            AccountId(42),
+            Account {
+                account: AccountId(42),
+                position_size: PositionSize(10),
+                avg_entry: MarkPrice(100),
+                collateral: Notional(500),
+            },
+        );
+        // Sanity-check the IM math against the helper itself so this
+        // test is robust to a future DEFAULT bps tweak.
+        let acct_snapshot = *accounts.lock().unwrap().get(&AccountId(42)).unwrap();
+        let im_req = openhl_clearing::initial_margin_requirement(
+            &acct_snapshot,
+            DEFAULT_INITIAL_MARGIN_BPS,
+        );
+        assert_eq!(im_req, 100, "IM_req sanity check");
+
+        // 1 wei past the free-collateral line → reject (sentinel zero).
+        let r = withdraw(&withdraw_calldata(42, 401), 100_000, 0).unwrap();
+        assert!(r.bytes.iter().all(|&b| b == 0), "above-IM withdraw rejects");
+        assert_eq!(
+            accounts.lock().unwrap().get(&AccountId(42)).unwrap().collateral,
+            Notional(500),
+            "balance untouched on reject",
+        );
+
+        // Exactly to the IM line → succeeds. Post balance = IM_req = 100.
+        let r = withdraw(&withdraw_calldata(42, 400), 100_000, 0).unwrap();
+        let mut buf = [0u8; 8];
+        buf.copy_from_slice(&r.bytes[24..32]);
+        assert_eq!(i64::from_be_bytes(buf), 100);
+
+        // One more → reject.
+        let r = withdraw(&withdraw_calldata(42, 1), 100_000, 0).unwrap();
+        assert!(r.bytes.iter().all(|&b| b == 0), "below-IM withdraw rejects");
 
         uninstall_accounts();
     }

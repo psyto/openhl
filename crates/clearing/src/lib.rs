@@ -43,6 +43,20 @@ use openhl_clob::{AccountId, Price, Qty, Side};
 use openhl_funding::{MarkPrice, Notional, PositionSize};
 use serde::{Deserialize, Serialize};
 
+/// Scale factor for basis-point margin rates: 10⁴, so 1000 bps = 10%.
+/// Matches `openhl_liquidation::MARGIN_SCALE`; duplicated here so the
+/// margin helper below doesn't pull in the liquidation crate as a
+/// dependency of clearing's consumers.
+pub const MARGIN_SCALE: i64 = 10_000;
+
+/// Default initial-margin rate for v0: 10% (1000 bps), matching
+/// [`openhl_liquidation::LiquidationParams::hyperliquid_default`]. The
+/// bridge and the deposit/withdraw precompiles need a margin rate to
+/// enforce margin-aware withdrawal but can't easily reach the
+/// integration coordinator's `LiquidationParams` at v0 — a constant
+/// scoped to clearing closes that gap until param plumbing lands.
+pub const DEFAULT_INITIAL_MARGIN_BPS: u32 = 1_000;
+
 /// One account's persistent perp state. Same shape as
 /// `openhl_liquidation::AccountSnapshot` by design — the snapshot is a
 /// per-tick read of this. We don't re-use that type directly because
@@ -224,6 +238,34 @@ pub fn apply_fill(
     realized
 }
 
+/// Initial-margin requirement for `acct`, in quote-currency units.
+///
+/// `IM_req = |position_size| × avg_entry × im_bps / MARGIN_SCALE`,
+/// saturating on overflow.
+///
+/// **Why `avg_entry` instead of the current mark.** The owning layer
+/// (bridge + EVM precompile) needs a single, locally-computable
+/// margin denominator. `avg_entry` is the price at which the
+/// position's IM was originally posted, so this is literally
+/// "initial margin used to open". The trade-off is that a position
+/// at a gain still shows the same IM_req as at entry — withdrawing
+/// against unrealized gains is *not* allowed in v0. That matches a
+/// conservative reading of "free collateral after IM" and avoids
+/// dragging a CLOB-derived mark into the precompile's hot path.
+///
+/// Returns `0` for a flat position (no exposure → no margin).
+#[must_use]
+pub fn initial_margin_requirement(acct: &Account, im_bps: u32) -> i64 {
+    let abs_size = i128::from(acct.position_size.0.unsigned_abs());
+    let avg_entry = i128::from(acct.avg_entry.0);
+    let bps = i128::from(im_bps);
+    let scaled = abs_size
+        .saturating_mul(avg_entry)
+        .saturating_mul(bps);
+    let req = scaled / i128::from(MARGIN_SCALE);
+    i64::try_from(req).unwrap_or(i64::MAX)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -388,5 +430,57 @@ mod tests {
         apply_fill(&mut a, Price(100), Qty(5), Side::Buy);
         apply_fill(&mut a, Price(110), Qty(2), Side::Sell);
         assert_eq!(a.account, AccountId(42));
+    }
+
+    // ─── initial_margin_requirement ───────────────────────────────
+
+    #[test]
+    fn im_requirement_zero_for_flat_account() {
+        let a = acct(1);
+        assert_eq!(initial_margin_requirement(&a, DEFAULT_INITIAL_MARGIN_BPS), 0);
+    }
+
+    #[test]
+    fn im_requirement_long_position_at_default_bps() {
+        // 10 contracts × 100 entry × 10% = 100.
+        let a = long(1, 10, 100);
+        assert_eq!(
+            initial_margin_requirement(&a, DEFAULT_INITIAL_MARGIN_BPS),
+            100,
+        );
+    }
+
+    #[test]
+    fn im_requirement_short_position_uses_absolute_size() {
+        // Short and long of the same |size| × avg_entry share IM_req.
+        let s = short(1, -10, 100);
+        let l = long(2, 10, 100);
+        assert_eq!(
+            initial_margin_requirement(&s, DEFAULT_INITIAL_MARGIN_BPS),
+            initial_margin_requirement(&l, DEFAULT_INITIAL_MARGIN_BPS),
+        );
+    }
+
+    #[test]
+    fn im_requirement_zero_bps_is_zero() {
+        // With a 0 bps rate (config-only edge), even a giant position
+        // requires no IM.
+        let a = long(1, 1_000_000, 1_000);
+        assert_eq!(initial_margin_requirement(&a, 0), 0);
+    }
+
+    #[test]
+    fn im_requirement_saturates_on_extreme_inputs() {
+        // |size| × avg_entry × bps would overflow i64 but stays in
+        // i128 until the final cast; we saturate to i64::MAX rather
+        // than panicking. Validators disagreeing on overflow forks
+        // the chain — bounded behavior is the contract.
+        let a = Account {
+            account: AccountId(1),
+            position_size: PositionSize(i64::MAX),
+            avg_entry: MarkPrice(u64::MAX),
+            collateral: Notional(0),
+        };
+        assert_eq!(initial_margin_requirement(&a, u32::MAX), i64::MAX);
     }
 }
