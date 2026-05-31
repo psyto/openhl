@@ -79,6 +79,13 @@ pub struct LiveRethEvmBridge<P> {
     /// precompile can hold a clone of the same map. Same shared-Arc
     /// pattern as `clob` and `pending_fills`.
     accounts: Arc<Mutex<HashMap<AccountId, Account>>>,
+    /// Initial-margin rate in basis points for free-collateral
+    /// computation in [`Self::withdraw`] (Stage 17l). Defaults to
+    /// [`openhl_clearing::DEFAULT_INITIAL_MARGIN_BPS`]; override via
+    /// [`Self::with_initial_margin_bps`]. The builder also installs
+    /// the value into [`crate::precompiles::install_initial_margin_bps`]
+    /// so the EVM-side withdraw precompile reads the same rate.
+    initial_margin_bps: u32,
 }
 
 #[derive(Debug, Default)]
@@ -124,7 +131,32 @@ impl<P> LiveRethEvmBridge<P> {
             engine_handle: None,
             state: Mutex::new(State::default()),
             accounts,
+            initial_margin_bps: openhl_clearing::DEFAULT_INITIAL_MARGIN_BPS,
         }
+    }
+
+    /// Stage 17l — override the initial-margin rate used by
+    /// [`Self::withdraw`]. `bin/openhl` reads
+    /// `OpenHlNodeConfig::liquidation_params::initial_margin_bps`
+    /// at boot and threads it through here so the bridge stops
+    /// using its hardcoded default. ALSO installs the rate into
+    /// [`crate::precompiles::install_initial_margin_bps`] so the
+    /// `openhl_withdraw` precompile uses the same value — keeps
+    /// the "EVM-side and Rust-side withdraw are equivalent state
+    /// changes" property (see `docs/architecture.md`).
+    #[must_use]
+    pub fn with_initial_margin_bps(mut self, bps: u32) -> Self {
+        self.initial_margin_bps = bps;
+        crate::precompiles::install_initial_margin_bps(bps);
+        self
+    }
+
+    /// Read the bridge's current initial-margin rate. Mostly for
+    /// tests; production code paths just call `withdraw` directly
+    /// and let the rate apply internally.
+    #[must_use]
+    pub const fn initial_margin_bps(&self) -> u32 {
+        self.initial_margin_bps
     }
 
     /// Install a Reth in-process Engine API handle. After this call,
@@ -267,7 +299,7 @@ impl<P> LiveRethEvmBridge<P> {
         let mut accts = self.accounts.lock().expect("accounts mutex poisoned");
         let acct = accts.get_mut(&account)?;
         let amount_i64 = i64::try_from(amount).ok()?;
-        let free = withdraw_free_collateral(acct, mark);
+        let free = withdraw_free_collateral(acct, mark, self.initial_margin_bps);
         if i128::from(amount_i64) > i128::from(free) {
             return None;
         }
@@ -366,27 +398,26 @@ impl<P> LiveRethEvmBridge<P> {
 
 /// Stage 17j helper for `withdraw`: free collateral with a CLOB
 /// mark when one's available, falling back to the Stage 17g
-/// avg-entry rule when it isn't. Shared by the bridge and
-/// (via [`crate::precompiles::withdraw_free_collateral`]) the
-/// withdraw precompile, so on-chain and off-chain views of "how
+/// avg-entry rule when it isn't. Shared by the bridge and the
+/// withdraw precompile so on-chain and off-chain views of "how
 /// much can I take out" stay byte-identical.
+///
+/// `im_bps` is the initial-margin rate in basis points. Stage 17l
+/// made this configurable per-bridge via
+/// [`LiveRethEvmBridge::with_initial_margin_bps`]; the precompile
+/// reads it from the matching
+/// [`crate::precompiles::current_initial_margin_bps`] global.
 pub(crate) fn withdraw_free_collateral(
     acct: &openhl_clearing::Account,
     mark: Option<openhl_funding::MarkPrice>,
+    im_bps: u32,
 ) -> i64 {
     match mark {
-        Some(m) => openhl_clearing::free_collateral(
-            acct,
-            m,
-            openhl_clearing::DEFAULT_INITIAL_MARGIN_BPS,
-        ),
+        Some(m) => openhl_clearing::free_collateral(acct, m, im_bps),
         None => {
             // Stage 17g fallback: no mark → IM at avg_entry, uPnL
             // treated as zero. Equivalent to `collateral − IM_req`.
-            let im = openhl_clearing::initial_margin_requirement(
-                acct,
-                openhl_clearing::DEFAULT_INITIAL_MARGIN_BPS,
-            );
+            let im = openhl_clearing::initial_margin_requirement(acct, im_bps);
             acct.collateral.0.saturating_sub(im)
         }
     }
@@ -1056,6 +1087,56 @@ mod tests {
         assert_eq!(
             bridge.withdraw(AccountId(1), 220),
             Some(Notional(280)),
+        );
+    }
+
+    /// Stage 17l: the initial-margin rate is now tunable. A bridge
+    /// constructed with a non-default rate enforces it on
+    /// `withdraw`, and the matching precompile-module global is
+    /// also installed (proved indirectly here by reading it back).
+    #[test]
+    fn with_initial_margin_bps_overrides_default_rate() {
+        use openhl_clob::{AccountId, OrderId, OrderType, Price, Qty, Side};
+        use openhl_funding::Notional;
+
+        // 500 bps (5%) instead of the default 1000 bps (10%).
+        let bridge = LiveRethEvmBridge::new((), dev_chain_spec())
+            .with_initial_margin_bps(500);
+        assert_eq!(bridge.initial_margin_bps(), 500);
+        assert_eq!(
+            crate::precompiles::current_initial_margin_bps(),
+            500,
+            "bridge builder must install the rate into the precompile global",
+        );
+
+        // Same setup as the Stage 17g IM test: long 10 @ 100,
+        // collateral 500.
+        bridge.submit_order(Order {
+            id: OrderId(1),
+            account: AccountId(1),
+            side: Side::Buy,
+            qty: Qty(10),
+            order_type: OrderType::Limit { price: Price(100) },
+        });
+        bridge.submit_order(Order {
+            id: OrderId(2),
+            account: AccountId(2),
+            side: Side::Sell,
+            qty: Qty(10),
+            order_type: OrderType::Market,
+        });
+        let _ = bridge.deposit(AccountId(1), 500);
+
+        // No mark book → avg-entry fallback. At 500 bps:
+        // IM = 10*100*5%/1 = 50. Free = 500 - 50 = 450.
+        // (At the default 1000 bps the free would have been 400.)
+        assert_eq!(bridge.withdraw(AccountId(1), 451), None);
+        assert_eq!(bridge.withdraw(AccountId(1), 450), Some(Notional(50)));
+
+        // Restore default so other tests in the workspace aren't
+        // disturbed. Process-global concern, same as ACCOUNTS_STATE.
+        crate::precompiles::install_initial_margin_bps(
+            openhl_clearing::DEFAULT_INITIAL_MARGIN_BPS,
         );
     }
 

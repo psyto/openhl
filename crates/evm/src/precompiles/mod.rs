@@ -28,7 +28,7 @@ use openhl_clob::{AccountId, Book, Fill, Order, OrderId, OrderType, Price, Qty, 
 use openhl_funding::Notional;
 use std::collections::HashMap;
 use std::sync::{
-    atomic::{AtomicU64, Ordering},
+    atomic::{AtomicU32, AtomicU64, Ordering},
     Arc, Mutex, RwLock,
 };
 
@@ -180,6 +180,37 @@ pub fn install_accounts(accounts: Arc<Mutex<HashMap<AccountId, Account>>>) {
 /// Clear the installed account map. Test-only typical use; idempotent.
 pub fn uninstall_accounts() {
     *ACCOUNTS_STATE.write().expect("ACCOUNTS_STATE rwlock poisoned") = None;
+}
+
+/// Stage 17l — process-global initial-margin rate (bps) used by
+/// the [`openhl_withdraw`](OPENHL_WITHDRAW) precompile when
+/// computing free collateral. Default
+/// [`openhl_clearing::DEFAULT_INITIAL_MARGIN_BPS`] (1000 bps,
+/// matching `LiquidationParams::hyperliquid_default`).
+///
+/// Bridge constructor sets this via
+/// [`LiveRethEvmBridge::with_initial_margin_bps`](crate::live_node::LiveRethEvmBridge::with_initial_margin_bps)
+/// so the bridge's Rust-side `withdraw` and the EVM-side precompile
+/// always read the same rate — the "EVM and Rust deposit/withdraw
+/// are equivalent state changes" property in `docs/architecture.md`
+/// depends on this lockstep.
+static INITIAL_MARGIN_BPS: AtomicU32 =
+    AtomicU32::new(openhl_clearing::DEFAULT_INITIAL_MARGIN_BPS);
+
+/// Set the process-global initial-margin rate the withdraw
+/// precompile uses. Returns the previous value (rarely useful;
+/// helps tests restore between runs).
+pub fn install_initial_margin_bps(bps: u32) -> u32 {
+    INITIAL_MARGIN_BPS.swap(bps, Ordering::Relaxed)
+}
+
+/// Read the process-global initial-margin rate. Mirrors
+/// [`install_initial_margin_bps`]; intended for the bridge's
+/// withdraw helper to consult so it doesn't diverge from the
+/// precompile path.
+#[must_use]
+pub fn current_initial_margin_bps() -> u32 {
+    INITIAL_MARGIN_BPS.load(Ordering::Relaxed)
 }
 
 /// Read the currently-installed CLOB's best bid. Returns `None` if no CLOB
@@ -544,7 +575,16 @@ pub(crate) fn withdraw(input: &[u8], _gas_limit: u64, _reservoir: u64) -> Precom
     // `(equity − IM_req_at_mark)` rule. Without a book midpoint, the
     // helper falls back to the Stage 17g avg-entry rule. For a flat
     // position both reduce to a raw-collateral check.
-    let free = crate::live_node::withdraw_free_collateral(acct, current_mark());
+    //
+    // Stage 17l: the IM rate is read from the process-global
+    // `INITIAL_MARGIN_BPS` (installed by
+    // `LiveRethEvmBridge::with_initial_margin_bps`), so this stays
+    // in lockstep with the bridge's Rust-side withdraw rule.
+    let free = crate::live_node::withdraw_free_collateral(
+        acct,
+        current_mark(),
+        current_initial_margin_bps(),
+    );
     if i128::from(amount_i64) > i128::from(free) {
         return Ok(PrecompileOutput::new(
             WITHDRAW_BASE_GAS_COST,
@@ -1049,6 +1089,52 @@ mod tests {
         // One more → reject.
         let r = withdraw(&withdraw_calldata(42, 1), 100_000, 0).unwrap();
         assert!(r.bytes.iter().all(|&b| b == 0), "below-IM withdraw rejects");
+
+        uninstall_accounts();
+    }
+
+    /// Stage 17l: `install_initial_margin_bps` flows into the
+    /// `openhl_withdraw` precompile's free-collateral computation —
+    /// same rate the bridge enforces, so on-chain and off-chain
+    /// withdraw rules don't drift.
+    #[test]
+    fn withdraw_precompile_picks_up_installed_initial_margin_bps() {
+        use openhl_clearing::DEFAULT_INITIAL_MARGIN_BPS;
+        use openhl_funding::{MarkPrice, PositionSize};
+
+        let _g = TEST_SERIALIZER.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        uninstall_clob();
+        let accounts = Arc::new(Mutex::new(HashMap::new()));
+        install_accounts(Arc::clone(&accounts));
+
+        // 500 bps (5%) instead of the default 1000 (10%).
+        let prev = install_initial_margin_bps(500);
+
+        // Open-position account: size=10, avg_entry=100, collateral=500.
+        // IM at 500 bps = 10*100*500/10000 = 50. Free = 450.
+        // (Stage 17g test with 1000 bps had free = 400.)
+        accounts.lock().unwrap().insert(
+            AccountId(42),
+            Account {
+                account: AccountId(42),
+                position_size: PositionSize(10),
+                avg_entry: MarkPrice(100),
+                collateral: Notional(500),
+            },
+        );
+
+        let r = withdraw(&withdraw_calldata(42, 451), 100_000, 0).unwrap();
+        assert!(r.bytes.iter().all(|&b| b == 0), "above-IM withdraw rejects");
+
+        let r = withdraw(&withdraw_calldata(42, 450), 100_000, 0).unwrap();
+        let mut buf = [0u8; 8];
+        buf.copy_from_slice(&r.bytes[24..32]);
+        assert_eq!(i64::from_be_bytes(buf), 50);
+
+        // Restore the default and verify the swap actually toggled.
+        let after_test = install_initial_margin_bps(DEFAULT_INITIAL_MARGIN_BPS);
+        assert_eq!(after_test, 500);
+        assert_eq!(prev, DEFAULT_INITIAL_MARGIN_BPS);
 
         uninstall_accounts();
     }

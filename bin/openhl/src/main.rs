@@ -480,7 +480,22 @@ async fn run_reth_devnet(
     // (Stage 13d gap closure).
     let genesis_hash_bytes: [u8; 32] = chain_spec.genesis_hash().into();
     let genesis_parent = BlockHash(genesis_hash_bytes);
-    let bridge = Arc::new(LiveRethEvmBridge::new(node.provider.clone(), chain_spec));
+    // Stage 17l: thread the initial-margin rate from the node
+    // config into the bridge so the Rust-side `withdraw` (and the
+    // `openhl_withdraw` precompile, installed in lockstep) uses
+    // the configured value rather than `DEFAULT_INITIAL_MARGIN_BPS`.
+    // Matches the rate the coordinator constructed below at L668
+    // picks up from the same `hyperliquid_default()` config.
+    let initial_margin_bps = OpenHlNodeConfig::hyperliquid_default()
+        .liquidation_params
+        .initial_margin_bps;
+    let bridge = Arc::new(
+        LiveRethEvmBridge::new(node.provider.clone(), chain_spec)
+            .with_initial_margin_bps(initial_margin_bps),
+    );
+    println!(
+        "      initial margin   = {initial_margin_bps} bps (consumed by bridge.withdraw + openhl_withdraw precompile)"
+    );
     println!(
         "      genesis hash     = 0x{}…{}",
         hex_prefix(&genesis_hash_bytes, 4),
