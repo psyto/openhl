@@ -1931,6 +1931,89 @@ mod tests {
         uninstall_fill_sink();
     }
 
+    /// **Stage 17k**: production wiring. `OpenHlEvmFactory::create_evm`
+    /// now installs `OpenHlRevertGuard` by default — no
+    /// `create_evm_with_inspector` call, no explicit guard, no
+    /// `evm.enable_inspector()`. Reth's executor invokes
+    /// `create_evm` for every block, so this is the path that
+    /// matters for real on-chain reverts.
+    ///
+    /// `#[ignore]` for the same `ACCOUNTS_STATE`-race reason as the
+    /// other bytecode-driven tests.
+    #[test]
+    #[ignore]
+    fn deposit_via_evm_bytecode_rolls_back_on_revert_through_create_evm() {
+        use crate::precompiles::{
+            uninstall_accounts, uninstall_clob, uninstall_fill_sink, OPENHL_DEPOSIT,
+        };
+        use crate::OpenHlEvmFactory;
+        use alloy_evm::revm::{
+            context::{result::ExecutionResult, TxEnv},
+            database::{CacheDB, EmptyDB},
+            primitives::{Address, Bytes, TxKind, U256},
+            state::{AccountInfo, Bytecode},
+        };
+        use alloy_evm::{Evm, EvmEnv, EvmFactory};
+
+        uninstall_accounts();
+        uninstall_clob();
+        uninstall_fill_sink();
+
+        let bridge = LiveRethEvmBridge::new((), dev_chain_spec());
+        assert!(bridge.accounts_snapshot().is_empty());
+
+        let contract_addr = Address::from([0xe0; 20]);
+        let caller_addr = Address::from([0xea; 20]);
+        let mut db = CacheDB::new(EmptyDB::default());
+        db.insert_account_info(
+            contract_addr,
+            AccountInfo {
+                nonce: 1,
+                code: Some(Bytecode::new_raw(Bytes::from(
+                    reverting_wrapper_bytecode_for(OPENHL_DEPOSIT),
+                ))),
+                ..Default::default()
+            },
+        );
+        db.insert_account_info(
+            caller_addr,
+            AccountInfo {
+                balance: U256::from(1_000_000_000u64),
+                ..Default::default()
+            },
+        );
+
+        // The key difference vs 17i: `create_evm` (no explicit
+        // inspector), no enable_inspector() call. This is what
+        // Reth's BlockExecutor uses on every block.
+        let mut evm = OpenHlEvmFactory.create_evm(db, EvmEnv::default());
+
+        let mut calldata = vec![0u8; 64];
+        calldata[24..32].copy_from_slice(&42u64.to_be_bytes());
+        calldata[56..64].copy_from_slice(&1000_i64.to_be_bytes());
+        let tx = TxEnv {
+            caller: caller_addr,
+            kind: TxKind::Call(contract_addr),
+            data: Bytes::from(calldata),
+            gas_limit: 1_000_000,
+            ..Default::default()
+        };
+        let result = evm.transact(tx).expect("evm.transact must not error");
+
+        match result.result {
+            ExecutionResult::Revert { .. } => {}
+            other => panic!("expected Revert, got {other:?}"),
+        }
+        assert!(
+            bridge.accounts_snapshot().is_empty(),
+            "Stage 17k: create_evm installs the guard by default — revert must roll back",
+        );
+
+        uninstall_accounts();
+        uninstall_clob();
+        uninstall_fill_sink();
+    }
+
     /// **Stage 17i companion**: with the same inspector wired in,
     /// a deposit-then-RETURN flow MUST still commit the mutation.
     /// Otherwise the guard would over-rollback and break the happy

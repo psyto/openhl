@@ -39,6 +39,7 @@ cargo test -p openhl-evm via_evm_bytecode -- --ignored --test-threads=1
 - `live_node::tests::withdraw_via_evm_bytecode_debits_bridge_accounts`
 - `live_node::tests::deposit_via_evm_bytecode_rolls_back_on_revert` (Stage 17i)
 - `live_node::tests::deposit_via_evm_bytecode_persists_on_return` (Stage 17i)
+- `live_node::tests::deposit_via_evm_bytecode_rolls_back_on_revert_through_create_evm` (Stage 17k — production-wiring path)
 
 ## Startup fail-fast behavior
 
