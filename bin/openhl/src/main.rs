@@ -480,21 +480,21 @@ async fn run_reth_devnet(
     // (Stage 13d gap closure).
     let genesis_hash_bytes: [u8; 32] = chain_spec.genesis_hash().into();
     let genesis_parent = BlockHash(genesis_hash_bytes);
-    // Stage 17l: thread the initial-margin rate from the node
-    // config into the bridge so the Rust-side `withdraw` (and the
-    // `openhl_withdraw` precompile, installed in lockstep) uses
-    // the configured value rather than `DEFAULT_INITIAL_MARGIN_BPS`.
-    // Matches the rate the coordinator constructed below at L668
-    // picks up from the same `hyperliquid_default()` config.
-    let initial_margin_bps = OpenHlNodeConfig::hyperliquid_default()
-        .liquidation_params
-        .initial_margin_bps;
+    // Stage 17l → 17m: thread the full margin params from the node
+    // config into the bridge. Same rate the coordinator constructed
+    // below at L668 picks up from `hyperliquid_default()`; bridge
+    // uses `params.initial_margin_bps` for withdraw and the full
+    // params for `margin_health()`.
+    let liquidation_params = OpenHlNodeConfig::hyperliquid_default().liquidation_params;
     let bridge = Arc::new(
         LiveRethEvmBridge::new(node.provider.clone(), chain_spec)
-            .with_initial_margin_bps(initial_margin_bps),
+            .with_liquidation_params(liquidation_params),
     );
     println!(
-        "      initial margin   = {initial_margin_bps} bps (consumed by bridge.withdraw + openhl_withdraw precompile)"
+        "      margin params    = {} bps initial / {} bps maintenance / {} bps fee",
+        liquidation_params.initial_margin_bps,
+        liquidation_params.maintenance_margin_bps,
+        liquidation_params.liquidation_fee_bps,
     );
     println!(
         "      genesis hash     = 0x{}…{}",

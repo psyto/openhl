@@ -6307,6 +6307,7 @@ dependencies = [
  "openhl-clob",
  "openhl-consensus",
  "openhl-funding",
+ "openhl-liquidation",
  "openhl-types",
  "reth-chainspec",
  "reth-consensus",

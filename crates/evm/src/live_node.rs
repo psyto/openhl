@@ -37,6 +37,9 @@ use openhl_clearing::{apply_fill, Account};
 use openhl_clob::{AccountId, Book, Fill, FillResult, Order};
 use openhl_consensus::bridge::{BridgeError, ConsensusBridge};
 use openhl_funding::Notional;
+use openhl_liquidation::{
+    margin_health as compute_margin_health, AccountSnapshot, LiquidationParams, MarginHealth,
+};
 use openhl_types::{BlockHash, ExecutedBlock, PayloadAttrs, PayloadId, PayloadStatus};
 use reth_chainspec::{ChainSpec, EthChainSpec};
 use reth_consensus::HeaderValidator;
@@ -79,13 +82,18 @@ pub struct LiveRethEvmBridge<P> {
     /// precompile can hold a clone of the same map. Same shared-Arc
     /// pattern as `clob` and `pending_fills`.
     accounts: Arc<Mutex<HashMap<AccountId, Account>>>,
-    /// Initial-margin rate in basis points for free-collateral
-    /// computation in [`Self::withdraw`] (Stage 17l). Defaults to
-    /// [`openhl_clearing::DEFAULT_INITIAL_MARGIN_BPS`]; override via
-    /// [`Self::with_initial_margin_bps`]. The builder also installs
-    /// the value into [`crate::precompiles::install_initial_margin_bps`]
-    /// so the EVM-side withdraw precompile reads the same rate.
-    initial_margin_bps: u32,
+    /// Margin-model parameters (Stage 17m, generalizing 17l's
+    /// single-`u32` field). The bridge stores the full
+    /// [`LiquidationParams`] so it can answer not just "what's the
+    /// initial-margin rate for withdraw?" but also "what's this
+    /// account's margin health right now?" — see
+    /// [`Self::margin_health`].
+    ///
+    /// Default: [`LiquidationParams::hyperliquid_default`].
+    /// Override via [`Self::with_liquidation_params`], which ALSO
+    /// installs `initial_margin_bps` into the precompile global
+    /// so EVM-side and Rust-side withdraw rules stay in lockstep.
+    liquidation_params: LiquidationParams,
 }
 
 #[derive(Debug, Default)]
@@ -131,32 +139,73 @@ impl<P> LiveRethEvmBridge<P> {
             engine_handle: None,
             state: Mutex::new(State::default()),
             accounts,
-            initial_margin_bps: openhl_clearing::DEFAULT_INITIAL_MARGIN_BPS,
+            liquidation_params: LiquidationParams::hyperliquid_default(),
         }
     }
 
-    /// Stage 17l — override the initial-margin rate used by
-    /// [`Self::withdraw`]. `bin/openhl` reads
-    /// `OpenHlNodeConfig::liquidation_params::initial_margin_bps`
-    /// at boot and threads it through here so the bridge stops
-    /// using its hardcoded default. ALSO installs the rate into
+    /// Stage 17m — override the margin-model parameters used by
+    /// [`Self::withdraw`] (via `params.initial_margin_bps`) and by
+    /// [`Self::margin_health`] (via the full
+    /// [`LiquidationParams`]). `bin/openhl` reads
+    /// `OpenHlNodeConfig::liquidation_params` at boot and threads
+    /// the whole struct through here.
+    ///
+    /// ALSO installs `params.initial_margin_bps` into
     /// [`crate::precompiles::install_initial_margin_bps`] so the
-    /// `openhl_withdraw` precompile uses the same value — keeps
+    /// `openhl_withdraw` precompile uses the same rate — preserves
     /// the "EVM-side and Rust-side withdraw are equivalent state
-    /// changes" property (see `docs/architecture.md`).
+    /// changes" property (see `docs/architecture.md`). The
+    /// maintenance/fee fields aren't exposed via precompile yet at
+    /// v0 (margin health isn't yet a callable EVM precompile).
     #[must_use]
-    pub fn with_initial_margin_bps(mut self, bps: u32) -> Self {
-        self.initial_margin_bps = bps;
-        crate::precompiles::install_initial_margin_bps(bps);
+    pub fn with_liquidation_params(mut self, params: LiquidationParams) -> Self {
+        crate::precompiles::install_initial_margin_bps(params.initial_margin_bps);
+        self.liquidation_params = params;
         self
     }
 
-    /// Read the bridge's current initial-margin rate. Mostly for
-    /// tests; production code paths just call `withdraw` directly
-    /// and let the rate apply internally.
+    /// Read the bridge's full margin-model parameters.
+    #[must_use]
+    pub const fn liquidation_params(&self) -> &LiquidationParams {
+        &self.liquidation_params
+    }
+
+    /// Convenience getter — initial-margin rate in bps. Equivalent
+    /// to `bridge.liquidation_params().initial_margin_bps()`; kept
+    /// for parity with the Stage 17l API.
     #[must_use]
     pub const fn initial_margin_bps(&self) -> u32 {
-        self.initial_margin_bps
+        self.liquidation_params.initial_margin_bps
+    }
+
+    /// Stage 17m — classify an account's margin health using the
+    /// production-shape `openhl_liquidation::margin_health` math
+    /// at the current CLOB midpoint and this bridge's
+    /// [`LiquidationParams`].
+    ///
+    /// Returns `None` when:
+    ///   * the account doesn't exist, OR
+    ///   * the CLOB midpoint isn't available (one-sided / empty
+    ///     book) — clients should treat this as "indeterminate
+    ///     until a mark is available", same handling pattern as
+    ///     [`Self::current_mark`].
+    ///
+    /// Read-only; mutates nothing. Designed as the v0 primitive a
+    /// future Hyperliquid-shape RPC `info` endpoint can return so
+    /// clients see Safe / AtRisk / Liquidatable / Underwater
+    /// status without re-implementing the liquidation engine.
+    #[must_use]
+    pub fn margin_health(&self, account: AccountId) -> Option<MarginHealth> {
+        let mark = self.current_mark()?;
+        let accts = self.accounts.lock().expect("accounts mutex poisoned");
+        let acct = accts.get(&account)?;
+        let snapshot = AccountSnapshot {
+            account: acct.account,
+            position_size: acct.position_size,
+            avg_entry: acct.avg_entry,
+            collateral: acct.collateral,
+        };
+        Some(compute_margin_health(&snapshot, mark, &self.liquidation_params))
     }
 
     /// Install a Reth in-process Engine API handle. After this call,
@@ -299,7 +348,8 @@ impl<P> LiveRethEvmBridge<P> {
         let mut accts = self.accounts.lock().expect("accounts mutex poisoned");
         let acct = accts.get_mut(&account)?;
         let amount_i64 = i64::try_from(amount).ok()?;
-        let free = withdraw_free_collateral(acct, mark, self.initial_margin_bps);
+        let free =
+            withdraw_free_collateral(acct, mark, self.liquidation_params.initial_margin_bps);
         if i128::from(amount_i64) > i128::from(free) {
             return None;
         }
@@ -1090,19 +1140,23 @@ mod tests {
         );
     }
 
-    /// Stage 17l: the initial-margin rate is now tunable. A bridge
-    /// constructed with a non-default rate enforces it on
-    /// `withdraw`, and the matching precompile-module global is
-    /// also installed (proved indirectly here by reading it back).
+    /// Stage 17l → 17m: the margin params are now tunable. A
+    /// bridge constructed with non-default params enforces them
+    /// on `withdraw`, and the matching precompile-module global
+    /// is also installed (proved indirectly here by reading it
+    /// back).
     #[test]
-    fn with_initial_margin_bps_overrides_default_rate() {
+    fn with_liquidation_params_overrides_default_rate() {
         use openhl_clob::{AccountId, OrderId, OrderType, Price, Qty, Side};
         use openhl_funding::Notional;
 
-        // 500 bps (5%) instead of the default 1000 bps (10%).
+        // 500 bps initial (5%) instead of the default 1000 bps (10%).
+        let mut params = LiquidationParams::hyperliquid_default();
+        params.initial_margin_bps = 500;
         let bridge = LiveRethEvmBridge::new((), dev_chain_spec())
-            .with_initial_margin_bps(500);
+            .with_liquidation_params(params);
         assert_eq!(bridge.initial_margin_bps(), 500);
+        assert_eq!(bridge.liquidation_params().initial_margin_bps, 500);
         assert_eq!(
             crate::precompiles::current_initial_margin_bps(),
             500,
@@ -1137,6 +1191,112 @@ mod tests {
         // disturbed. Process-global concern, same as ACCOUNTS_STATE.
         crate::precompiles::install_initial_margin_bps(
             openhl_clearing::DEFAULT_INITIAL_MARGIN_BPS,
+        );
+    }
+
+    /// Stage 17m — `margin_health(account)` classifies an
+    /// account's solvency at the current CLOB midpoint using the
+    /// bridge's `LiquidationParams`. Cycles through the four
+    /// states by varying mark + collateral on a long-10-at-100
+    /// position.
+    #[test]
+    fn margin_health_classifies_against_current_mark() {
+        use openhl_clob::{AccountId, OrderId, OrderType, Price, Qty, Side};
+
+        // Helper: build a fresh bridge, fund account 1 with `coll`
+        // and put account 1 long 10 @ 100. Then place mark-book
+        // orders at `bid`/`ask` so `current_mark` returns
+        // `(bid+ask)/2`. Returns the bridge so we can introspect.
+        let setup = |coll: i64, bid: u64, ask: u64| -> LiveRethEvmBridge<()> {
+            let bridge = LiveRethEvmBridge::new((), dev_chain_spec());
+            bridge.submit_order(Order {
+                id: OrderId(1),
+                account: AccountId(1),
+                side: Side::Buy,
+                qty: Qty(10),
+                order_type: OrderType::Limit { price: Price(100) },
+            });
+            bridge.submit_order(Order {
+                id: OrderId(2),
+                account: AccountId(2),
+                side: Side::Sell,
+                qty: Qty(10),
+                order_type: OrderType::Market,
+            });
+            bridge.submit_order(Order {
+                id: OrderId(101),
+                account: AccountId(99),
+                side: Side::Buy,
+                qty: Qty(1),
+                order_type: OrderType::Limit { price: Price(bid) },
+            });
+            bridge.submit_order(Order {
+                id: OrderId(102),
+                account: AccountId(98),
+                side: Side::Sell,
+                qty: Qty(1),
+                order_type: OrderType::Limit { price: Price(ask) },
+            });
+            let _ = bridge.deposit(AccountId(1), coll);
+            bridge
+        };
+
+        // hyperliquid_default: IM = 10% (1000 bps), MM = 2% (200 bps).
+        // Account 1 = long 10 @ 100, notional at mark m = 10*m.
+
+        // Safe: mark 110 → uPnL=+100, equity=600, MR ≈ 5455 bps ≥ IM.
+        let bridge = setup(500, 109, 111);
+        assert_eq!(bridge.margin_health(AccountId(1)), Some(MarginHealth::Safe));
+
+        // AtRisk: mark 95 → uPnL=-50, equity=50, notional=950,
+        // MR ≈ 526 bps. < IM(1000), ≥ MM(200) → AtRisk.
+        let bridge = setup(100, 94, 96);
+        assert_eq!(
+            bridge.margin_health(AccountId(1)),
+            Some(MarginHealth::AtRisk),
+        );
+
+        // Liquidatable: mark 92 → uPnL=-80, equity=20, notional=920,
+        // MR ≈ 217 bps. Tighten by lowering collateral so MR < MM.
+        // collateral 90, equity = 10, MR = 10*10000/920 = 108 bps < 200.
+        let bridge = setup(90, 91, 93);
+        assert_eq!(
+            bridge.margin_health(AccountId(1)),
+            Some(MarginHealth::Liquidatable),
+        );
+
+        // Underwater: mark 80 → uPnL=-200, equity=-150, MR<0.
+        let bridge = setup(50, 79, 81);
+        assert_eq!(
+            bridge.margin_health(AccountId(1)),
+            Some(MarginHealth::Underwater),
+        );
+
+        // Unknown account → None.
+        let bridge = setup(100, 99, 101);
+        assert_eq!(bridge.margin_health(AccountId(999)), None);
+
+        // No mark (one-sided book) → None.
+        let solo = LiveRethEvmBridge::new((), dev_chain_spec());
+        solo.submit_order(Order {
+            id: OrderId(1),
+            account: AccountId(1),
+            side: Side::Buy,
+            qty: Qty(10),
+            order_type: OrderType::Limit { price: Price(100) },
+        });
+        solo.submit_order(Order {
+            id: OrderId(2),
+            account: AccountId(2),
+            side: Side::Sell,
+            qty: Qty(10),
+            order_type: OrderType::Market,
+        });
+        let _ = solo.deposit(AccountId(1), 500);
+        assert_eq!(
+            solo.margin_health(AccountId(1)),
+            None,
+            "no CLOB midpoint → indeterminate",
         );
     }
 
