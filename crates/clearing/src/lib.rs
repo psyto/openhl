@@ -57,6 +57,14 @@ pub const MARGIN_SCALE: i64 = 10_000;
 /// scoped to clearing closes that gap until param plumbing lands.
 pub const DEFAULT_INITIAL_MARGIN_BPS: u32 = 1_000;
 
+/// Default maintenance-margin rate for v0: 2% (200 bps), matching
+/// [`openhl_liquidation::LiquidationParams::hyperliquid_default`].
+/// Used as the static default for the maintenance bps the bridge
+/// installs into a precompile global at Stage 17n so the EVM-side
+/// `openhl_margin_health` classifier reads the same threshold the
+/// liquidation engine uses.
+pub const DEFAULT_MAINTENANCE_MARGIN_BPS: u32 = 200;
+
 /// One account's persistent perp state. Same shape as
 /// `openhl_liquidation::AccountSnapshot` by design — the snapshot is a
 /// per-tick read of this. We don't re-use that type directly because

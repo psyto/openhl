@@ -96,6 +96,31 @@ pub const OPENHL_DEPOSIT: Address = address!("0x00000000000000000000000000000000
 /// transaction reverts.
 pub const OPENHL_WITHDRAW: Address = address!("0x0000000000000000000000000000000000000c1e");
 
+/// Address of the "margin health" precompile (Stage 17n).
+///
+/// Solidity call shape (32-byte input):
+/// `staticcall(gas, 0x...0c1f, calldata=(uint64 account), ...) → uint256 tag`
+///
+/// Returns a 32-byte word whose **last byte** is the
+/// [`MarginHealthTag`] discriminator:
+///   - `0` = Indeterminate (no CLOB midpoint available, account
+///           doesn't exist, account map not installed, or
+///           malformed input — clients should treat as "ask again
+///           in a moment")
+///   - `1` = Safe
+///   - `2` = AtRisk
+///   - `3` = Liquidatable
+///   - `4` = Underwater
+///
+/// Read-only / pure-query (no state mutation, no fill side
+/// effects) — same lifecycle expectations as
+/// [`CLOB_READ_BEST_BID`]. Wraps the production-shape
+/// `openhl_liquidation::margin_health` classifier the bridge's
+/// `margin_health(account)` accessor uses, so on-chain queries
+/// and Rust-side queries return identical answers.
+pub const OPENHL_MARGIN_HEALTH: Address =
+    address!("0x0000000000000000000000000000000000000c1f");
+
 /// The minimum gas charge for invoking a CLOB precompile. Tuned later.
 const CLOB_BASE_GAS_COST: u64 = 500;
 
@@ -105,6 +130,20 @@ const DEPOSIT_BASE_GAS_COST: u64 = 500;
 
 /// Base gas for the withdraw precompile (Stage 17e). Same magnitude.
 const WITHDRAW_BASE_GAS_COST: u64 = 500;
+
+/// Base gas for the margin-health precompile (Stage 17n). Read-
+/// only, same magnitude as the rest of the openhl precompile set.
+const MARGIN_HEALTH_BASE_GAS_COST: u64 = 500;
+
+/// Discriminator bytes returned in the last position of the
+/// [`OPENHL_MARGIN_HEALTH`] precompile's output word.
+pub mod margin_health_tag {
+    pub const INDETERMINATE: u8 = 0;
+    pub const SAFE: u8 = 1;
+    pub const AT_RISK: u8 = 2;
+    pub const LIQUIDATABLE: u8 = 3;
+    pub const UNDERWATER: u8 = 4;
+}
 
 /// Monotonic order-ID counter for orders placed via the EVM. Starts at 1
 /// so the sentinel value 0 (returned on rejection) is distinguishable from
@@ -211,6 +250,32 @@ pub fn install_initial_margin_bps(bps: u32) -> u32 {
 #[must_use]
 pub fn current_initial_margin_bps() -> u32 {
     INITIAL_MARGIN_BPS.load(Ordering::Relaxed)
+}
+
+/// Stage 17n — process-global maintenance-margin rate (bps) used
+/// by the [`openhl_margin_health`](OPENHL_MARGIN_HEALTH) precompile
+/// to classify accounts as `Liquidatable` (below maintenance) vs
+/// `AtRisk` (between maintenance and initial). Default
+/// [`openhl_clearing::DEFAULT_MAINTENANCE_MARGIN_BPS`] (200 bps,
+/// matching `LiquidationParams::hyperliquid_default`).
+///
+/// The bridge's [`LiveRethEvmBridge::with_liquidation_params`]
+/// installs this alongside `INITIAL_MARGIN_BPS` so on-chain and
+/// off-chain margin views share the same thresholds.
+static MAINTENANCE_MARGIN_BPS: AtomicU32 =
+    AtomicU32::new(openhl_clearing::DEFAULT_MAINTENANCE_MARGIN_BPS);
+
+/// Set the process-global maintenance-margin rate the
+/// `openhl_margin_health` precompile uses. Returns the previous
+/// value.
+pub fn install_maintenance_margin_bps(bps: u32) -> u32 {
+    MAINTENANCE_MARGIN_BPS.swap(bps, Ordering::Relaxed)
+}
+
+/// Read the process-global maintenance-margin rate.
+#[must_use]
+pub fn current_maintenance_margin_bps() -> u32 {
+    MAINTENANCE_MARGIN_BPS.load(Ordering::Relaxed)
 }
 
 /// Read the currently-installed CLOB's best bid. Returns `None` if no CLOB
@@ -609,6 +674,94 @@ pub(crate) fn withdraw(input: &[u8], _gas_limit: u64, _reservoir: u64) -> Precom
     ))
 }
 
+/// Stage 17n — classify an account's margin health at the current
+/// CLOB midpoint, using the same
+/// `openhl_liquidation::margin_health` function the bridge's
+/// `margin_health(account)` accessor uses.
+///
+/// Calldata (32 bytes): big-endian u64 in the last 8 bytes
+/// (`uint256 account` ABI-padded).
+///
+/// Output (32 bytes): all zero except the last byte, which
+/// carries one of the [`margin_health_tag`] discriminators.
+///
+/// Indeterminate (`0`) covers every reason the precompile can't
+/// produce a real classification: input too short, account map
+/// not installed, account doesn't exist, or the CLOB is
+/// one-sided/empty so `current_mark` is `None`. Smart contracts
+/// should treat that as "try again once the book has a mark".
+#[allow(clippy::unnecessary_wraps)]
+pub(crate) fn margin_health(
+    input: &[u8],
+    _gas_limit: u64,
+    _reservoir: u64,
+) -> PrecompileResult {
+    let mut out = vec![0u8; 32];
+    // Default tag = Indeterminate (0). All early returns below
+    // ship the zero-output.
+
+    if input.len() < 32 {
+        return Ok(PrecompileOutput::new(
+            MARGIN_HEALTH_BASE_GAS_COST,
+            Bytes::from(out),
+            0,
+        ));
+    }
+    let account_id = u64_from_be_chunk(&input[0..32]);
+
+    let Some(mark) = current_mark() else {
+        return Ok(PrecompileOutput::new(
+            MARGIN_HEALTH_BASE_GAS_COST,
+            Bytes::from(out),
+            0,
+        ));
+    };
+
+    let state = ACCOUNTS_STATE
+        .read()
+        .expect("ACCOUNTS_STATE rwlock poisoned");
+    let Some(accounts) = state.as_ref() else {
+        return Ok(PrecompileOutput::new(
+            MARGIN_HEALTH_BASE_GAS_COST,
+            Bytes::from(out),
+            0,
+        ));
+    };
+    let map = accounts.lock().expect("accounts mutex poisoned");
+    let Some(acct) = map.get(&AccountId(account_id)) else {
+        return Ok(PrecompileOutput::new(
+            MARGIN_HEALTH_BASE_GAS_COST,
+            Bytes::from(out),
+            0,
+        ));
+    };
+
+    let snapshot = openhl_liquidation::AccountSnapshot {
+        account: acct.account,
+        position_size: acct.position_size,
+        avg_entry: acct.avg_entry,
+        collateral: acct.collateral,
+    };
+    // `liquidation_fee_bps` is unused by `margin_health`; pass 0.
+    let params = openhl_liquidation::LiquidationParams {
+        initial_margin_bps: current_initial_margin_bps(),
+        maintenance_margin_bps: current_maintenance_margin_bps(),
+        liquidation_fee_bps: 0,
+    };
+    let tag = match openhl_liquidation::margin_health(&snapshot, mark, &params) {
+        openhl_liquidation::MarginHealth::Safe => margin_health_tag::SAFE,
+        openhl_liquidation::MarginHealth::AtRisk => margin_health_tag::AT_RISK,
+        openhl_liquidation::MarginHealth::Liquidatable => margin_health_tag::LIQUIDATABLE,
+        openhl_liquidation::MarginHealth::Underwater => margin_health_tag::UNDERWATER,
+    };
+    out[31] = tag;
+    Ok(PrecompileOutput::new(
+        MARGIN_HEALTH_BASE_GAS_COST,
+        Bytes::from(out),
+        0,
+    ))
+}
+
 /// Build a `Precompiles` set that extends Reth's standard precompiles with
 /// openhl's CLOB-reading + CLOB-writing additions. The base set is parameterized
 /// over the hardfork's spec id so we inherit Ethereum's evolution (e.g., the
@@ -636,6 +789,11 @@ pub fn openhl_precompiles(base: &Precompiles) -> Precompiles {
             PrecompileId::custom("openhl_withdraw"),
             OPENHL_WITHDRAW,
             withdraw,
+        ),
+        Precompile::new(
+            PrecompileId::custom("openhl_margin_health"),
+            OPENHL_MARGIN_HEALTH,
+            margin_health,
         ),
     ]);
     precompiles
@@ -1137,6 +1295,123 @@ mod tests {
         assert_eq!(prev, DEFAULT_INITIAL_MARGIN_BPS);
 
         uninstall_accounts();
+    }
+
+    /// Stage 17n — `openhl_margin_health` precompile cycles
+    /// through Indeterminate / Safe / AtRisk / Liquidatable /
+    /// Underwater as account state varies at a fixed mark.
+    /// Mirrors the bridge's `margin_health_classifies_against_current_mark`
+    /// test (live_node.rs) but drives the EVM-side precompile
+    /// directly.
+    #[test]
+    fn margin_health_precompile_returns_each_classification() {
+        use openhl_funding::{MarkPrice, PositionSize};
+
+        let _g = TEST_SERIALIZER.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        // Clean state.
+        uninstall_clob();
+        uninstall_accounts();
+        install_initial_margin_bps(openhl_clearing::DEFAULT_INITIAL_MARGIN_BPS);
+        install_maintenance_margin_bps(openhl_clearing::DEFAULT_MAINTENANCE_MARGIN_BPS);
+
+        // Calldata helper.
+        let calldata = |account: u64| -> Vec<u8> {
+            let mut buf = vec![0u8; 32];
+            buf[24..32].copy_from_slice(&account.to_be_bytes());
+            buf
+        };
+
+        // Indeterminate (no map / no CLOB).
+        let r = margin_health(&calldata(42), 100_000, 0).unwrap();
+        assert_eq!(r.bytes[31], margin_health_tag::INDETERMINATE);
+
+        // Install accounts + a CLOB with bid 109 / ask 111 → mark 110.
+        let accounts = Arc::new(Mutex::new(HashMap::new()));
+        install_accounts(Arc::clone(&accounts));
+        let book = Arc::new(Mutex::new(Book::new()));
+        let install_book = |bid: u64, ask: u64| {
+            uninstall_clob();
+            let b = Arc::new(Mutex::new(Book::new()));
+            b.lock().unwrap().submit(Order {
+                id: OrderId(101),
+                account: AccountId(99),
+                side: Side::Buy,
+                qty: Qty(1),
+                order_type: OrderType::Limit { price: Price(bid) },
+            });
+            b.lock().unwrap().submit(Order {
+                id: OrderId(102),
+                account: AccountId(98),
+                side: Side::Sell,
+                qty: Qty(1),
+                order_type: OrderType::Limit { price: Price(ask) },
+            });
+            install_clob(b);
+        };
+        let _ = book; // silence the unused-binding lint above; we use install_book instead.
+
+        // Long 10 @ 100 used throughout; vary collateral + mark.
+        let put_acct = |coll: i64| {
+            accounts.lock().unwrap().insert(
+                AccountId(42),
+                Account {
+                    account: AccountId(42),
+                    position_size: PositionSize(10),
+                    avg_entry: MarkPrice(100),
+                    collateral: Notional(coll),
+                },
+            );
+        };
+
+        // Safe: mark 110, coll 500. uPnL=+100, equity=600,
+        // notional=1100, MR≈5454 bps ≥ IM(1000).
+        install_book(109, 111);
+        put_acct(500);
+        let r = margin_health(&calldata(42), 100_000, 0).unwrap();
+        assert_eq!(r.bytes[31], margin_health_tag::SAFE);
+        assert_eq!(r.gas_used, MARGIN_HEALTH_BASE_GAS_COST);
+
+        // AtRisk: mark 95, coll 100. uPnL=-50, equity=50,
+        // notional=950, MR≈526 bps; < IM(1000), ≥ MM(200).
+        install_book(94, 96);
+        put_acct(100);
+        let r = margin_health(&calldata(42), 100_000, 0).unwrap();
+        assert_eq!(r.bytes[31], margin_health_tag::AT_RISK);
+
+        // Liquidatable: mark 92, coll 90. equity=10,
+        // notional=920, MR≈108 bps < MM(200) but ≥ 0.
+        install_book(91, 93);
+        put_acct(90);
+        let r = margin_health(&calldata(42), 100_000, 0).unwrap();
+        assert_eq!(r.bytes[31], margin_health_tag::LIQUIDATABLE);
+
+        // Underwater: mark 80, coll 50. equity=-150 < 0.
+        install_book(79, 81);
+        put_acct(50);
+        let r = margin_health(&calldata(42), 100_000, 0).unwrap();
+        assert_eq!(r.bytes[31], margin_health_tag::UNDERWATER);
+
+        // Unknown account → Indeterminate.
+        let r = margin_health(&calldata(999), 100_000, 0).unwrap();
+        assert_eq!(r.bytes[31], margin_health_tag::INDETERMINATE);
+
+        // Malformed input → Indeterminate.
+        let r = margin_health(&[0u8; 16], 100_000, 0).unwrap();
+        assert_eq!(r.bytes[31], margin_health_tag::INDETERMINATE);
+
+        // Cleanup.
+        uninstall_clob();
+        uninstall_accounts();
+    }
+
+    /// Stage 17n: the new precompile is registered at its address.
+    #[test]
+    fn openhl_precompiles_registers_margin_health() {
+        let extended = openhl_precompiles(Precompiles::cancun());
+        assert!(
+            extended.contains(&OPENHL_MARGIN_HEALTH),
+            "openhl_precompiles must register OPENHL_MARGIN_HEALTH",
+        );
     }
 
     /// Stage 17c: a negative amount debits the balance.

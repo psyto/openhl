@@ -150,16 +150,20 @@ impl<P> LiveRethEvmBridge<P> {
     /// `OpenHlNodeConfig::liquidation_params` at boot and threads
     /// the whole struct through here.
     ///
-    /// ALSO installs `params.initial_margin_bps` into
-    /// [`crate::precompiles::install_initial_margin_bps`] so the
-    /// `openhl_withdraw` precompile uses the same rate — preserves
-    /// the "EVM-side and Rust-side withdraw are equivalent state
-    /// changes" property (see `docs/architecture.md`). The
-    /// maintenance/fee fields aren't exposed via precompile yet at
-    /// v0 (margin health isn't yet a callable EVM precompile).
+    /// ALSO installs `params.initial_margin_bps` and
+    /// `params.maintenance_margin_bps` into the matching
+    /// precompile-module globals (Stage 17n) so the
+    /// `openhl_withdraw` and `openhl_margin_health` precompiles
+    /// read the same thresholds the bridge enforces — preserves
+    /// the "EVM-side and Rust-side views are equivalent" property
+    /// (see `docs/architecture.md`). The `liquidation_fee_bps`
+    /// field isn't exposed via precompile (it's only used by the
+    /// liquidation engine's solvent-close math, not by anything
+    /// EVM contracts query).
     #[must_use]
     pub fn with_liquidation_params(mut self, params: LiquidationParams) -> Self {
         crate::precompiles::install_initial_margin_bps(params.initial_margin_bps);
+        crate::precompiles::install_maintenance_margin_bps(params.maintenance_margin_bps);
         self.liquidation_params = params;
         self
     }
@@ -1150,9 +1154,11 @@ mod tests {
         use openhl_clob::{AccountId, OrderId, OrderType, Price, Qty, Side};
         use openhl_funding::Notional;
 
-        // 500 bps initial (5%) instead of the default 1000 bps (10%).
+        // 500 bps initial (5%), 100 bps maintenance (1%) instead of
+        // the defaults (1000 / 200).
         let mut params = LiquidationParams::hyperliquid_default();
         params.initial_margin_bps = 500;
+        params.maintenance_margin_bps = 100;
         let bridge = LiveRethEvmBridge::new((), dev_chain_spec())
             .with_liquidation_params(params);
         assert_eq!(bridge.initial_margin_bps(), 500);
@@ -1160,7 +1166,12 @@ mod tests {
         assert_eq!(
             crate::precompiles::current_initial_margin_bps(),
             500,
-            "bridge builder must install the rate into the precompile global",
+            "bridge builder must install the initial rate into the precompile global",
+        );
+        assert_eq!(
+            crate::precompiles::current_maintenance_margin_bps(),
+            100,
+            "Stage 17n: bridge builder must install the maintenance rate too",
         );
 
         // Same setup as the Stage 17g IM test: long 10 @ 100,
@@ -1187,10 +1198,13 @@ mod tests {
         assert_eq!(bridge.withdraw(AccountId(1), 451), None);
         assert_eq!(bridge.withdraw(AccountId(1), 450), Some(Notional(50)));
 
-        // Restore default so other tests in the workspace aren't
+        // Restore defaults so other tests in the workspace aren't
         // disturbed. Process-global concern, same as ACCOUNTS_STATE.
         crate::precompiles::install_initial_margin_bps(
             openhl_clearing::DEFAULT_INITIAL_MARGIN_BPS,
+        );
+        crate::precompiles::install_maintenance_margin_bps(
+            openhl_clearing::DEFAULT_MAINTENANCE_MARGIN_BPS,
         );
     }
 
