@@ -238,32 +238,79 @@ pub fn apply_fill(
     realized
 }
 
-/// Initial-margin requirement for `acct`, in quote-currency units.
+/// Initial-margin requirement at the account's **`avg_entry`**, in
+/// quote-currency units. The no-mark fallback used when the CLOB is
+/// one-sided or empty and no current midpoint is available — see
+/// [`initial_margin_requirement_at`] for the mark-based variant a
+/// well-formed book lets you use.
 ///
 /// `IM_req = |position_size| × avg_entry × im_bps / MARGIN_SCALE`,
-/// saturating on overflow.
-///
-/// **Why `avg_entry` instead of the current mark.** The owning layer
-/// (bridge + EVM precompile) needs a single, locally-computable
-/// margin denominator. `avg_entry` is the price at which the
-/// position's IM was originally posted, so this is literally
-/// "initial margin used to open". The trade-off is that a position
-/// at a gain still shows the same IM_req as at entry — withdrawing
-/// against unrealized gains is *not* allowed in v0. That matches a
-/// conservative reading of "free collateral after IM" and avoids
-/// dragging a CLOB-derived mark into the precompile's hot path.
-///
-/// Returns `0` for a flat position (no exposure → no margin).
+/// saturating on overflow. Returns `0` for a flat position.
 #[must_use]
 pub fn initial_margin_requirement(acct: &Account, im_bps: u32) -> i64 {
+    initial_margin_requirement_at(acct, acct.avg_entry, im_bps)
+}
+
+/// Initial-margin requirement at an externally-supplied `mark`, in
+/// quote-currency units. The shape every production margin model
+/// uses (Hyperliquid, Binance, Drift): the denominator is the current
+/// notional value `|size| × mark`, not the entry notional.
+///
+/// `IM_req = |position_size| × mark × im_bps / MARGIN_SCALE`,
+/// saturating. Returns `0` for a flat position.
+#[must_use]
+pub fn initial_margin_requirement_at(
+    acct: &Account,
+    mark: MarkPrice,
+    im_bps: u32,
+) -> i64 {
     let abs_size = i128::from(acct.position_size.0.unsigned_abs());
-    let avg_entry = i128::from(acct.avg_entry.0);
+    let mark_i = i128::from(mark.0);
     let bps = i128::from(im_bps);
-    let scaled = abs_size
-        .saturating_mul(avg_entry)
-        .saturating_mul(bps);
+    let scaled = abs_size.saturating_mul(mark_i).saturating_mul(bps);
     let req = scaled / i128::from(MARGIN_SCALE);
-    i64::try_from(req).unwrap_or(i64::MAX)
+    saturate_i128_to_i64(req)
+}
+
+/// Unrealized PnL for `acct` at `mark`, in quote-currency units.
+/// Signed. `(mark − avg_entry) × position_size`, saturating.
+///
+/// Long position + mark above entry → positive (profit).
+/// Long position + mark below entry → negative (loss).
+/// Short position + mark above entry → negative (loss).
+/// Short position + mark below entry → positive (profit).
+/// Flat position → `0`.
+#[must_use]
+pub fn unrealized_pnl(acct: &Account, mark: MarkPrice) -> i64 {
+    let diff = i128::from(mark.0) - i128::from(acct.avg_entry.0);
+    let pnl = diff.saturating_mul(i128::from(acct.position_size.0));
+    saturate_i128_to_i64(pnl)
+}
+
+/// Free collateral at `mark` for `acct`, in quote-currency units.
+/// Signed: a position that's already past the initial-margin line
+/// returns a negative number (the trader is "over-leveraged"
+/// relative to the current mark and can't open more, let alone
+/// withdraw).
+///
+/// `free = (collateral + unrealized_pnl) − IM_req_at_mark`,
+/// saturating.
+///
+/// This is the bridge + precompile withdraw rule's denominator:
+/// `withdraw(amount)` is allowed iff `amount ≤ free_collateral(...)`.
+#[must_use]
+pub fn free_collateral(acct: &Account, mark: MarkPrice, im_bps: u32) -> i64 {
+    let upnl = unrealized_pnl(acct, mark);
+    let equity = i128::from(acct.collateral.0).saturating_add(i128::from(upnl));
+    let im_req = i128::from(initial_margin_requirement_at(acct, mark, im_bps));
+    saturate_i128_to_i64(equity - im_req)
+}
+
+/// Saturating cast from `i128` to `i64`. Local copy of
+/// `openhl_liquidation::compute::saturate_i128_to_i64`, duplicated to
+/// avoid pulling the liquidation crate into clearing's dep graph.
+fn saturate_i128_to_i64(v: i128) -> i64 {
+    i64::try_from(v).unwrap_or(if v > 0 { i64::MAX } else { i64::MIN })
 }
 
 #[cfg(test)]
@@ -482,5 +529,88 @@ mod tests {
             collateral: Notional(0),
         };
         assert_eq!(initial_margin_requirement(&a, u32::MAX), i64::MAX);
+    }
+
+    // ─── mark-aware helpers (Stage 17j) ───────────────────────────
+
+    #[test]
+    fn upnl_signs_follow_long_short_and_mark_direction() {
+        // Long 10 @ 100, mark 110 → +100
+        let l = long(1, 10, 100);
+        assert_eq!(unrealized_pnl(&l, MarkPrice(110)), 100);
+        // Long 10 @ 100, mark 90 → -100
+        assert_eq!(unrealized_pnl(&l, MarkPrice(90)), -100);
+        // Short 10 @ 100, mark 110 → -100
+        let s = short(1, -10, 100);
+        assert_eq!(unrealized_pnl(&s, MarkPrice(110)), -100);
+        // Short 10 @ 100, mark 90 → +100
+        assert_eq!(unrealized_pnl(&s, MarkPrice(90)), 100);
+        // Flat → 0 at any mark
+        let f = acct(1);
+        assert_eq!(unrealized_pnl(&f, MarkPrice(50)), 0);
+        assert_eq!(unrealized_pnl(&f, MarkPrice(5000)), 0);
+    }
+
+    #[test]
+    fn im_at_mark_uses_mark_not_avg_entry() {
+        // Long 10 @ 100, IM at avg_entry = 10*100*10%/1 = 100.
+        // At mark 200: 10*200*10% = 200 (doubles with mark).
+        let a = long(1, 10, 100);
+        assert_eq!(initial_margin_requirement(&a, 1_000), 100);
+        assert_eq!(
+            initial_margin_requirement_at(&a, MarkPrice(200), 1_000),
+            200,
+        );
+        assert_eq!(
+            initial_margin_requirement_at(&a, MarkPrice(50), 1_000),
+            50,
+        );
+    }
+
+    #[test]
+    fn free_collateral_long_in_profit_lets_trader_withdraw_against_gains() {
+        // Long 10 @ 100, collateral 500. Mark = 120.
+        // uPnL = (120-100)*10 = 200
+        // equity = 500 + 200 = 700
+        // IM at mark 120 = 10*120*10%/1 = 120
+        // free = 700 - 120 = 580
+        let mut a = long(1, 10, 100);
+        a.collateral = Notional(500);
+        assert_eq!(free_collateral(&a, MarkPrice(120), 1_000), 580);
+    }
+
+    #[test]
+    fn free_collateral_long_at_loss_tighter_than_avg_entry_rule() {
+        // Long 10 @ 100, collateral 500. Mark = 80.
+        // uPnL = (80-100)*10 = -200
+        // equity = 500 - 200 = 300
+        // IM at mark 80 = 10*80*10%/1 = 80
+        // free = 300 - 80 = 220
+        //
+        // Compare to the avg_entry rule (Stage 17g): free would have
+        // been 500 - 100 = 400, way more permissive. The mark-aware
+        // rule correctly reflects the actual loss.
+        let mut a = long(1, 10, 100);
+        a.collateral = Notional(500);
+        assert_eq!(free_collateral(&a, MarkPrice(80), 1_000), 220);
+    }
+
+    #[test]
+    fn free_collateral_underwater_position_returns_negative() {
+        // Long 10 @ 100, collateral 50. Mark = 80.
+        // uPnL = -200, equity = -150, IM = 80, free = -230.
+        // Trader can't withdraw anything (any positive amount > -230
+        // would fail the `amount ≤ free` check).
+        let mut a = long(1, 10, 100);
+        a.collateral = Notional(50);
+        assert_eq!(free_collateral(&a, MarkPrice(80), 1_000), -230);
+    }
+
+    #[test]
+    fn free_collateral_flat_account_equals_collateral() {
+        let mut a = acct(1);
+        a.collateral = Notional(1_000);
+        assert_eq!(free_collateral(&a, MarkPrice(123), 1_000), 1_000);
+        assert_eq!(free_collateral(&a, MarkPrice(456), 5_000), 1_000);
     }
 }

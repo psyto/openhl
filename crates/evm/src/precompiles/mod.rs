@@ -193,6 +193,23 @@ pub fn current_best_bid() -> Option<(openhl_clob::Price, openhl_clob::Qty)> {
     book.best_bid_with_qty()
 }
 
+/// Stage 17j — read the currently-installed CLOB's midpoint as a
+/// [`openhl_funding::MarkPrice`]. Returns `None` when no CLOB is
+/// installed or either side of the book is empty; that's the signal
+/// the withdraw precompile uses to fall back to the avg-entry IM
+/// rule. Mirror of [`crate::live_node::LiveRethEvmBridge::current_mark`]
+/// so the EVM-side check and the bridge's Rust-side check stay in
+/// lockstep.
+#[must_use]
+pub fn current_mark() -> Option<openhl_funding::MarkPrice> {
+    let state = CLOB_STATE.read().expect("CLOB_STATE rwlock poisoned");
+    let clob = state.as_ref()?;
+    let book = clob.lock().expect("clob mutex poisoned");
+    let bid = book.best_bid()?;
+    let ask = book.best_ask()?;
+    Some(openhl_funding::MarkPrice((bid.0 + ask.0) / 2))
+}
+
 /// Stage 17i: in-memory snapshot of every mutating bridge global —
 /// `{accounts, book, pending_fills}`. Used by [`revert_guard`] to
 /// roll back precompile mutations when the calling EVM frame
@@ -522,16 +539,13 @@ pub(crate) fn withdraw(input: &[u8], _gas_limit: u64, _reservoir: u64) -> Precom
             0,
         ));
     };
-    // Stage 17g: margin-aware. Reject if the post-withdraw balance
-    // would dip below the position's initial-margin requirement at
-    // `avg_entry`. For a flat position `im_req == 0` and this
-    // collapses to the original raw-collateral check.
-    let im_req = openhl_clearing::initial_margin_requirement(
-        acct,
-        openhl_clearing::DEFAULT_INITIAL_MARGIN_BPS,
-    );
-    let post = i128::from(acct.collateral.0) - i128::from(amount_i64);
-    if post < i128::from(im_req) {
+    // Stage 17j: mark-aware free collateral. With a two-sided CLOB
+    // book, use the midpoint as mark and the production-shape
+    // `(equity − IM_req_at_mark)` rule. Without a book midpoint, the
+    // helper falls back to the Stage 17g avg-entry rule. For a flat
+    // position both reduce to a raw-collateral check.
+    let free = crate::live_node::withdraw_free_collateral(acct, current_mark());
+    if i128::from(amount_i64) > i128::from(free) {
         return Ok(PrecompileOutput::new(
             WITHDRAW_BASE_GAS_COST,
             Bytes::from(out),
@@ -911,17 +925,88 @@ mod tests {
         uninstall_accounts();
     }
 
+    /// Stage 17j: when a CLOB with a two-sided book is installed,
+    /// the precompile uses mark-aware free collateral — a long at
+    /// a gain can withdraw against unrealized profits, mirroring
+    /// the bridge's Rust-side rule. Sanity-check that the EVM-side
+    /// withdraw stays byte-identical with `bridge.withdraw`.
+    #[test]
+    fn withdraw_precompile_uses_mark_aware_free_collateral_at_gain() {
+        use openhl_funding::{MarkPrice, PositionSize};
+
+        let _g = TEST_SERIALIZER.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        // Defensive: prior tests may have left a CLOB installed
+        // whose midpoint isn't what this test wants.
+        uninstall_clob();
+        let accounts = Arc::new(Mutex::new(HashMap::new()));
+        install_accounts(Arc::clone(&accounts));
+
+        // Install a CLOB with bid 119 / ask 121 → midpoint 120.
+        let book = Arc::new(Mutex::new(Book::new()));
+        book.lock().unwrap().submit(Order {
+            id: OrderId(101),
+            account: AccountId(99),
+            side: Side::Buy,
+            qty: Qty(1),
+            order_type: OrderType::Limit { price: Price(119) },
+        });
+        book.lock().unwrap().submit(Order {
+            id: OrderId(102),
+            account: AccountId(98),
+            side: Side::Sell,
+            qty: Qty(1),
+            order_type: OrderType::Limit { price: Price(121) },
+        });
+        install_clob(Arc::clone(&book));
+        assert_eq!(current_mark(), Some(MarkPrice(120)));
+
+        // Long 10 @ 100, collateral 500. At mark 120: uPnL=+200,
+        // equity=700, IM=120, free=580.
+        accounts.lock().unwrap().insert(
+            AccountId(42),
+            Account {
+                account: AccountId(42),
+                position_size: PositionSize(10),
+                avg_entry: MarkPrice(100),
+                collateral: Notional(500),
+            },
+        );
+
+        // One above free → reject; at free → succeeds with balance
+        // = 500 - 580 = -80 (deficit absorbed by the gain).
+        let r = withdraw(&withdraw_calldata(42, 581), 100_000, 0).unwrap();
+        assert!(r.bytes.iter().all(|&b| b == 0), "above free → reject");
+        let r = withdraw(&withdraw_calldata(42, 580), 100_000, 0).unwrap();
+        let mut buf = [0u8; 8];
+        buf.copy_from_slice(&r.bytes[24..32]);
+        assert_eq!(i64::from_be_bytes(buf), -80);
+        assert_eq!(
+            accounts.lock().unwrap().get(&AccountId(42)).unwrap().collateral,
+            Notional(-80),
+        );
+
+        uninstall_accounts();
+        uninstall_clob();
+    }
+
     /// Stage 17g: with an open position installed, the precompile
     /// rejects a withdraw that would breach the initial-margin
     /// requirement — same rule the bridge enforces. A boundary
     /// withdraw (post-balance == IM_req) is allowed; one more quote
     /// is not.
+    ///
+    /// Stage 17j note: this test installs no CLOB, so the
+    /// `current_mark()` fallback puts us on the Stage 17g
+    /// avg-entry rule — exactly what this test expects.
     #[test]
     fn withdraw_precompile_respects_initial_margin() {
         use openhl_clearing::DEFAULT_INITIAL_MARGIN_BPS;
         use openhl_funding::{MarkPrice, PositionSize};
 
         let _g = TEST_SERIALIZER.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        // Stage 17j: defensive clear of any leftover CLOB so the
+        // fallback (no mark → avg-entry rule) actually fires.
+        uninstall_clob();
         let accounts = Arc::new(Mutex::new(HashMap::new()));
         install_accounts(Arc::clone(&accounts));
 

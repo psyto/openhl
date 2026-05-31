@@ -237,39 +237,38 @@ impl<P> LiveRethEvmBridge<P> {
     }
 
     /// Debit `amount` quote-currency from `account`'s collateral
-    /// (Stage 17e, margin-aware as of 17g). Returns the new balance
-    /// on success; `None` if the account doesn't exist, the
-    /// requested amount doesn't fit in `i64`, or the withdraw would
-    /// leave collateral below the position's initial-margin
-    /// requirement.
+    /// (Stage 17e, margin-aware as of 17g, mark-aware as of 17j).
+    /// Returns the new balance on success; `None` if the account
+    /// doesn't exist, the requested amount doesn't fit in `i64`, or
+    /// the withdraw would leave free collateral below zero.
     ///
     /// `amount` is unsigned by API contract — callers expressing
-    /// "I want to take 100 out" never accidentally credit by
-    /// passing a negative.
+    /// "I want to take 100 out" never accidentally credit by passing
+    /// a negative.
     ///
-    /// The margin check uses
-    /// [`openhl_clearing::initial_margin_requirement`] at
-    /// [`openhl_clearing::DEFAULT_INITIAL_MARGIN_BPS`] (1000 bps,
-    /// matching `LiquidationParams::hyperliquid_default`). For a
-    /// flat account `IM_req == 0` and behaviour reduces to the
-    /// raw-balance check that Stage 17e shipped.
+    /// **Free collateral rule (Stage 17j).** When the CLOB has both
+    /// a bid and an ask, the midpoint serves as the mark and free
+    /// collateral is `(collateral + unrealized_pnl) − IM_req(mark)` —
+    /// the production shape used by Hyperliquid / Binance / Drift.
+    /// Traders with positive uPnL can withdraw against their gains;
+    /// traders at a loss face a tighter limit than the Stage 17g
+    /// avg-entry rule.
+    ///
+    /// **Fallback.** With a one-sided or empty book (no midpoint),
+    /// uPnL is treated as `0` and IM_req is evaluated at `avg_entry`
+    /// — the exact rule Stage 17g shipped. Flat accounts collapse to
+    /// the raw-collateral check Stage 17e shipped.
     pub fn withdraw(
         &self,
         account: AccountId,
         amount: u64,
     ) -> Option<openhl_funding::Notional> {
+        let mark = self.current_mark();
         let mut accts = self.accounts.lock().expect("accounts mutex poisoned");
         let acct = accts.get_mut(&account)?;
         let amount_i64 = i64::try_from(amount).ok()?;
-        let im_req = openhl_clearing::initial_margin_requirement(
-            acct,
-            openhl_clearing::DEFAULT_INITIAL_MARGIN_BPS,
-        );
-        // Reject if the post-withdraw balance would dip below IM.
-        // `checked_sub` against amount + im_req in a single i128
-        // avoids the intermediate-overflow corner.
-        let post = i128::from(acct.collateral.0) - i128::from(amount_i64);
-        if post < i128::from(im_req) {
+        let free = withdraw_free_collateral(acct, mark);
+        if i128::from(amount_i64) > i128::from(free) {
             return None;
         }
         acct.collateral = openhl_funding::Notional(acct.collateral.0 - amount_i64);
@@ -361,6 +360,34 @@ impl<P> LiveRethEvmBridge<P> {
         accts.clear();
         for acct in snapshot.accounts {
             accts.insert(acct.account, acct);
+        }
+    }
+}
+
+/// Stage 17j helper for `withdraw`: free collateral with a CLOB
+/// mark when one's available, falling back to the Stage 17g
+/// avg-entry rule when it isn't. Shared by the bridge and
+/// (via [`crate::precompiles::withdraw_free_collateral`]) the
+/// withdraw precompile, so on-chain and off-chain views of "how
+/// much can I take out" stay byte-identical.
+pub(crate) fn withdraw_free_collateral(
+    acct: &openhl_clearing::Account,
+    mark: Option<openhl_funding::MarkPrice>,
+) -> i64 {
+    match mark {
+        Some(m) => openhl_clearing::free_collateral(
+            acct,
+            m,
+            openhl_clearing::DEFAULT_INITIAL_MARGIN_BPS,
+        ),
+        None => {
+            // Stage 17g fallback: no mark → IM at avg_entry, uPnL
+            // treated as zero. Equivalent to `collateral − IM_req`.
+            let im = openhl_clearing::initial_margin_requirement(
+                acct,
+                openhl_clearing::DEFAULT_INITIAL_MARGIN_BPS,
+            );
+            acct.collateral.0.saturating_sub(im)
         }
     }
 }
@@ -915,6 +942,121 @@ mod tests {
 
         // Any further withdrawal violates IM — reject.
         assert_eq!(bridge.withdraw(AccountId(1), 1), None);
+    }
+
+    /// Stage 17j: with a CLOB midpoint available, withdraw uses
+    /// mark-aware free collateral instead of the Stage 17g
+    /// avg-entry rule. A long position with mark above entry can
+    /// withdraw against its unrealized gains.
+    #[test]
+    fn withdraw_uses_mark_aware_free_collateral_at_gain() {
+        use openhl_clob::{AccountId, OrderId, OrderType, Price, Qty, Side};
+        use openhl_funding::Notional;
+
+        let bridge = LiveRethEvmBridge::new((), dev_chain_spec());
+
+        // Cross at 100 to give account 1 a long position.
+        bridge.submit_order(Order {
+            id: OrderId(1),
+            account: AccountId(1),
+            side: Side::Buy,
+            qty: Qty(10),
+            order_type: OrderType::Limit { price: Price(100) },
+        });
+        bridge.submit_order(Order {
+            id: OrderId(2),
+            account: AccountId(2),
+            side: Side::Sell,
+            qty: Qty(10),
+            order_type: OrderType::Market,
+        });
+        // Mark-book at midpoint 120 (bid 119, ask 121). Resting on
+        // both sides with no cross — the book ends two-sided and
+        // `current_mark()` returns Some(120).
+        bridge.submit_order(Order {
+            id: OrderId(101),
+            account: AccountId(99),
+            side: Side::Buy,
+            qty: Qty(1),
+            order_type: OrderType::Limit { price: Price(119) },
+        });
+        bridge.submit_order(Order {
+            id: OrderId(102),
+            account: AccountId(98),
+            side: Side::Sell,
+            qty: Qty(1),
+            order_type: OrderType::Limit { price: Price(121) },
+        });
+
+        // Fund account 1: collateral = 500.
+        let _ = bridge.deposit(AccountId(1), 500);
+
+        // At mark 120: uPnL = (120-100)*10 = +200; equity = 700;
+        // IM at mark = 10*120*10% = 120; free = 580.
+        //
+        // Stage 17g would have allowed only 400 (collateral - IM at
+        // avg_entry). The mark-aware rule lets the trader pull
+        // against the gain.
+        assert_eq!(bridge.withdraw(AccountId(1), 581), None, "one above free → reject");
+        assert_eq!(
+            bridge.withdraw(AccountId(1), 580),
+            Some(Notional(-80)),
+            "at the IM line: balance = 500 - 580 = -80 (deficit absorbed by uPnL)",
+        );
+    }
+
+    /// Stage 17j companion: long at a loss tightens the rule
+    /// relative to Stage 17g (the trader has *less* free collateral
+    /// than `collateral − IM_at_avg_entry`).
+    #[test]
+    fn withdraw_uses_mark_aware_free_collateral_at_loss() {
+        use openhl_clob::{AccountId, OrderId, OrderType, Price, Qty, Side};
+        use openhl_funding::Notional;
+
+        let bridge = LiveRethEvmBridge::new((), dev_chain_spec());
+
+        bridge.submit_order(Order {
+            id: OrderId(1),
+            account: AccountId(1),
+            side: Side::Buy,
+            qty: Qty(10),
+            order_type: OrderType::Limit { price: Price(100) },
+        });
+        bridge.submit_order(Order {
+            id: OrderId(2),
+            account: AccountId(2),
+            side: Side::Sell,
+            qty: Qty(10),
+            order_type: OrderType::Market,
+        });
+        // Mark-book at midpoint 80 (bid 79, ask 81).
+        bridge.submit_order(Order {
+            id: OrderId(101),
+            account: AccountId(99),
+            side: Side::Buy,
+            qty: Qty(1),
+            order_type: OrderType::Limit { price: Price(79) },
+        });
+        bridge.submit_order(Order {
+            id: OrderId(102),
+            account: AccountId(98),
+            side: Side::Sell,
+            qty: Qty(1),
+            order_type: OrderType::Limit { price: Price(81) },
+        });
+
+        let _ = bridge.deposit(AccountId(1), 500);
+
+        // At mark 80: uPnL = (80-100)*10 = -200; equity = 300;
+        // IM at mark = 10*80*10% = 80; free = 220.
+        //
+        // Stage 17g would have wrongly let the trader withdraw up
+        // to 400.
+        assert_eq!(bridge.withdraw(AccountId(1), 221), None);
+        assert_eq!(
+            bridge.withdraw(AccountId(1), 220),
+            Some(Notional(280)),
+        );
     }
 
     /// Stage 16b: bridge snapshot round-trips the account map.
