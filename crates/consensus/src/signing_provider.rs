@@ -67,20 +67,25 @@ impl SigningProvider<OpenHlContext> for OpenHlSigningProvider {
         &self,
         part: OpenHlProposalPart,
     ) -> SignedMessage<OpenHlContext, OpenHlProposalPart> {
-        // ProposalPart is a unit struct in OpenHL (ValuePayload::ProposalOnly mode);
-        // sign empty bytes so the type-level contract is honored but no extra
-        // information is committed.
-        let sig = self.private_key.sign(&[]);
+        // Stage 18a: parts now carry the proposer's encoded block bytes.
+        // Sign a serde-JSON serialization so the receiving validator can
+        // verify the proposer authored these exact bytes. Matches the
+        // codec's wire format for `OpenHlProposalPart`.
+        let bytes = serde_json::to_vec(&part).expect("proposal-part serialisation");
+        let sig = self.private_key.sign(&bytes);
         SignedMessage::new(part, sig)
     }
 
     fn verify_signed_proposal_part(
         &self,
-        _part: &OpenHlProposalPart,
+        part: &OpenHlProposalPart,
         signature: &Signature,
         public_key: &PublicKey,
     ) -> bool {
-        public_key.verify(&[], signature).is_ok()
+        let Ok(bytes) = serde_json::to_vec(part) else {
+            return false;
+        };
+        public_key.verify(&bytes, signature).is_ok()
     }
 
     fn sign_vote_extension(&self, ext: ()) -> SignedMessage<OpenHlContext, ()> {
@@ -171,10 +176,22 @@ mod tests {
 
     #[test]
     fn proposal_part_sign_verify_round_trips() {
+        use informalsystems_malachitebft_core_types::Round;
         let (sp, pk) = provider();
-        let part = OpenHlProposalPart;
-        let signed = sp.sign_proposal_part(part);
+        let part = OpenHlProposalPart {
+            height: OpenHlHeight(5),
+            round: Round::new(0),
+            pol_round: Round::Nil,
+            proposer: OpenHlAddress([0xaa; 20]),
+            block_bytes: vec![1, 2, 3, 4],
+        };
+        let signed = sp.sign_proposal_part(part.clone());
         assert!(sp.verify_signed_proposal_part(&part, &signed.signature, &pk));
+
+        // Tampering with the block bytes invalidates the signature.
+        let mut tampered = part.clone();
+        tampered.block_bytes.push(99);
+        assert!(!sp.verify_signed_proposal_part(&tampered, &signed.signature, &pk));
     }
 
     #[test]

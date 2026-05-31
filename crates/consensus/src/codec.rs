@@ -45,17 +45,17 @@ pub enum CodecError {
     PeerId(String),
 }
 
-// ---- ProposalPart (unit type — empty payload) ----------------------------
+// ---- ProposalPart (Stage 18a: now carries the proposer's block bytes) ----
 
 impl Codec<OpenHlProposalPart> for OpenHlCodec {
     type Error = CodecError;
 
-    fn decode(&self, _bytes: Bytes) -> Result<OpenHlProposalPart, Self::Error> {
-        Ok(OpenHlProposalPart)
+    fn decode(&self, bytes: Bytes) -> Result<OpenHlProposalPart, Self::Error> {
+        Ok(serde_json::from_slice(&bytes)?)
     }
 
-    fn encode(&self, _msg: &OpenHlProposalPart) -> Result<Bytes, Self::Error> {
-        Ok(Bytes::new())
+    fn encode(&self, msg: &OpenHlProposalPart) -> Result<Bytes, Self::Error> {
+        Ok(Bytes::from(serde_json::to_vec(msg)?))
     }
 }
 
@@ -627,9 +627,16 @@ mod tests {
     #[test]
     fn proposal_part_round_trips() {
         let codec = OpenHlCodec;
-        let bytes = Codec::<OpenHlProposalPart>::encode(&codec, &OpenHlProposalPart).unwrap();
+        let part = OpenHlProposalPart {
+            height: OpenHlHeight(11),
+            round: Round::new(0),
+            pol_round: Round::Nil,
+            proposer: OpenHlAddress([0xab; 20]),
+            block_bytes: vec![0xde, 0xad, 0xbe, 0xef],
+        };
+        let bytes = Codec::<OpenHlProposalPart>::encode(&codec, &part).unwrap();
         let decoded: OpenHlProposalPart = codec.decode(bytes).unwrap();
-        assert_eq!(decoded, OpenHlProposalPart);
+        assert_eq!(decoded, part);
     }
 
     #[test]

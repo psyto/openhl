@@ -597,6 +597,88 @@ where
         drop(header);
         Ok(())
     }
+
+    /// Stage 18a — serialise the just-built payload for cross-validator
+    /// transport. Includes the full alloy [`Header`] (so the follower
+    /// reconstructs an identical `parent_header` for its own next
+    /// `build_payload`) plus the [`ExecutedBlock`] view and the drained
+    /// fills (currently unused on the follower but kept in the wire
+    /// format so adding fill-replication later doesn't break the
+    /// schema).
+    async fn encode_proposed_block(&self, id: PayloadId) -> Result<Vec<u8>, BridgeError> {
+        let (hash, header, _fills) = {
+            let s = self.state.lock().expect("state mutex poisoned");
+            s.pending
+                .get(&id.0)
+                .cloned()
+                .ok_or_else(|| {
+                    BridgeError::Rejected(format!(
+                        "encode_proposed_block: unknown payload id {}",
+                        id.0
+                    ))
+                })?
+        };
+        let block = ExecutedBlock {
+            hash: BlockHash(hash.0),
+            parent_hash: BlockHash(header.parent_hash.0),
+            number: header.number,
+            state_root: header.state_root.0,
+            timestamp: header.timestamp,
+        };
+        // Note: drained fills are intentionally NOT included in the wire
+        // format at v0. The proposer's `pending_fills` are CLOB-local
+        // book-keeping; they aren't yet encoded as EVM-executable
+        // transactions, so the follower has no use for them. When fills
+        // become real EVM txs the schema gets a fills field — adding
+        // one to `ProposedBlockWire` is the only change.
+        let wire = ProposedBlockWire { header, block };
+        serde_json::to_vec(&wire).map_err(|e| {
+            BridgeError::Internal(eyre::eyre!("serialise proposed block: {e}"))
+        })
+    }
+
+    /// Stage 18a — companion to [`Self::encode_proposed_block`]. Decodes
+    /// the wire bytes and installs the block in the bridge's pending
+    /// map so a subsequent `commit(block.hash)` finds it without going
+    /// through `build_payload`.
+    ///
+    /// Sanity: re-hashes the decoded header and rejects the part if the
+    /// hash disagrees with the carried `block.hash` field — guards
+    /// against a malformed wire payload silently committing the wrong
+    /// state.
+    async fn register_proposed_block(
+        &self,
+        bytes: &[u8],
+    ) -> Result<ExecutedBlock, BridgeError> {
+        let wire: ProposedBlockWire = serde_json::from_slice(bytes).map_err(|e| {
+            BridgeError::Rejected(format!("decode proposed block: {e}"))
+        })?;
+        let computed = wire.header.hash_slow();
+        let claimed = B256::from(wire.block.hash.0);
+        if computed != claimed {
+            return Err(BridgeError::Rejected(format!(
+                "proposed block hash mismatch — header hashes to {computed} but wire claims {claimed}"
+            )));
+        }
+
+        let mut s = self.state.lock().expect("state mutex poisoned");
+        let id = s.next_payload_id;
+        s.next_payload_id += 1;
+        s.pending
+            .insert(id, (computed, wire.header, Vec::new()));
+        Ok(wire.block)
+    }
+}
+
+/// Wire format the proposer ships and the follower decodes. Carries the
+/// full alloy [`Header`] so the follower's bridge can act as if it had
+/// built the block itself — its next `build_payload` finds the right
+/// parent in `state.chain` and produces an identical hash, just like
+/// any other committed block on this validator.
+#[derive(serde::Serialize, serde::Deserialize)]
+struct ProposedBlockWire {
+    header: Header,
+    block: ExecutedBlock,
 }
 
 #[cfg(test)]

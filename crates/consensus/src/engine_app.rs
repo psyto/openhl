@@ -1,25 +1,57 @@
 //! Engine app loop — consumes `AppMsg` from the Malachite engine and routes
 //! every consensus-relevant event through a [`ConsensusBridge`].
 //!
-//! This is the missing half of Stage 6c: with `OpenHlNode::start()` spinning
-//! up the actor system, this loop is what makes those actors do useful work.
-//! Once a `Decided` arrives we commit through the bridge, increment height,
-//! and (optionally) stop after N decisions for tests.
+//! ### Stage 18a: real follower-side replication via ProposalAndParts
+//!
+//! Through Stage 13n the follower learned a proposer's block by calling
+//! `bridge.build_payload` itself on `Decided` and checking the hash
+//! matched what consensus decided. That worked only because v0's
+//! `build_payload` was a pure function of `(parent, attrs)`; the
+//! moment payload-building stops being deterministic (real EVM tx
+//! execution, mempool ordering, wallclock-dependent fields) the
+//! follower's recompute would diverge from the proposer's.
+//!
+//! 18a replaces that with the production-shape pattern:
+//!   * Proposer's `GetValue`: build the payload, ask the bridge to
+//!     `encode_proposed_block` into wire bytes, ship them as a
+//!     `StreamMessage::Data` followed by a `StreamMessage::Fin`
+//!     through `NetworkMsg::PublishProposalPart`.
+//!   * Follower's `ReceivedProposalPart`: buffer the two messages
+//!     per `(peer, stream_id)`, then call `register_proposed_block`
+//!     once the stream completes. The bridge stores the block in its
+//!     pending map, so the follower's subsequent `commit(hash)` finds
+//!     it without recomputing anything.
+//!   * `Decided` no longer rebuilds — it just commits the hash, with
+//!     the block's timestamp looked up in the engine_app's local
+//!     `block_times` map that both paths populate.
 
 use std::sync::Arc;
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 
 use eyre::eyre;
 use informalsystems_malachitebft_app::engine::host::Next;
-use informalsystems_malachitebft_app_channel::{AppMsg, Channels};
-use informalsystems_malachitebft_core_types::Height as _;
+use informalsystems_malachitebft_app::types::streaming::{StreamId, StreamMessage};
+use informalsystems_malachitebft_app::types::{PeerId, ProposedValue};
+use informalsystems_malachitebft_app_channel::{AppMsg, Channels, NetworkMsg};
+use informalsystems_malachitebft_core_types::{Height as _, Round, Validity};
+use informalsystems_malachitebft_engine::util::streaming::StreamContent;
 use openhl_types::{BlockHash, PayloadAttrs};
 
 use crate::bridge::ConsensusBridge;
 use crate::context::OpenHlContext;
-use crate::types::{OpenHlHeight, OpenHlValidatorSet, OpenHlValue};
+use crate::types::{OpenHlHeight, OpenHlProposalPart, OpenHlValidatorSet, OpenHlValue};
 
 const APP_REPLY_WAIT_LOG: &str = "engine_app: peer replied unsuccessfully (channel closed)";
+
+/// Per-stream assembly state. v0 streams are exactly two messages
+/// (one `Data`, one `Fin`), so we don't need the heap-ordered
+/// reassembler the Malachite example uses for multi-part streams —
+/// just hold onto the data until Fin arrives.
+#[derive(Default)]
+struct InProgressStream {
+    data: Option<OpenHlProposalPart>,
+    fin_seen: bool,
+}
 
 /// Drive the engine app loop until `stop_after_decisions` decisions have been
 /// committed through the bridge, or the consensus channel closes.
@@ -42,16 +74,11 @@ const APP_REPLY_WAIT_LOG: &str = "engine_app: peer replied unsuccessfully (chann
 /// (Stage 13i), callers pass `OpenHlHeight(prior_decisions + 1)` so
 /// consensus log lines and any future multi-validator peers see a
 /// height that continues the prior chain instead of restarting at 1.
-/// Generic per-commit hook fired by [`run_engine_app`] after each
-/// successful `bridge.commit(hash)`. Stage 14a uses this to drive
-/// [`openhl_node::OpenHlNode::tick`] without leaking integration-layer
-/// types into the consensus crate — engine_app stays consensus-only
-/// and the binary plugs in the coordinator-tick closure.
 ///
-/// The hook receives the committed block hash, its consensus height,
-/// and the **block-header timestamp** (Stage 15e). Using the header
-/// timestamp instead of host wallclock keeps the coordinator tick
-/// (oracle refresh interval, funding clock, etc.) deterministic
+/// `on_committed` receives the committed block hash, its consensus
+/// height, and the **block-header timestamp** (Stage 15e). Using the
+/// header timestamp instead of host wallclock keeps the coordinator
+/// tick (oracle refresh interval, funding clock, etc.) deterministic
 /// across validators — host clocks could drift millisecond-to-second
 /// in a real distributed setting and silently break consensus
 /// downstream.
@@ -76,12 +103,22 @@ where
     let mut current_parent = initial_parent;
     let mut current_height = initial_height;
     let history_min_height = initial_height;
-    // Stage 14d / 15e: heights where this validator served as
-    // proposer, mapped to the block-header timestamp it computed
-    // during `GetValue`. Used in `Decided` to (a) skip a redundant
-    // recompute (15a) and (b) hand the integration coordinator the
-    // chain-derived block_time rather than host wallclock (15e).
-    let mut locally_built_at: HashMap<OpenHlHeight, u64> = HashMap::new();
+
+    // Stage 18a: timestamps keyed by decided block hash. Both proposer
+    // (in `GetValue`) and follower (in `ReceivedProposalPart`) populate
+    // this so `Decided` can hand the integration coordinator the
+    // chain-derived block_time without recomputing the header.
+    let mut block_times: HashMap<BlockHash, u64> = HashMap::new();
+
+    // Per-(peer, stream_id) part assembly state. Streams complete in
+    // O(1) for v0 since each carries exactly two messages. `BTreeMap`
+    // rather than `HashMap` because Malachite's `StreamId` derives
+    // `Ord` but not `Hash`.
+    let mut streams: BTreeMap<(PeerId, StreamId), InProgressStream> = BTreeMap::new();
+
+    // Per-height monotonic counter for our own outbound stream ids
+    // (the engine wants distinct ones per height/round).
+    let mut next_stream_id: u64 = 0;
 
     while let Some(msg) = channels.consensus.recv().await {
         match msg {
@@ -115,7 +152,8 @@ where
                 let attrs = default_attrs();
                 let id = bridge.build_payload(current_parent, attrs).await?;
                 let block = bridge.payload_ready(id).await?;
-                locally_built_at.insert(height, block.timestamp);
+                block_times.insert(block.hash, block.timestamp);
+
                 let value = OpenHlValue(block.hash);
                 let lpv =
                     informalsystems_malachitebft_app_channel::app::types::LocallyProposedValue::new(
@@ -124,6 +162,36 @@ where
                 if reply.send(lpv).is_err() {
                     tracing::warn!("{APP_REPLY_WAIT_LOG} (GetValue)");
                 }
+
+                // Stage 18a: stream the block to followers. Encode via
+                // the bridge (opaque wire format), wrap in an
+                // `OpenHlProposalPart`, send a Data + Fin pair under a
+                // fresh stream id.
+                let block_bytes = bridge.encode_proposed_block(id).await?;
+                let part = OpenHlProposalPart {
+                    height,
+                    round,
+                    pol_round: Round::Nil,
+                    proposer: select_proposer_address(&validator_set, height, round),
+                    block_bytes,
+                };
+                let stream_id = make_stream_id(height, round, &mut next_stream_id);
+                let data_msg = StreamMessage::new(
+                    stream_id.clone(),
+                    0,
+                    StreamContent::Data(part),
+                );
+                let fin_msg = StreamMessage::new(stream_id, 1, StreamContent::Fin);
+                channels
+                    .network
+                    .send(NetworkMsg::PublishProposalPart(data_msg))
+                    .await
+                    .map_err(|e| eyre!("publish proposal Data part: {e}"))?;
+                channels
+                    .network
+                    .send(NetworkMsg::PublishProposalPart(fin_msg))
+                    .await
+                    .map_err(|e| eyre!("publish proposal Fin part: {e}"))?;
             }
 
             AppMsg::ExtendVote { reply, .. } => {
@@ -139,7 +207,10 @@ where
             }
 
             AppMsg::RestreamProposal { .. } => {
-                // Single-validator mode never re-streams.
+                // v0 doesn't restream — a peer that missed the original
+                // stream waits for the next round's broadcast or syncs
+                // via `GetDecidedValue`. Production hardening would
+                // re-stream from a cache of recent payloads.
             }
 
             AppMsg::GetHistoryMinHeight { reply } => {
@@ -148,9 +219,39 @@ where
                 }
             }
 
-            AppMsg::ReceivedProposalPart { reply, .. } => {
-                // ProposalOnly value-payload mode — proposal parts never arrive.
-                if reply.send(None).is_err() {
+            AppMsg::ReceivedProposalPart { from, part, reply } => {
+                // Buffer the incoming message and, once both Data and
+                // Fin have arrived for this stream, register the block
+                // with the bridge and reply with a ProposedValue.
+                let key = (from, part.stream_id.clone());
+                let entry = streams.entry(key.clone()).or_default();
+                match part.content {
+                    StreamContent::Data(p) => {
+                        entry.data = Some(p);
+                    }
+                    StreamContent::Fin => {
+                        entry.fin_seen = true;
+                    }
+                }
+                let proposed = if entry.data.is_some() && entry.fin_seen {
+                    let entry = streams.remove(&key).expect("entry exists");
+                    let part = entry.data.expect("data set per branch above");
+                    let block = bridge
+                        .register_proposed_block(&part.block_bytes)
+                        .await?;
+                    block_times.insert(block.hash, block.timestamp);
+                    Some(ProposedValue {
+                        height: part.height,
+                        round: part.round,
+                        valid_round: part.pol_round,
+                        proposer: part.proposer,
+                        value: OpenHlValue(block.hash),
+                        validity: Validity::Valid,
+                    })
+                } else {
+                    None
+                };
+                if reply.send(proposed).is_err() {
                     tracing::warn!("{APP_REPLY_WAIT_LOG} (ReceivedProposalPart)");
                 }
             }
@@ -166,40 +267,18 @@ where
             } => {
                 let hash = certificate.value_id;
 
-                // Stage 13n: follower-side bridge replication via deterministic
-                // recompute.
-                //
-                // Important: only nodes that did NOT run `GetValue` at this
-                // height should re-build. If proposer-side code re-builds here,
-                // bridge side effects can run twice (for example draining
-                // pending fills in LiveRethEvmBridge).
-                //
-                // Stage 15e: pick up the chain's notion of block time from
-                // whichever of the two paths actually produced the block.
-                // Proposer remembered it in `locally_built_at` during
-                // `GetValue`; follower learns it from its own recompute
-                // here. Both arrive at the same value because the
-                // bridge's timestamp derivation
-                // (`max(attrs.timestamp, parent.timestamp + 1)`) is a
-                // pure function of inputs they share.
-                let block_time = if let Some(ts) =
-                    locally_built_at.remove(&certificate.height)
-                {
-                    ts
-                } else {
-                    let id = bridge.build_payload(current_parent, default_attrs()).await?;
-                    let block = bridge.payload_ready(id).await?;
-                    if block.hash != hash {
-                        return Err(eyre!(
-                            "Stage 13n: deterministic build_payload mismatch — \
-                             consensus decided {hash:?} but our recompute yielded {recomputed:?}; \
-                             the proposer's attrs or parent state diverged from ours",
-                            hash = hash,
-                            recomputed = block.hash,
-                        ));
-                    }
-                    block.timestamp
-                };
+                // Stage 18a: no more recompute. The block is in the
+                // bridge's pending map — either because this validator
+                // built it (`GetValue` path) or because it received and
+                // registered the proposer's stream
+                // (`ReceivedProposalPart` path). `commit(hash)` looks
+                // it up; the timestamp comes from our local map.
+                let block_time = block_times.remove(&hash).ok_or_else(|| {
+                    eyre!(
+                        "Stage 18a: Decided for {hash:?} but no timestamp recorded — \
+                         neither GetValue nor ReceivedProposalPart ran for this hash"
+                    )
+                })?;
 
                 bridge.commit(hash).await?;
                 on_committed(hash, certificate.height, block_time)?;
@@ -252,6 +331,48 @@ fn default_attrs() -> PayloadAttrs {
     }
 }
 
+/// Build a fresh stream id for a proposer's outgoing parts. The byte
+/// layout (height || round || counter) is opaque to the engine; what
+/// matters is uniqueness across this validator's outbound streams so
+/// follower-side reassembly can key on it cleanly.
+fn make_stream_id(
+    height: OpenHlHeight,
+    round: Round,
+    counter: &mut u64,
+) -> StreamId {
+    use bytes::BytesMut;
+    let mut bytes = BytesMut::with_capacity(8 + 4 + 8);
+    bytes.extend_from_slice(&height.0.to_be_bytes());
+    bytes.extend_from_slice(&round.as_i64().to_be_bytes());
+    bytes.extend_from_slice(&counter.to_be_bytes());
+    *counter += 1;
+    StreamId::new(bytes.freeze())
+}
+
+/// Pull the proposer address for `(height, round)` straight out of the
+/// validator set using the same selection rule
+/// [`OpenHlContext::select_proposer`] uses. Each engine_app instance
+/// only ever calls this for heights where IT is the proposer, so the
+/// result matches its own validator address — Malachite uses the
+/// embedded `proposer` for attribution when peers receive the part.
+fn select_proposer_address(
+    validator_set: &OpenHlValidatorSet,
+    height: OpenHlHeight,
+    round: Round,
+) -> crate::types::OpenHlAddress {
+    use informalsystems_malachitebft_core_types::ValidatorSet as _;
+    let count = validator_set.count();
+    assert!(count > 0, "validator set is empty");
+    let round_u64 = u64::try_from(round.as_i64().max(0)).unwrap_or(0);
+    let index = usize::try_from(height.0.wrapping_add(round_u64))
+        .unwrap_or(usize::MAX) % count;
+    let validator = validator_set
+        .get_by_index(index)
+        .expect("index < count by construction");
+    use informalsystems_malachitebft_core_types::Validator as _;
+    *validator.address()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -264,7 +385,7 @@ mod tests {
     use informalsystems_malachitebft_app_channel::{AppMsg, Channels};
     use informalsystems_malachitebft_core_types::{CommitCertificate, Round, VoteExtensions};
     use informalsystems_malachitebft_signing_ed25519::PrivateKey;
-    use openhl_types::{ExecutedBlock, PayloadId, PayloadStatus};
+    use openhl_types::{ExecutedBlock, PayloadAttrs, PayloadId, PayloadStatus};
     use rand::rngs::OsRng;
     use sha2::{Digest, Sha256};
     use std::sync::{Arc as StdArc, Mutex};
@@ -275,7 +396,17 @@ mod tests {
     struct StubBridge {
         last_built: Mutex<Option<BlockHash>>,
         build_calls: Mutex<usize>,
+        register_calls: Mutex<usize>,
         committed: Mutex<Vec<BlockHash>>,
+    }
+
+    /// Test wire format for StubBridge — just the executed block. Symmetric
+    /// with `ProposedBlockWire` in `openhl-evm` (which also includes a
+    /// Header), but the stub doesn't need a Header to satisfy its own
+    /// commit/build_payload contract.
+    #[derive(serde::Serialize, serde::Deserialize)]
+    struct StubProposedBlock {
+        block: ExecutedBlock,
     }
 
     #[async_trait]
@@ -315,6 +446,32 @@ mod tests {
             self.committed.lock().expect("poisoned").push(block_hash);
             Ok(())
         }
+
+        async fn encode_proposed_block(
+            &self,
+            _id: PayloadId,
+        ) -> Result<Vec<u8>, BridgeError> {
+            let wire = StubProposedBlock {
+                block: ExecutedBlock {
+                    hash: BlockHash([0x42u8; 32]),
+                    parent_hash: BlockHash([0u8; 32]),
+                    number: 1,
+                    state_root: [0u8; 32],
+                    timestamp: 1,
+                },
+            };
+            serde_json::to_vec(&wire).map_err(|e| BridgeError::Internal(eyre!(e)))
+        }
+
+        async fn register_proposed_block(
+            &self,
+            bytes: &[u8],
+        ) -> Result<ExecutedBlock, BridgeError> {
+            *self.register_calls.lock().expect("poisoned") += 1;
+            let wire: StubProposedBlock = serde_json::from_slice(bytes)
+                .map_err(|e| BridgeError::Rejected(e.to_string()))?;
+            Ok(wire.block)
+        }
     }
 
     fn make_test_node(home_dir: std::path::PathBuf) -> OpenHlNode {
@@ -325,8 +482,6 @@ mod tests {
         addr_bytes.copy_from_slice(&digest[12..32]);
         let address = OpenHlAddress(addr_bytes);
         let validator_set = OpenHlValidatorSet::new(vec![OpenHlValidator::new(address, pk, 1)]);
-        // ProposalAndParts is currently the most stable mode for actor-based
-        // engine integration tests in upstream Malachite.
         OpenHlNode::new(sk, validator_set, home_dir, "openhl-engine-test")
             .with_value_payload(informalsystems_malachitebft_config::ValuePayload::ProposalAndParts)
     }
@@ -422,7 +577,7 @@ mod tests {
         assert_eq!(
             *bridge_for_check.build_calls.lock().unwrap(),
             1,
-            "GetValue path should avoid duplicate build_payload on Decided for proposer heights",
+            "Stage 18a: single-validator proposer-only path → exactly one build_payload",
         );
 
         handle.kill(None).await.unwrap();
@@ -494,11 +649,16 @@ mod tests {
         );
     }
 
+    /// Stage 18a — proposer path: a GetValue followed by Decided does
+    /// NOT call register_proposed_block (the block already lives in
+    /// pending from the build_payload call) and does NOT re-call
+    /// build_payload (no more recompute trick). Exactly one
+    /// build_payload total.
     #[tokio::test]
-    async fn decided_after_get_value_does_not_rebuild_payload() {
+    async fn decided_after_get_value_does_not_rebuild_or_register() {
         let bridge = Arc::new(StubBridge::default());
         let (tx_consensus, rx_consensus) = mpsc::channel(8);
-        let (tx_network, _rx_network) = mpsc::channel(4);
+        let (tx_network, mut rx_network) = mpsc::channel(16);
         let channels = Channels {
             consensus: rx_consensus,
             network: tx_network,
@@ -536,6 +696,12 @@ mod tests {
         let proposed = gv_rx.await.expect("get value reply");
         assert_eq!(proposed.value.0, BlockHash([0x42u8; 32]));
 
+        // The engine_app should also have pushed Data + Fin to the
+        // network — drain them so the channel doesn't fill up.
+        for _ in 0..2 {
+            let _ = tokio::time::timeout(Duration::from_secs(1), rx_network.recv()).await;
+        }
+
         let (decided_tx, decided_rx) = tokio::sync::oneshot::channel();
         tx_consensus
             .send(AppMsg::Decided {
@@ -561,12 +727,20 @@ mod tests {
         assert_eq!(
             *bridge.build_calls.lock().expect("poisoned"),
             1,
-            "GetValue at this height must prevent duplicate build_payload in Decided",
+            "GetValue triggers exactly one build_payload; Decided does NOT recompute",
+        );
+        assert_eq!(
+            *bridge.register_calls.lock().expect("poisoned"),
+            0,
+            "Proposer path never goes through register_proposed_block",
         );
     }
 
+    /// Stage 18a — follower path: a Decided without prior GetValue or
+    /// ReceivedProposalPart should ERROR (no recompute fallback). This
+    /// pins the "we no longer silently rebuild" property.
     #[tokio::test]
-    async fn decided_without_get_value_rebuilds_once_for_follower_path() {
+    async fn decided_without_register_errors_on_unknown_hash() {
         let bridge = Arc::new(StubBridge::default());
         let (tx_consensus, rx_consensus) = mpsc::channel(8);
         let (tx_network, _rx_network) = mpsc::channel(4);
@@ -594,6 +768,129 @@ mod tests {
             |_hash, _height, _block_time| Ok(()),
         ));
 
+        let (decided_tx, _decided_rx) = tokio::sync::oneshot::channel();
+        tx_consensus
+            .send(AppMsg::Decided {
+                certificate: CommitCertificate {
+                    height: OpenHlHeight::INITIAL,
+                    round: Round::new(0),
+                    value_id: BlockHash([0x42u8; 32]),
+                    commit_signatures: Vec::new(),
+                },
+                extensions: VoteExtensions::default(),
+                reply: decided_tx,
+            })
+            .await
+            .expect("send decided");
+        drop(tx_consensus);
+
+        let err = app_task
+            .await
+            .expect("app task join")
+            .expect_err("Decided without prior register/build must error");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("no timestamp recorded"),
+            "expected timestamp-missing error, got: {msg}",
+        );
+        assert_eq!(
+            *bridge.build_calls.lock().expect("poisoned"),
+            0,
+            "no implicit rebuild — that's the whole point of Stage 18a",
+        );
+    }
+
+    /// Stage 18a — follower path: ReceivedProposalPart (Data + Fin)
+    /// then Decided commits without ever calling build_payload.
+    #[tokio::test]
+    async fn follower_register_then_decided_commits_without_rebuild() {
+        use informalsystems_malachitebft_app::types::PeerId;
+        use informalsystems_malachitebft_app::types::streaming::{StreamId, StreamMessage};
+        use informalsystems_malachitebft_engine::util::streaming::StreamContent;
+        use bytes::Bytes;
+
+        // A valid multihash with identity-hash code (0x00) and a 32-byte
+        // payload. We need any concrete PeerId; the contents don't
+        // matter for assembly (the engine_app keys streams by
+        // (peer, stream_id), not by validating peer authenticity).
+        let mut peer_bytes = vec![0x00, 0x20];
+        peer_bytes.extend_from_slice(&[0x11u8; 32]);
+        let from = PeerId::from_bytes(&peer_bytes).expect("valid peer id multihash");
+
+        let bridge = Arc::new(StubBridge::default());
+        let (tx_consensus, rx_consensus) = mpsc::channel(8);
+        let (tx_network, _rx_network) = mpsc::channel(4);
+        let channels = Channels {
+            consensus: rx_consensus,
+            network: tx_network,
+            events: TxEvent::new(),
+        };
+
+        let sk = PrivateKey::generate(OsRng);
+        let pk = sk.public_key();
+        let digest = Sha256::digest(pk.as_bytes());
+        let mut addr_bytes = [0u8; 20];
+        addr_bytes.copy_from_slice(&digest[12..32]);
+        let address = OpenHlAddress(addr_bytes);
+        let validator_set = OpenHlValidatorSet::new(vec![OpenHlValidator::new(address, pk, 1)]);
+
+        let app_task = tokio::spawn(run_engine_app(
+            bridge.clone(),
+            channels,
+            validator_set,
+            BlockHash([0u8; 32]),
+            OpenHlHeight::INITIAL,
+            1,
+            |_hash, _height, _block_time| Ok(()),
+        ));
+
+        // Simulate a proposer streaming the Data + Fin parts.
+        let stream_id = StreamId::new(Bytes::from_static(b"test-stream"));
+        let stub_block_bytes = serde_json::to_vec(&StubProposedBlock {
+            block: ExecutedBlock {
+                hash: BlockHash([0x42u8; 32]),
+                parent_hash: BlockHash([0u8; 32]),
+                number: 1,
+                state_root: [0u8; 32],
+                timestamp: 1,
+            },
+        })
+        .unwrap();
+        let part = OpenHlProposalPart {
+            height: OpenHlHeight::INITIAL,
+            round: Round::new(0),
+            pol_round: Round::Nil,
+            proposer: address,
+            block_bytes: stub_block_bytes,
+        };
+
+        let (data_reply_tx, data_reply_rx) = tokio::sync::oneshot::channel();
+        tx_consensus
+            .send(AppMsg::ReceivedProposalPart {
+                from,
+                part: StreamMessage::new(stream_id.clone(), 0, StreamContent::Data(part)),
+                reply: data_reply_tx,
+            })
+            .await
+            .expect("send data part");
+        let after_data = data_reply_rx.await.expect("data reply");
+        assert!(after_data.is_none(), "Data alone shouldn't complete the stream");
+
+        let (fin_reply_tx, fin_reply_rx) = tokio::sync::oneshot::channel();
+        tx_consensus
+            .send(AppMsg::ReceivedProposalPart {
+                from,
+                part: StreamMessage::new(stream_id, 1, StreamContent::Fin),
+                reply: fin_reply_tx,
+            })
+            .await
+            .expect("send fin part");
+        let after_fin = fin_reply_rx.await.expect("fin reply");
+        let proposed = after_fin.expect("Fin should complete the stream");
+        assert_eq!(proposed.value.0, BlockHash([0x42u8; 32]));
+
+        // Now Decided commits — and the block_time is the one
+        // register_proposed_block returned.
         let (decided_tx, decided_rx) = tokio::sync::oneshot::channel();
         tx_consensus
             .send(AppMsg::Decided {
@@ -618,8 +915,17 @@ mod tests {
         assert_eq!(decisions, vec![BlockHash([0x42u8; 32])]);
         assert_eq!(
             *bridge.build_calls.lock().expect("poisoned"),
+            0,
+            "Follower path must NEVER call build_payload — the 18a contract",
+        );
+        assert_eq!(
+            *bridge.register_calls.lock().expect("poisoned"),
             1,
-            "Follower path should rebuild once in Decided when GetValue was not called",
+            "Exactly one register_proposed_block per follower-received block",
+        );
+        assert_eq!(
+            bridge.committed.lock().unwrap().as_slice(),
+            &[BlockHash([0x42u8; 32])],
         );
     }
 }

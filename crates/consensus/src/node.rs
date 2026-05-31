@@ -72,10 +72,13 @@ pub struct OpenHlConfig {
 impl OpenHlConfig {
     #[must_use]
     pub fn new(moniker: impl Into<String>) -> Self {
-        // OpenHL runs ProposalOnly (no streaming proposal parts) — must match
-        // our `Context::ProposalPart` shape.
+        // Stage 18a: ProposalAndParts. The proposer streams the full
+        // block via `NetworkMsg::PublishProposalPart`; followers
+        // assemble the parts and call `bridge.register_proposed_block`
+        // (no more deterministic-recompute trick). See
+        // `crates/consensus/src/engine_app.rs` for the wire flow.
         let consensus = ConsensusConfig {
-            value_payload: ValuePayload::ProposalOnly,
+            value_payload: ValuePayload::ProposalAndParts,
             ..ConsensusConfig::default()
         };
         Self {
@@ -418,11 +421,11 @@ mod tests {
     }
 
     #[test]
-    fn load_config_sets_proposal_only_payload_and_ephemeral_listen_addr() {
+    fn load_config_sets_proposal_and_parts_payload_and_ephemeral_listen_addr() {
         let tmp = tempfile::tempdir().unwrap();
         let node = single_validator_node(tmp.path().to_path_buf());
         let cfg = node.load_config().unwrap();
-        assert_eq!(cfg.consensus.value_payload, ValuePayload::ProposalOnly);
+        assert_eq!(cfg.consensus.value_payload, ValuePayload::ProposalAndParts);
         // listen_addr should be /ip4/127.0.0.1/tcp/0 (ephemeral)
         let listen_str = cfg.consensus.p2p.listen_addr.to_string();
         assert!(
