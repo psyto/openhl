@@ -785,7 +785,7 @@ async fn run_reth_devnet(
     } else {
         let fills_count = seed_accounts_via_fills(&bridge);
         println!(
-            "      seed fills           = {} (Alice/Bob/Carol take longs from Dave + Eve @ price 100)",
+            "      seed fills           = {} (Alice/Bob/Carol take longs from Dave + Eve @ price 110)",
             fills_count,
         );
         seed_mark_orders(&bridge);
@@ -795,7 +795,15 @@ async fn run_reth_devnet(
         // This is the bridge-layer hook an EVM-side
         // `deposit(account, amount)` instruction would call once
         // we have a real on-chain collateral flow.
-        for (id, coll) in [(10, 200), (20, 50), (30, 100), (40, 300), (50, 200)] {
+        // Stage 17p: trade entry shifted from 100 → 110 (see
+        // `seed_accounts_via_fills`) so longs lose at oracle mark
+        // 102 (was: longs lose at midpoint 96). Bob's collateral
+        // bumped from 50 → 90 to keep him strictly Liquidatable
+        // (equity = 10, MR ≈ 1 % < 2 % maintenance) rather than
+        // tipping to Underwater (equity < 0) — that preserves the
+        // disjoint scan / ADL target invariant. The other four
+        // collaterals don't need re-tuning.
+        for (id, coll) in [(10, 200), (20, 90), (30, 100), (40, 300), (50, 200)] {
             let new_balance = bridge.deposit(ClobAccountId(id), coll);
             println!(
                 "      deposit              = account {id} → collateral {}",
@@ -1303,22 +1311,23 @@ const SYNTHETIC_FEEDS: &[(u32, u8, u64)] = &[
     (3, 3, 103),
 ];
 
-/// Stage 17h: five-account market scenario. Replaces the Stage 17a
-/// single-MM seed (account 999 taking absurd off-market orders) with
-/// a realistic shape: every trade in the seed sequence happens at
-/// the same fair price (100), and the cascade-inducing PnL comes
-/// from the mark moving in [`seed_mark_orders`] — exactly how real
-/// markets generate winners and losers.
+/// Stage 17h: five-account market scenario, re-tuned at Stage 17p
+/// for the oracle-driven scan mark. Replaces the Stage 17a single-MM
+/// seed (account 999 taking absurd off-market orders) with a
+/// realistic shape: every trade in the seed sequence happens at the
+/// same fair price (110), and the cascade-inducing loss comes from
+/// the oracle index landing below entry — exactly how real markets
+/// generate winners and losers.
 ///
 /// Sequence (deterministic across validators — both nodes execute
-/// this identically on boot, every order at price 100):
+/// this identically on boot, every order at price 110):
 ///
 ///   1. Dave (40) Sell-limit 10 → Alice (10) Buy-market 10
 ///   2. Dave (40) Sell-limit 10 → Bob   (20) Buy-market 10
 ///   3. Dave (40) Sell-limit 30 → Carol (30) Buy-market 30
 ///   4. Eve  (50) Sell-limit 20 → Carol (30) Buy-market 20
 ///
-/// Resulting positions (avg_entry = 100 for everyone):
+/// Resulting positions (avg_entry = 110 for everyone):
 ///   - Alice (10): long 10  — safe trader with margin to spare
 ///   - Bob   (20): long 10  — thinly-collateralised, drops below
 ///                            maintenance once mark moves
@@ -1330,14 +1339,20 @@ const SYNTHETIC_FEEDS: &[(u32, u8, u64)] = &[
 ///   - Eve   (50): short 20 — counterparty to round 4's tail;
 ///                            also ADL-eligible
 ///
-/// At the post-boot mark (96, see [`seed_mark_orders`]) and the
-/// post-boot collateral deposits (200, 50, 100, 300, 200) the
-/// `MarginHealth` shakes out to:
-///   - Alice: Safe          (MR ≈ 16.7%)
+/// Stage 17p — the scan's mark is now the oracle's aggregated index
+/// (102 from `SYNTHETIC_FEEDS`), not the CLOB midpoint (96 from
+/// `seed_mark_orders`). At oracle 102 with post-boot collateral
+/// (200, 90, 100, 300, 200) the `MarginHealth` shakes out to:
+///   - Alice: Safe          (MR ≈ 11.8%)
 ///   - Bob:   Liquidatable  (MR ≈ 1.0%, < 2% maintenance) — scan
-///   - Carol: Underwater    (equity = −100)                — ADL
-///   - Dave:  Safe          (MR ≈ 10.4%, +200 uPnL)        — ADL ctp
-///   - Eve:   Safe          (MR ≈ 14.6%, +80  uPnL)        — ADL ctp
+///   - Carol: Underwater    (equity = −300)                — ADL
+///   - Dave:  Safe          (MR ≈ 13.7%, +400 uPnL)        — ADL ctp
+///   - Eve:   Safe          (MR ≈ 17.6%, +160 uPnL)        — ADL ctp
+///
+/// The CLOB midpoint (96) is still load-bearing — `funding_clock.tick`
+/// reads it as `mark` for the premium calculation
+/// `premium = mark − index = 96 − 102 = −6`. So midpoint AND oracle
+/// both matter; they just feed different rules.
 ///
 /// **Disjoint-target invariant.** Scan targets {Bob}, ADL targets
 /// {Carol}, ADL counterparties are drawn from {Dave, Eve}. All
@@ -1356,7 +1371,7 @@ fn seed_accounts_via_fills<P>(bridge: &LiveRethEvmBridge<P>) -> usize {
         account: ClobAccountId(40),
         side: Side::Sell,
         qty: Qty(10),
-        order_type: OrderType::Limit { price: Price(100) },
+        order_type: OrderType::Limit { price: Price(110) },
     });
     fills += r.fills.len();
     let r = bridge.submit_order(Order {
@@ -1374,7 +1389,7 @@ fn seed_accounts_via_fills<P>(bridge: &LiveRethEvmBridge<P>) -> usize {
         account: ClobAccountId(40),
         side: Side::Sell,
         qty: Qty(10),
-        order_type: OrderType::Limit { price: Price(100) },
+        order_type: OrderType::Limit { price: Price(110) },
     });
     fills += r.fills.len();
     let r = bridge.submit_order(Order {
@@ -1393,7 +1408,7 @@ fn seed_accounts_via_fills<P>(bridge: &LiveRethEvmBridge<P>) -> usize {
         account: ClobAccountId(40),
         side: Side::Sell,
         qty: Qty(30),
-        order_type: OrderType::Limit { price: Price(100) },
+        order_type: OrderType::Limit { price: Price(110) },
     });
     fills += r.fills.len();
     let r = bridge.submit_order(Order {
@@ -1411,7 +1426,7 @@ fn seed_accounts_via_fills<P>(bridge: &LiveRethEvmBridge<P>) -> usize {
         account: ClobAccountId(50),
         side: Side::Sell,
         qty: Qty(20),
-        order_type: OrderType::Limit { price: Price(100) },
+        order_type: OrderType::Limit { price: Price(110) },
     });
     fills += r.fills.len();
     let r = bridge.submit_order(Order {

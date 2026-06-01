@@ -320,26 +320,51 @@ impl OpenHlNode {
     ///   3. ADL (conditional on scan result + config).
     ///   4. Vault mark-to-market.
     ///
-    /// The mark used for liquidation is always the bridge-supplied
-    /// `input.mark`, **not** the oracle's freshly-aggregated price.
-    /// They serve different purposes: the oracle's index price feeds
-    /// funding (`premium = mark − index`), while the CLOB-derived
-    /// mark drives margin classification (a contract's collateral is
-    /// only stress-tested against the CLOB it can actually exit into).
-    /// Conflating the two would let a stale oracle delay
-    /// otherwise-required liquidations.
+    /// Mark sources:
+    ///
+    /// * **Liquidation scan + ADL** use the oracle's cached
+    ///   aggregated index price if one is available, falling back
+    ///   to `input.mark` (the bridge-supplied CLOB midpoint) when
+    ///   no refresh has succeeded yet. This is the production-shape
+    ///   choice — the oracle is the cross-venue reference and the
+    ///   bridge's `bridge.margin_health` accessor reads the same
+    ///   source, so scan / ADL classifications match what users see
+    ///   over RPC and what Solidity contracts get from the
+    ///   `openhl_margin_health` precompile (Stage 17o → 17p).
+    /// * **Funding rate** continues to use `input.mark` (CLOB
+    ///   midpoint) as the mark and `oracle.current_price()` as the
+    ///   index, because `premium = mark − index` is the whole point
+    ///   of the funding formula — using oracle for both sides would
+    ///   collapse the premium to zero.
+    ///
+    /// Order of operations is fixed (deterministic):
+    ///   1. Oracle refresh (if interval elapsed).
+    ///   2. Liquidation scan.
+    ///   3. ADL (conditional on scan result + config).
+    ///   4. Vault mark-to-market.
+    ///   5. Funding tick.
     pub fn tick(&mut self, input: TickInput<'_>) -> TickReport {
         // 1. Oracle refresh — only if the interval has elapsed.
         let oracle_result = self.maybe_refresh_oracle(input.block_time);
 
-        // 2. Liquidation scan against the CLOB-derived mark.
-        let scan = self.scanner.scan(input.account_snapshots, input.mark);
+        // Mark for solvency classification: prefer the oracle's
+        // aggregated index. Falls back to `input.mark` (CLOB
+        // midpoint) only when no oracle refresh has succeeded yet.
+        // Same fallback hierarchy as `LiveRethEvmBridge::effective_mark`.
+        let scan_mark = self
+            .oracle
+            .current_price()
+            .map(|i| MarkPrice(i.0))
+            .unwrap_or(input.mark);
+
+        // 2. Liquidation scan at the oracle-preferred mark.
+        let scan = self.scanner.scan(input.account_snapshots, scan_mark);
 
         // 3. ADL only if scan surfaced unfilled deficit AND config opts in.
         let adl_report = if self.config.run_adl_on_unfilled_deficit && scan.unfilled_deficit > 0 {
             Some(execute_adl(
                 input.account_snapshots,
-                input.mark,
+                scan_mark,
                 scan.unfilled_deficit,
             ))
         } else {
@@ -658,6 +683,55 @@ mod tests {
         });
         assert!(report.liquidation.unfilled_deficit > 0);
         assert!(report.adl.is_none());
+    }
+
+    /// Stage 17p — scan + ADL prefer the oracle index over the
+    /// bridge-supplied CLOB midpoint when one's available. Same
+    /// long-1-at-100 / coll-10 position classifies Liquidatable
+    /// against a midpoint of 80 (no oracle), then flips to Safe
+    /// when the oracle's cached aggregate is restored to 100.
+    #[test]
+    fn tick_scan_prefers_oracle_index_over_input_mark() {
+        use openhl_oracle::AggregatedPrice;
+
+        // No oracle cached yet → fallback to `input.mark` (80).
+        // At mark 80 the long is underwater (entry 100, coll 10):
+        // uPnL = -20, equity = -10 → scan flags it.
+        let mut node = default_node();
+        let accounts = vec![snapshot(1, 1, 100, 10)];
+        let report = node.tick(TickInput {
+            block_height: 1,
+            block_time: 100,
+            mark: MarkPrice(80),
+            account_snapshots: &accounts,
+            vault_total_assets: 0,
+        });
+        assert!(
+            !report.liquidation.records.is_empty(),
+            "with no oracle, midpoint 80 makes the position liquidatable",
+        );
+
+        // Restore the oracle's cached aggregate to 100 (a "healthy"
+        // mark). Same position, same midpoint input — now scan
+        // sees mark 100 (uPnL=0, equity=10 → Safe) and produces
+        // no records.
+        let mut node = default_node();
+        node.oracle_mut().restore_current(AggregatedPrice {
+            index: openhl_funding::IndexPrice(100),
+            computed_at: 50,
+            feeds_used: 1,
+        });
+        let report = node.tick(TickInput {
+            block_height: 2,
+            block_time: 101,
+            mark: MarkPrice(80),
+            account_snapshots: &accounts,
+            vault_total_assets: 0,
+        });
+        assert!(
+            report.liquidation.records.is_empty(),
+            "oracle index 100 overrides midpoint 80 → no liquidation",
+        );
     }
 
     // ─── tick: vault mark-to-market ────────────────────────────────
