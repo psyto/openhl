@@ -158,6 +158,26 @@ impl OracleState {
         self.current.map(|c| c.index)
     }
 
+    /// Staleness-aware variant of [`Self::current_price`] (Stage 17q).
+    /// Returns the cached index price ONLY if it was computed within
+    /// `params.aggregate_max_age_secs` of the supplied `now`. After
+    /// that window the aggregate is treated as stale and `None` is
+    /// returned, so coordinator-tick consumers (liquidation scan,
+    /// funding rate) fall back to whatever their no-oracle path is.
+    ///
+    /// `now` is the consensus block time, not host wallclock — using
+    /// host wallclock here would break determinism across validators.
+    #[must_use]
+    pub fn current_price_fresh_at(&self, now: u64) -> Option<IndexPrice> {
+        let agg = self.current?;
+        let age = now.saturating_sub(agg.computed_at);
+        if age <= self.params.aggregate_max_age_secs {
+            Some(agg.index)
+        } else {
+            None
+        }
+    }
+
     /// Replace the cached aggregate. Stage 16d — used by the
     /// integration coordinator's `load_snapshot` to restore the
     /// previous run's price; without this, callers that gate
@@ -326,6 +346,42 @@ mod tests {
         let o = OracleState::new(default_params());
         assert_eq!(o.feed_count(), 0);
         assert_eq!(o.current_price(), None);
+    }
+
+    /// Stage 17q — `current_price_fresh_at` returns the aggregate
+    /// only while it's within `aggregate_max_age_secs` of the
+    /// supplied `now`. After that window it returns `None` so
+    /// downstream consumers (liquidation scan, funding) can fall
+    /// back rather than acting on stale oracle data.
+    #[test]
+    fn current_price_fresh_at_respects_max_age() {
+        let mut params = default_params();
+        params.aggregate_max_age_secs = 30;
+        let mut o = OracleState::new(params);
+        o.restore_current(AggregatedPrice {
+            index: IndexPrice(100),
+            computed_at: 1000,
+            feeds_used: 3,
+        });
+
+        // Same timestamp → fresh.
+        assert_eq!(o.current_price_fresh_at(1000), Some(IndexPrice(100)));
+        // Edge: exactly at max_age → fresh.
+        assert_eq!(o.current_price_fresh_at(1030), Some(IndexPrice(100)));
+        // One past → stale → None.
+        assert_eq!(o.current_price_fresh_at(1031), None);
+        // Way past → still None.
+        assert_eq!(o.current_price_fresh_at(10_000), None);
+        // Legacy `current_price` ignores staleness — still surfaces
+        // the cached value for callers that don't care (e.g.,
+        // restart bookkeeping).
+        assert_eq!(o.current_price(), Some(IndexPrice(100)));
+    }
+
+    #[test]
+    fn current_price_fresh_at_returns_none_when_no_aggregate() {
+        let o = OracleState::new(default_params());
+        assert_eq!(o.current_price_fresh_at(1000), None);
     }
 
     // ─── ingest: happy path ───────────────────────────────────────

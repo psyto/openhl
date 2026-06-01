@@ -219,6 +219,21 @@ impl<P> LiveRethEvmBridge<P> {
             .expect("oracle_index_price mutex poisoned")
     }
 
+    /// Stage 17q — clear the cached oracle index price so
+    /// downstream consumers fall back to the CLOB midpoint via
+    /// [`Self::effective_mark`]. Called by `bin/openhl` after a
+    /// `coordinator.tick` whose oracle aggregate has gone stale
+    /// (older than `OracleParams::aggregate_max_age_secs`).
+    /// Mirrors [`crate::precompiles::clear_oracle_index_price`]
+    /// — bridge and precompile views stay in lockstep.
+    pub fn clear_oracle_index_price(&self) {
+        *self
+            .oracle_index_price
+            .lock()
+            .expect("oracle_index_price mutex poisoned") = None;
+        crate::precompiles::clear_oracle_index_price();
+    }
+
     /// Stage 17o — the mark used by margin / withdraw / margin_health
     /// computations. Returns the cached oracle index price if any
     /// has been installed (production-correct: oracle is the

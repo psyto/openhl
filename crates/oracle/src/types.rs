@@ -155,17 +155,32 @@ pub struct OracleParams {
     /// default: 50 bps (0.5%); openhl's `hyperliquid_default` uses 100
     /// bps for a slightly looser v0.
     pub max_deviation_bps: u32,
+    /// Maximum age (in seconds, relative to a caller-supplied `now`)
+    /// the cached [`AggregatedPrice`] is allowed to be before
+    /// [`crate::state::OracleState::current_price_fresh_at`] returns
+    /// `None` (Stage 17q).
+    ///
+    /// Distinct from [`Self::staleness_window_secs`] — that one is
+    /// about *input observation* freshness (drop publisher
+    /// observations older than the window); this one is about the
+    /// *aggregated index* itself going stale. If the publishers stop
+    /// pushing for `aggregate_max_age_secs`, the coordinator's
+    /// liquidation scan and the bridge's `effective_mark` fall back
+    /// to the CLOB midpoint rather than acting on stale oracle data.
+    pub aggregate_max_age_secs: u64,
 }
 
 impl OracleParams {
-    /// Hyperliquid-shape defaults: 60-second staleness window, 2 feeds
-    /// minimum, 100 bps single-feed deviation cap.
+    /// Hyperliquid-shape defaults: 60-second observation staleness
+    /// window, 2 feeds minimum, 100 bps single-feed deviation cap,
+    /// 60-second aggregate max-age (Stage 17q).
     #[must_use]
     pub const fn hyperliquid_default() -> Self {
         Self {
             staleness_window_secs: 60,
             min_feeds_required: 2,
             max_deviation_bps: 100,
+            aggregate_max_age_secs: 60,
         }
     }
 }

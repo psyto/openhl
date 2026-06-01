@@ -306,6 +306,7 @@ mod tests {
             staleness_window_secs: 60,
             min_feeds_required: 0,
             max_deviation_bps: 100,
+            aggregate_max_age_secs: 60,
         };
         let result = aggregate_index(&[], &params);
         assert!(matches!(

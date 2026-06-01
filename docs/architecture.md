@@ -42,6 +42,8 @@ Margin / withdraw / margin_health all consult `bridge.effective_mark()` (Rust) /
 
 Stage 17p extends the same rule to the integration coordinator: `OpenHlNode::tick` now reads `self.oracle.current_price()` as the mark for the liquidation scanner and ADL (with `input.mark` as the same fallback), so the on-chain ADL engine and the bridge's `margin_health` accessor agree on which accounts are at risk. The CLOB midpoint (`input.mark`) is still the input to the funding rate's `premium = mark − index` — using oracle for both sides would collapse the premium to zero.
 
+Stage 17q adds a freshness check. `OracleParams::aggregate_max_age_secs` (default 60s) caps how old the cached aggregate is allowed to be relative to `input.block_time`; the new `OracleState::current_price_fresh_at` returns `None` past the window. Scan / ADL / funding all gate through this accessor, and `bin/openhl`'s tick hook installs OR clears the bridge's oracle cell based on the same check — so a stalled publisher set degrades cleanly to the CLOB midpoint everywhere rather than letting an aging aggregate delay liquidations or fix the funding premium.
+
 #### Queryable margin health (Stages 17m–17n + 19a)
 
 Three surfaces, all returning the same production-shape `Safe / AtRisk / Liquidatable / Underwater` classification computed by `openhl-liquidation::margin_health` at the current CLOB midpoint:

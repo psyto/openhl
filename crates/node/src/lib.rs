@@ -323,19 +323,23 @@ impl OpenHlNode {
     /// Mark sources:
     ///
     /// * **Liquidation scan + ADL** use the oracle's cached
-    ///   aggregated index price if one is available, falling back
-    ///   to `input.mark` (the bridge-supplied CLOB midpoint) when
-    ///   no refresh has succeeded yet. This is the production-shape
-    ///   choice — the oracle is the cross-venue reference and the
-    ///   bridge's `bridge.margin_health` accessor reads the same
-    ///   source, so scan / ADL classifications match what users see
-    ///   over RPC and what Solidity contracts get from the
-    ///   `openhl_margin_health` precompile (Stage 17o → 17p).
-    /// * **Funding rate** continues to use `input.mark` (CLOB
-    ///   midpoint) as the mark and `oracle.current_price()` as the
-    ///   index, because `premium = mark − index` is the whole point
-    ///   of the funding formula — using oracle for both sides would
-    ///   collapse the premium to zero.
+    ///   aggregated index price if one is available **and fresh**
+    ///   (within `aggregate_max_age_secs` of `input.block_time`,
+    ///   Stage 17q), falling back to `input.mark` (the bridge-
+    ///   supplied CLOB midpoint) when no refresh has succeeded or
+    ///   the last refresh has aged out. This is the production-
+    ///   shape choice — the oracle is the cross-venue reference;
+    ///   the bridge's `bridge.margin_health` accessor reads the
+    ///   same source, so scan / ADL classifications match what
+    ///   users see over RPC and what Solidity contracts get from
+    ///   the `openhl_margin_health` precompile (Stage 17o → 17q).
+    /// * **Funding rate** uses `input.mark` (CLOB midpoint) as the
+    ///   mark and the oracle's fresh aggregate as the index,
+    ///   because `premium = mark − index` is the whole point of
+    ///   the funding formula — using oracle for both sides would
+    ///   collapse the premium to zero. A stale oracle skips the
+    ///   funding tick rather than computing premium against an
+    ///   aged index (Stage 17q).
     ///
     /// Order of operations is fixed (deterministic):
     ///   1. Oracle refresh (if interval elapsed).
@@ -348,12 +352,13 @@ impl OpenHlNode {
         let oracle_result = self.maybe_refresh_oracle(input.block_time);
 
         // Mark for solvency classification: prefer the oracle's
-        // aggregated index. Falls back to `input.mark` (CLOB
-        // midpoint) only when no oracle refresh has succeeded yet.
-        // Same fallback hierarchy as `LiveRethEvmBridge::effective_mark`.
+        // aggregated index, but only if it's fresh enough
+        // (`oracle.params.aggregate_max_age_secs` — Stage 17q).
+        // A stalled publisher set degrades to the CLOB midpoint
+        // rather than letting an aging oracle delay liquidations.
         let scan_mark = self
             .oracle
-            .current_price()
+            .current_price_fresh_at(input.block_time)
             .map(|i| MarkPrice(i.0))
             .unwrap_or(input.mark);
 
@@ -379,7 +384,10 @@ impl OpenHlNode {
         //    own gating decides whether a settlement actually fires;
         //    we just supply the inputs. Per the module's "no catch-up"
         //    invariant, a long gap still produces at most one tick.
-        let funding = self.oracle.current_price().and_then(|index| {
+        // Stage 17q: funding also respects oracle freshness — a
+        // stalled oracle skips funding rather than computing
+        // `premium` against a stale index.
+        let funding = self.oracle.current_price_fresh_at(input.block_time).and_then(|index| {
             let positions: Vec<Position> = input
                 .account_snapshots
                 .iter()
@@ -731,6 +739,61 @@ mod tests {
         assert!(
             report.liquidation.records.is_empty(),
             "oracle index 100 overrides midpoint 80 → no liquidation",
+        );
+    }
+
+    /// Stage 17q — when the oracle's cached aggregate is older
+    /// than `aggregate_max_age_secs`, scan falls back to
+    /// `input.mark` (CLOB midpoint), not the stale oracle value.
+    #[test]
+    fn tick_scan_falls_back_to_midpoint_when_oracle_is_stale() {
+        use openhl_oracle::AggregatedPrice;
+
+        // Default `aggregate_max_age_secs` is 60s. Restore a
+        // cached aggregate computed at t=0 with a "healthy" mark
+        // 100 — that price would keep the long Safe.
+        let mut node = default_node();
+        node.oracle_mut().restore_current(AggregatedPrice {
+            index: openhl_funding::IndexPrice(100),
+            computed_at: 0,
+            feeds_used: 3,
+        });
+
+        // Now tick at t=1000 (way past the 60s max age). With
+        // input.mark = 80, scan must use 80, not the stale 100.
+        // Long 1 @ 100, coll 10: at mark 80 it's flagged
+        // (underwater).
+        let accounts = vec![snapshot(1, 1, 100, 10)];
+        let report = node.tick(TickInput {
+            block_height: 1,
+            block_time: 1000,
+            mark: MarkPrice(80),
+            account_snapshots: &accounts,
+            vault_total_assets: 0,
+        });
+        assert!(
+            !report.liquidation.records.is_empty(),
+            "stale oracle (computed_at=0, block_time=1000) → fall back to midpoint 80 → liquidatable",
+        );
+
+        // Sanity-check: a FRESH oracle at the same price would
+        // produce the opposite outcome.
+        let mut node = default_node();
+        node.oracle_mut().restore_current(AggregatedPrice {
+            index: openhl_funding::IndexPrice(100),
+            computed_at: 990, // within 60s of block_time=1000
+            feeds_used: 3,
+        });
+        let report = node.tick(TickInput {
+            block_height: 2,
+            block_time: 1000,
+            mark: MarkPrice(80),
+            account_snapshots: &accounts,
+            vault_total_assets: 0,
+        });
+        assert!(
+            report.liquidation.records.is_empty(),
+            "fresh oracle 100 wins over midpoint 80 → not liquidatable",
         );
     }
 
