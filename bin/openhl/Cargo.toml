@@ -52,5 +52,11 @@ hex                = "0.4"
 tempfile           = "3"
 k256               = { version = "0.13", default-features = false, features = ["ecdsa", "std", "precomputed-tables"] }
 
+# Stage 19a: openhl_* JSON-RPC namespace registered via Reth's
+# `extend_rpc_modules` hook. Pinned to the version Reth pulls
+# transitively (0.26) so the macro-generated `*ApiServer` traits
+# wire into Reth's RPC server without a version mismatch.
+jsonrpsee = { version = "0.26", features = ["server", "macros"] }
+
 [lints]
 workspace = true

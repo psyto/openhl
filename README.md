@@ -56,6 +56,28 @@ What's still synthetic / next:
 - **Solidity-side test is bytecode-only.** Stage 17f deploys a hand-rolled 26-byte wrapper at a contract address in an in-memory revm `CacheDB`, executes a transaction against it via `OpenHlEvmFactory`, and asserts that the EVM `CALL` into `openhl_deposit`/`openhl_withdraw` mutates the bridge's account map. Two tests, marked `#[ignore]` due to a process-global precompile-state race with parallel bridge tests — see [`docs/testing.md`](docs/testing.md). What remains: a full signed-transaction-through-mempool-to-mined-block path, which depends on CLOB fills becoming EVM-executable transactions inside `build_payload` (today they're still a bridge-local parallel list).
 - **Margin model is mark-aware initial-margin + queryable solvency (Rust + EVM); oracle-index mark still synthetic.** Stage 17j upgrades the withdraw rule to production shape: when the CLOB has both a bid and an ask, the midpoint is the mark and `free = (collateral + unrealized_pnl) − |size| × mark × im_bps / 10⁴`. Traders can withdraw against unrealized gains; loss positions face a tighter limit than the avg-entry rule. With a one-sided book the Stage 17g avg-entry fallback kicks in (conservative). Stage 17l made the `im_bps` rate configurable per-bridge; Stage 17m generalizes that to the full `LiquidationParams` via `LiveRethEvmBridge::with_liquidation_params`, plus exposes `bridge.margin_health(account)` — the production-shape Safe / AtRisk / Liquidatable / Underwater classification computed by `openhl-liquidation` at the current mark. Stage 17n exposes the same classifier on-chain as the `openhl_margin_health` precompile at `0x…0c1f` so Solidity contracts can query their own solvency. What's still synthetic: oracle-index mark (CLOB midpoint is used today; oracle output isn't piped to the bridge or precompile).
 
+## RPC
+
+`bin/openhl reth-devnet` exposes Reth's standard `eth_*` namespace plus an
+`openhl_*` namespace (Stage 19a) that wraps the bridge's accessors so a
+frontend or trading client can query chain state without re-implementing
+the engine.
+
+| Method | Returns |
+| --- | --- |
+| `openhl_currentMark` | `Option<u64>` — CLOB midpoint, `null` if one-sided book |
+| `openhl_accounts` | `Vec<u64>` — every account id the bridge has seen |
+| `openhl_accountSnapshot(account)` | `Option<{account, position_size, avg_entry, collateral}>` — `null` if unknown |
+| `openhl_marginHealth(account)` | `Option<"Safe" \| "AtRisk" \| "Liquidatable" \| "Underwater">` — `null` if indeterminate |
+| `openhl_liquidationParams` | `{initial_margin_bps, maintenance_margin_bps, liquidation_fee_bps}` |
+
+```bash
+curl -s -X POST -H 'Content-Type: application/json' \
+  --data '{"jsonrpc":"2.0","id":1,"method":"openhl_marginHealth","params":[20]}' \
+  http://127.0.0.1:8545
+# → {"jsonrpc":"2.0","id":1,"result":"Safe"}
+```
+
 ## Build
 
 ```bash

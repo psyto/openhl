@@ -37,6 +37,9 @@
 //! (persistent across restarts, real network config, multi-validator)
 //! lands in Stage 13f.
 
+mod rpc;
+use crate::rpc::OpenHlInfoApiServer as _;
+
 use std::net::IpAddr;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -419,6 +422,12 @@ async fn run_reth_devnet(
     // `RpcServerArgs` exposes `http_addr`/`http_port` as public fields,
     // so we mutate the default rather than using a builder method.
     let mut rpc_args = reth_node_core::args::RpcServerArgs::default();
+    // Stage 19a: enable the HTTP JSON-RPC server. Reth's CLI flips
+    // this on via `--http` (and via the `--dev` shortcut); when we
+    // construct `RpcServerArgs` programmatically the field stays
+    // `false` and `extend_rpc_modules` would have nowhere to plug
+    // the `openhl_*` namespace into.
+    rpc_args.http = true;
     if let Some(spec) = rpc_bind.as_deref() {
         let (ip, port) = parse_socket_spec(spec)?;
         println!("      rpc bind         = {ip}:{port}");
@@ -457,6 +466,14 @@ async fn run_reth_devnet(
     // a fresh one if none exists — idempotent across restarts.
     let db = Arc::new(init_db(&reth_db_path, DatabaseArguments::default())?);
 
+    // Stage 19a: register the `openhl_*` JSON-RPC namespace on
+    // Reth's RPC server. The bridge is constructed AFTER Reth
+    // launches (it needs `node.provider`), so we pre-create a
+    // bridge cell and fill it post-launch; the RPC handler reads
+    // through the cell and returns a "bridge not ready" error
+    // during the narrow window before it's filled.
+    let rpc_bridge_cell = rpc::new_bridge_cell();
+    let rpc_bridge_cell_for_hook = rpc_bridge_cell.clone();
     let RethNodeHandle {
         node,
         node_exit_future: _,
@@ -466,6 +483,12 @@ async fn run_reth_devnet(
         .with_types::<EthereumNode>()
         .with_components(EthereumNode::components().executor(OpenHlExecutorBuilder::default()))
         .with_add_ons(EthereumAddOns::default())
+        .extend_rpc_modules(move |ctx| {
+            let server = rpc::OpenHlInfoServer::new(rpc_bridge_cell_for_hook);
+            ctx.modules.merge_configured(server.into_rpc())?;
+            println!("      openhl rpc       = openhl_* namespace registered");
+            Ok(())
+        })
         .launch()
         .await?;
     println!(
@@ -490,6 +513,11 @@ async fn run_reth_devnet(
         LiveRethEvmBridge::new(node.provider.clone(), chain_spec)
             .with_liquidation_params(liquidation_params),
     );
+    // Stage 19a: now that the bridge exists, fill the RPC cell so
+    // openhl_* methods start resolving against it. Any client that
+    // hit an openhl_* method before this point got a "bridge not
+    // ready" error rather than a stale or zero answer.
+    rpc::install_bridge(&rpc_bridge_cell, bridge.clone());
     println!(
         "      margin params    = {} bps initial / {} bps maintenance / {} bps fee",
         liquidation_params.initial_margin_bps,

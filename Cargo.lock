@@ -6217,6 +6217,7 @@ dependencies = [
  "hex",
  "informalsystems-malachitebft-app",
  "informalsystems-malachitebft-signing-ed25519",
+ "jsonrpsee",
  "k256",
  "openhl-clearing",
  "openhl-clob",
