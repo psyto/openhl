@@ -80,6 +80,28 @@ curl -s -X POST -H 'Content-Type: application/json' \
 # → {"jsonrpc":"2.0","id":1,"result":"Safe"}
 ```
 
+### Reader contracts via `eth_call` (Stage 19d)
+
+The precompile addresses (`0x…0c1b` … `0x…0c1f`) aren't directly addressable from standard Ethereum clients — viem / ethers / curl talk to **deployed contracts**, not precompile addresses. Stage 19d pre-deploys a tiny 26-byte wrapper at a fixed address via the dev chain's genesis allocation, so any standard ETH client can hit `openhl_margin_health` through `eth_call`:
+
+| Reader | Address | Wraps |
+| --- | --- | --- |
+| MarginHealthReader | `0x0000000000000000000000000000000000011101` | `openhl_margin_health` at `0x…0c1f` |
+
+Calldata is the 32-byte ABI-encoded account id; the response is a 32-byte word whose last byte is the discriminator (0 Indeterminate / 1 Safe / 2 AtRisk / 3 Liquidatable / 4 Underwater).
+
+```bash
+# Margin health for account 20 (Bob, after the boot cascade resolves):
+curl -s -X POST -H 'Content-Type: application/json' http://127.0.0.1:8545 \
+  --data '{"jsonrpc":"2.0","id":1,"method":"eth_call","params":[{
+    "to":   "0x0000000000000000000000000000000000011101",
+    "data": "0x0000000000000000000000000000000000000000000000000000000000000014"
+  },"latest"]}'
+# → {"result":"0x...01"}    (1 = Safe)
+```
+
+`eth_call` is read-only (no state mutation), which matches `openhl_margin_health`'s read-only semantics. Wrapping the mutating precompiles (`openhl_deposit` / `openhl_withdraw`) as reader contracts is a separate stage — it depends on `eth_sendRawTransaction` actually mining a block, which depends on `bridge.build_payload` integrating Reth's `PayloadBuilder`.
+
 ### WebSocket subscriptions (Stage 19c)
 
 For push-style updates without polling, the same namespace exposes three subscriptions over WebSocket (`ws://127.0.0.1:8546`):

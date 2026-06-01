@@ -37,6 +37,7 @@
 //! (persistent across restarts, real network config, multi-validator)
 //! lands in Stage 13f.
 
+mod reader_contracts;
 mod rpc;
 mod seed_fixture;
 use crate::rpc::OpenHlInfoApiServer as _;
@@ -1288,7 +1289,13 @@ fn dev_chain_spec() -> Arc<ChainSpec> {
             "shanghaiTime": 0
         }
     }"#;
-    let genesis: Genesis = serde_json::from_str(genesis_json).expect("dev genesis parses");
+    let mut genesis: Genesis = serde_json::from_str(genesis_json).expect("dev genesis parses");
+    // Stage 19d: inject pre-deployed reader contracts so standard
+    // Ethereum clients (curl, ethers, viem) can hit our precompiles
+    // via `eth_call` to a fixed Solidity-shape address rather than
+    // having to know the precompile address layout. See
+    // `reader_contracts.rs` for the contracts + their ABIs.
+    genesis.alloc.extend(reader_contracts::genesis_alloc());
     Arc::new(genesis.into())
 }
 
