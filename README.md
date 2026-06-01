@@ -52,7 +52,7 @@ v1 milestone: per-block integration cascade runs across both validators — orac
 Clearing-layer milestone: per-account positions are produced by real CLOB fills (not direct injection), owned by the bridge, persisted across restart, and collateral moves through `deposit`/`withdraw` primitives callable both from Rust and from EVM smart contracts via precompiles. **Achieved** at Stage 17e.
 
 What's still synthetic / next:
-- **Boot scenario is fixed but realistic-shaped.** Stage 17h retired the MM (account 999) and replaced it with five accounts trading at the same fair price (100): Alice/Bob/Carol go long against makers Dave/Eve, then the mark book sets (95/97 → mid 96) and a 4-point uPnL drift drives the cascade. Bob lands Liquidatable, Carol Underwater, Dave + Eve become ADL counterparties — same disjoint-target invariant the cascade needs, no more absurd off-market orders. A persisted-trade-history seed (so the boot scenario evolves block-by-block rather than springing fully-formed) is a separate follow-up.
+- **Boot scenario is fixed-but-realistic-shaped, with an operator escape hatch.** Stage 17h retired the MM (account 999) and replaced it with five accounts trading at fair value, Stage 17p re-tuned for the oracle-driven scan. Stage 19b adds `--seed-fixture <path.json>` so operators can demo any market shape without recompiling (default behavior unchanged; see the "Seed fixtures" section below). The cascade still springs fully-formed on tick 1; a chain-history seed where boot replays block-by-block from a persisted log is a separate follow-up.
 - **Solidity-side test is bytecode-only.** Stage 17f deploys a hand-rolled 26-byte wrapper at a contract address in an in-memory revm `CacheDB`, executes a transaction against it via `OpenHlEvmFactory`, and asserts that the EVM `CALL` into `openhl_deposit`/`openhl_withdraw` mutates the bridge's account map. Two tests, marked `#[ignore]` due to a process-global precompile-state race with parallel bridge tests — see [`docs/testing.md`](docs/testing.md). What remains: a full signed-transaction-through-mempool-to-mined-block path, which depends on CLOB fills becoming EVM-executable transactions inside `build_payload` (today they're still a bridge-local parallel list).
 - **Margin model is end-to-end production-shape.** Stage 17j upgrades the withdraw rule to `free = (collateral + uPnL) − |size| × mark × im_bps / 10⁴`. 17l → 17m make the full `LiquidationParams` runtime-tunable. 17m exposes `bridge.margin_health(account)`; 17n adds the same classifier as the `openhl_margin_health` precompile at `0x…0c1f`. 17o pipes `openhl-oracle`'s aggregated index through to the bridge / precompile as the canonical mark (falling back to CLOB midpoint pre-first-refresh); 17p aligns the integration coordinator's `OpenHlNode::tick` so the liquidation scan + ADL use the same oracle-preferred mark — `bridge.margin_health` now accurately predicts what the next tick's cascade will do. Stage 17q closes the stale-oracle gap: a freshness check (`OracleParams::aggregate_max_age_secs`, default 60s) gates the oracle's use as mark, so a publisher set that stops pushing falls back to the CLOB midpoint rather than letting an aging aggregate delay liquidations or fix the funding premium. CLOB midpoint stays the input to the funding-rate premium (`premium = mark − index`) where it's load-bearing.
 
@@ -79,6 +79,19 @@ curl -s -X POST -H 'Content-Type: application/json' \
   http://127.0.0.1:8545
 # → {"jsonrpc":"2.0","id":1,"result":"Safe"}
 ```
+
+## Seed fixtures
+
+The boot scenario `bin/openhl reth-devnet` runs out of the box (a hardcoded five-account trade sequence designed to demonstrate the cascade end-to-end) can be replaced with a JSON fixture via `--seed-fixture <path>` (Stage 19b). The fixture lists `submit_order` calls and `bridge.deposit` calls; everything else (oracle publishers, mark book interpretation, etc.) stays as-is.
+
+```bash
+openhl reth-devnet --moniker alice --data-dir /tmp/openhl-a \
+    --seed-fixture examples/seed-default.json --rounds 3
+```
+
+`examples/seed-default.json` replays the hardcoded seed byte-identically — copy it and edit to demo a different market shape.
+
+**Cross-validator note:** every validator MUST load the same fixture. The seed runs in production code paths and the resulting bridge state is part of the determinism contract — different fixtures → different initial state → consensus diverges.
 
 ## Build
 

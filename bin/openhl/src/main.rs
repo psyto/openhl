@@ -38,6 +38,7 @@
 //! lands in Stage 13f.
 
 mod rpc;
+mod seed_fixture;
 use crate::rpc::OpenHlInfoApiServer as _;
 
 use std::net::IpAddr;
@@ -182,6 +183,25 @@ enum Command {
         /// `[::1]:8545`.
         #[arg(long)]
         rpc_bind: Option<String>,
+
+        /// Stage 19b — path to a JSON seed fixture
+        /// (`crate::seed_fixture::SeedFixture` shape). When set,
+        /// the boot scenario is replayed from the fixture instead
+        /// of the hardcoded `seed_accounts_via_fills` /
+        /// `seed_mark_orders` sequence. Lets operators demo
+        /// non-default market shapes without recompiling.
+        ///
+        /// Cross-validator note: every validator MUST load the
+        /// same fixture file. The seed runs in production code
+        /// paths and the resulting bridge state is part of the
+        /// determinism contract — different fixtures → different
+        /// initial state → consensus diverges.
+        ///
+        /// See `examples/seed-default.json` for a fixture that
+        /// replays the current hardcoded Stage 17h/17p seed
+        /// byte-identically.
+        #[arg(long)]
+        seed_fixture: Option<PathBuf>,
     },
 }
 
@@ -234,6 +254,7 @@ fn main() -> eyre::Result<()> {
             validators,
             listen_addr,
             rpc_bind,
+            seed_fixture,
         } => tokio_rt()?.block_on(run_reth_devnet(
             rounds,
             moniker,
@@ -242,6 +263,7 @@ fn main() -> eyre::Result<()> {
             validators,
             listen_addr,
             rpc_bind,
+            seed_fixture,
         )),
     }
 }
@@ -389,6 +411,7 @@ async fn run_reth_devnet(
     validators_path: Option<PathBuf>,
     listen_addr: Option<String>,
     rpc_bind: Option<String>,
+    seed_fixture_path: Option<PathBuf>,
 ) -> eyre::Result<()> {
     println!(
         "openhl v{} — driving {} reth-backed decision{}",
@@ -782,6 +805,23 @@ async fn run_reth_devnet(
         // snapshot today), so re-seed them on every boot.
         seed_mark_orders(&bridge);
         println!("      mark book            = re-seeded (Buy@95 / Sell@97)");
+    } else if let Some(path) = seed_fixture_path.as_deref() {
+        // Stage 19b: operator-supplied seed fixture wins over the
+        // hardcoded path. Same determinism rules apply — every
+        // validator MUST load the same file.
+        let fixture = seed_fixture::load_from_path(path)?;
+        let fills_count = seed_fixture::replay(&bridge, &fixture)?;
+        println!(
+            "      seed fixture         = {} ({} trade(s), {} deposit(s), {} fill(s) produced)",
+            path.display(),
+            fixture.trades.len(),
+            fixture.deposits.len(),
+            fills_count,
+        );
+        println!(
+            "      accounts             = {} (replayed from fixture)",
+            bridge.accounts_snapshot().len(),
+        );
     } else {
         let fills_count = seed_accounts_via_fills(&bridge);
         println!(

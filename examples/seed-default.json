@@ -1,0 +1,26 @@
+{
+  "_comment": "Stage 19b reference fixture — replays bin/openhl's hardcoded Stage 17h/17p seed byte-identically. Trades go in first, deposits last; the four 110-priced rounds + two mark-book orders match seed_accounts_via_fills + seed_mark_orders; the five deposits match the (10:200, 20:90, 30:100, 40:300, 50:200) loop. Operators wanting a different boot scenario can copy this file and edit. Every validator in a multi-node network MUST load the same file.",
+  "trades": [
+    { "id": 1001, "account": 40, "side": "Sell", "qty": 10, "kind": "Limit", "price": 110 },
+    { "id": 1002, "account": 10, "side": "Buy",  "qty": 10, "kind": "Market" },
+
+    { "id": 1003, "account": 40, "side": "Sell", "qty": 10, "kind": "Limit", "price": 110 },
+    { "id": 1004, "account": 20, "side": "Buy",  "qty": 10, "kind": "Market" },
+
+    { "id": 1005, "account": 40, "side": "Sell", "qty": 30, "kind": "Limit", "price": 110 },
+    { "id": 1006, "account": 30, "side": "Buy",  "qty": 30, "kind": "Market" },
+
+    { "id": 1007, "account": 50, "side": "Sell", "qty": 20, "kind": "Limit", "price": 110 },
+    { "id": 1008, "account": 30, "side": "Buy",  "qty": 20, "kind": "Market" },
+
+    { "id": 2001, "account": 1,  "side": "Buy",  "qty": 1,  "kind": "Limit", "price": 95 },
+    { "id": 2002, "account": 2,  "side": "Sell", "qty": 1,  "kind": "Limit", "price": 97 }
+  ],
+  "deposits": [
+    { "account": 10, "amount": 200 },
+    { "account": 20, "amount": 90 },
+    { "account": 30, "amount": 100 },
+    { "account": 40, "amount": 300 },
+    { "account": 50, "amount": 200 }
+  ]
+}
