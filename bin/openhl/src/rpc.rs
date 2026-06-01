@@ -29,10 +29,12 @@
 use std::sync::{Arc, RwLock};
 
 use jsonrpsee::{
-    core::RpcResult,
+    core::{RpcResult, SubscriptionResult},
     proc_macros::rpc,
     types::{error::ErrorCode, ErrorObject, ErrorObjectOwned},
+    PendingSubscriptionSink, SubscriptionMessage,
 };
+use std::time::Duration;
 use openhl_clob::AccountId;
 use openhl_evm::LiveRethEvmBridge;
 use openhl_liquidation::{LiquidationParams, MarginHealth};
@@ -143,6 +145,30 @@ pub trait OpenHlInfoApi {
     /// liquidation-fee bps) the bridge enforces today.
     #[method(name = "liquidationParams")]
     fn liquidation_params(&self) -> RpcResult<LiquidationParamsRpc>;
+
+    /// Stage 19c — WebSocket subscription: emit the CLOB midpoint
+    /// initially and on every change thereafter. Polled at 1s
+    /// intervals on the server side; no event emitted when the
+    /// value is unchanged from the prior tick (cheap to keep open
+    /// long-term).
+    #[subscription(name = "subscribeCurrentMark", item = Option<u64>)]
+    fn subscribe_current_mark(&self) -> SubscriptionResult;
+
+    /// WebSocket subscription: emit the effective mark (oracle
+    /// index if installed, else CLOB midpoint) initially and on
+    /// change. Use this when you want to know what the bridge is
+    /// ACTUALLY using for margin / withdraw right now.
+    #[subscription(name = "subscribeEffectiveMark", item = Option<u64>)]
+    fn subscribe_effective_mark(&self) -> SubscriptionResult;
+
+    /// WebSocket subscription: emit an account's margin health
+    /// classification on every change. `null` until the bridge
+    /// has enough information to classify (no mark / unknown
+    /// account); a subscriber that joins before the first oracle
+    /// refresh and the account exists sees null first, then a
+    /// concrete classification once the mark is available.
+    #[subscription(name = "subscribeMarginHealth", item = Option<String>)]
+    fn subscribe_margin_health(&self, account: u64) -> SubscriptionResult;
 }
 
 /// Implementation backed by an [`BridgeCell`]. Constructed once
@@ -240,4 +266,86 @@ where
             self.bridge_or_err()?.liquidation_params(),
         ))
     }
+
+    fn subscribe_current_mark(&self, pending: PendingSubscriptionSink) -> SubscriptionResult {
+        let bridge = self.bridge.clone();
+        spawn_polling_subscription(pending, move || {
+            read_bridge(&bridge).map(|b| b.current_mark().map(|m| m.0))
+        });
+        Ok(())
+    }
+
+    fn subscribe_effective_mark(&self, pending: PendingSubscriptionSink) -> SubscriptionResult {
+        let bridge = self.bridge.clone();
+        spawn_polling_subscription(pending, move || {
+            read_bridge(&bridge).map(|b| b.effective_mark().map(|m| m.0))
+        });
+        Ok(())
+    }
+
+    fn subscribe_margin_health(
+        &self,
+        pending: PendingSubscriptionSink,
+        account: u64,
+    ) -> SubscriptionResult {
+        let bridge = self.bridge.clone();
+        spawn_polling_subscription(pending, move || {
+            read_bridge(&bridge).map(|b| {
+                b.margin_health(AccountId(account))
+                    .map(|h| margin_health_str(h).to_string())
+            })
+        });
+        Ok(())
+    }
+}
+
+/// Poll the bridge cell; `None` if the bridge isn't installed yet
+/// (the narrow window between Reth launch and bin/openhl filling
+/// the cell). Subscriptions skip emission until it's filled.
+fn read_bridge<P>(cell: &BridgeCell<P>) -> Option<Arc<LiveRethEvmBridge<P>>> {
+    cell.read().ok()?.clone()
+}
+
+/// Stage 19c — generic polling subscription. Spawns a tokio task
+/// that:
+///   1. Accepts the pending subscription.
+///   2. Polls `poll_fn` every 1s.
+///   3. Emits the value when it differs from the last emitted
+///      one (or on the first iteration). Unchanged values are
+///      silently dropped — the subscription stays cheap.
+///   4. Exits when the subscriber disconnects or the bridge cell
+///      poll returns `None` (the bridge isn't installed yet — the
+///      caller is expected to retry; we don't keep a zombie task).
+fn spawn_polling_subscription<T, F>(pending: PendingSubscriptionSink, mut poll_fn: F)
+where
+    T: serde::Serialize + PartialEq + Clone + Send + 'static,
+    F: FnMut() -> Option<T> + Send + 'static,
+{
+    tokio::spawn(async move {
+        let sink = match pending.accept().await {
+            Ok(s) => s,
+            Err(_) => return,
+        };
+        let interval = Duration::from_secs(1);
+        let mut last: Option<T> = None;
+        let mut first = true;
+        loop {
+            // Skip if the bridge cell isn't filled — we don't have
+            // an answer to emit yet. Try again next interval.
+            if let Some(now) = poll_fn() {
+                if first || last.as_ref() != Some(&now) {
+                    let raw = match serde_json::value::to_raw_value(&now) {
+                        Ok(r) => r,
+                        Err(_) => return,
+                    };
+                    if sink.send(SubscriptionMessage::from(raw)).await.is_err() {
+                        return;
+                    }
+                    last = Some(now);
+                    first = false;
+                }
+            }
+            tokio::time::sleep(interval).await;
+        }
+    });
 }

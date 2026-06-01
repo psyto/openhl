@@ -451,6 +451,11 @@ async fn run_reth_devnet(
     // `false` and `extend_rpc_modules` would have nowhere to plug
     // the `openhl_*` namespace into.
     rpc_args.http = true;
+    // Stage 19c: enable WebSocket transport so the
+    // `openhl_subscribe*` push methods are reachable. Without
+    // this, the methods register but clients can't open a
+    // subscription channel.
+    rpc_args.ws = true;
     if let Some(spec) = rpc_bind.as_deref() {
         let (ip, port) = parse_socket_spec(spec)?;
         println!("      rpc bind         = {ip}:{port}");

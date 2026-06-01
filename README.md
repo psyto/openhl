@@ -80,6 +80,31 @@ curl -s -X POST -H 'Content-Type: application/json' \
 # → {"jsonrpc":"2.0","id":1,"result":"Safe"}
 ```
 
+### WebSocket subscriptions (Stage 19c)
+
+For push-style updates without polling, the same namespace exposes three subscriptions over WebSocket (`ws://127.0.0.1:8546`):
+
+| Method | Item |
+| --- | --- |
+| `openhl_subscribeCurrentMark` | `Option<u64>` — CLOB midpoint, pushed on change |
+| `openhl_subscribeEffectiveMark` | `Option<u64>` — oracle index if installed, else midpoint |
+| `openhl_subscribeMarginHealth(account)` | `Option<"Safe" \| "AtRisk" \| "Liquidatable" \| "Underwater">` |
+
+All three poll the bridge accessor server-side every 1s and emit only when the value differs from the previous emission (so an idle subscription stays cheap). Unsubscribe with the standard `_unsubscribe` companion method jsonrpsee generates per subscription.
+
+```python
+import asyncio, json, websockets
+async def main():
+    async with websockets.connect("ws://127.0.0.1:8546") as ws:
+        await ws.send(json.dumps({"jsonrpc":"2.0","id":1,
+            "method":"openhl_subscribeMarginHealth","params":[20]}))
+        ack = await ws.recv()  # subscription id
+        while True:
+            msg = await ws.recv()  # pushes when health changes
+            print(msg)
+asyncio.run(main())
+```
+
 ## Seed fixtures
 
 The boot scenario `bin/openhl reth-devnet` runs out of the box (a hardcoded five-account trade sequence designed to demonstrate the cascade end-to-end) can be replaced with a JSON fixture via `--seed-fixture <path>` (Stage 19b). The fixture lists `submit_order` calls and `bridge.deposit` calls; everything else (oracle publishers, mark book interpretation, etc.) stays as-is.
