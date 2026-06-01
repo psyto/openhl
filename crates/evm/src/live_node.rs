@@ -94,6 +94,16 @@ pub struct LiveRethEvmBridge<P> {
     /// installs `initial_margin_bps` into the precompile global
     /// so EVM-side and Rust-side withdraw rules stay in lockstep.
     liquidation_params: LiquidationParams,
+    /// Stage 17o — latest oracle aggregated index price.
+    /// `bin/openhl` pushes this after every successful
+    /// `coordinator.tick` via [`Self::set_oracle_index_price`];
+    /// the setter also installs it into the matching precompile
+    /// global so the EVM-side reads the same value. `None` before
+    /// the first refresh (and after every miss, e.g., a tick
+    /// where the deviation filter failed quorum) — in that case
+    /// margin / withdraw paths fall back to the CLOB midpoint
+    /// via [`Self::effective_mark`].
+    oracle_index_price: Mutex<Option<u64>>,
 }
 
 #[derive(Debug, Default)]
@@ -140,6 +150,7 @@ impl<P> LiveRethEvmBridge<P> {
             state: Mutex::new(State::default()),
             accounts,
             liquidation_params: LiquidationParams::hyperliquid_default(),
+            oracle_index_price: Mutex::new(None),
         }
     }
 
@@ -182,6 +193,49 @@ impl<P> LiveRethEvmBridge<P> {
         self.liquidation_params.initial_margin_bps
     }
 
+    /// Stage 17o — install the latest oracle aggregated index
+    /// price. Called by `bin/openhl` after every
+    /// `coordinator.tick`; updates the bridge's local cache AND
+    /// the matching precompile-module global so the EVM-side
+    /// `openhl_withdraw` / `openhl_margin_health` precompiles read
+    /// exactly the value the bridge uses for its Rust-side
+    /// `withdraw` and `margin_health` accessors.
+    pub fn set_oracle_index_price(&self, price: u64) {
+        *self
+            .oracle_index_price
+            .lock()
+            .expect("oracle_index_price mutex poisoned") = Some(price);
+        crate::precompiles::install_oracle_index_price(price);
+    }
+
+    /// Read the cached oracle index price (last value pushed via
+    /// [`Self::set_oracle_index_price`]), or `None` if no refresh
+    /// has succeeded yet.
+    #[must_use]
+    pub fn oracle_index_price(&self) -> Option<u64> {
+        *self
+            .oracle_index_price
+            .lock()
+            .expect("oracle_index_price mutex poisoned")
+    }
+
+    /// Stage 17o — the mark used by margin / withdraw / margin_health
+    /// computations. Returns the cached oracle index price if any
+    /// has been installed (production-correct: oracle is the
+    /// canonical reference, not the CLOB midpoint), otherwise
+    /// falls back to [`Self::current_mark`] (CLOB midpoint).
+    ///
+    /// Returns `None` only when neither source is available — i.e.,
+    /// no oracle refresh has succeeded AND the book is one-sided
+    /// or empty. Withdraw degrades to the avg-entry fallback in
+    /// that case; `margin_health` returns Indeterminate.
+    #[must_use]
+    pub fn effective_mark(&self) -> Option<openhl_funding::MarkPrice> {
+        self.oracle_index_price()
+            .map(openhl_funding::MarkPrice)
+            .or_else(|| self.current_mark())
+    }
+
     /// Stage 17m — classify an account's margin health using the
     /// production-shape `openhl_liquidation::margin_health` math
     /// at the current CLOB midpoint and this bridge's
@@ -200,7 +254,10 @@ impl<P> LiveRethEvmBridge<P> {
     /// status without re-implementing the liquidation engine.
     #[must_use]
     pub fn margin_health(&self, account: AccountId) -> Option<MarginHealth> {
-        let mark = self.current_mark()?;
+        // Stage 17o: prefer the installed oracle index over the
+        // CLOB midpoint (production-correct mark for margin /
+        // liquidation). `effective_mark` does the fallback.
+        let mark = self.effective_mark()?;
         let accts = self.accounts.lock().expect("accounts mutex poisoned");
         let acct = accts.get(&account)?;
         let snapshot = AccountSnapshot {
@@ -348,7 +405,11 @@ impl<P> LiveRethEvmBridge<P> {
         account: AccountId,
         amount: u64,
     ) -> Option<openhl_funding::Notional> {
-        let mark = self.current_mark();
+        // Stage 17o: oracle index price (if installed) is the
+        // canonical mark; CLOB midpoint is the fallback. Same
+        // source the `openhl_withdraw` precompile reads via
+        // `precompiles::effective_mark`.
+        let mark = self.effective_mark();
         let mut accts = self.accounts.lock().expect("accounts mutex poisoned");
         let acct = accts.get_mut(&account)?;
         let amount_i64 = i64::try_from(amount).ok()?;
@@ -1312,6 +1373,84 @@ mod tests {
             None,
             "no CLOB midpoint → indeterminate",
         );
+    }
+
+    /// Stage 17o — when an oracle index has been installed via
+    /// `set_oracle_index_price`, both `effective_mark` and the
+    /// downstream margin / withdraw math prefer it over the CLOB
+    /// midpoint. Without an oracle install they fall back to the
+    /// midpoint (Stage 17j behavior).
+    #[test]
+    fn effective_mark_prefers_oracle_index_over_clob_midpoint() {
+        use openhl_clob::{AccountId, OrderId, OrderType, Price, Qty, Side};
+        use openhl_funding::{MarkPrice, Notional};
+
+        let bridge = LiveRethEvmBridge::new((), dev_chain_spec());
+
+        // Cross at 100 to make account 1 long 10 @ 100.
+        bridge.submit_order(Order {
+            id: OrderId(1),
+            account: AccountId(1),
+            side: Side::Buy,
+            qty: Qty(10),
+            order_type: OrderType::Limit { price: Price(100) },
+        });
+        bridge.submit_order(Order {
+            id: OrderId(2),
+            account: AccountId(2),
+            side: Side::Sell,
+            qty: Qty(10),
+            order_type: OrderType::Market,
+        });
+        // CLOB mark-book at midpoint 110 (bid 109 / ask 111).
+        bridge.submit_order(Order {
+            id: OrderId(101),
+            account: AccountId(99),
+            side: Side::Buy,
+            qty: Qty(1),
+            order_type: OrderType::Limit { price: Price(109) },
+        });
+        bridge.submit_order(Order {
+            id: OrderId(102),
+            account: AccountId(98),
+            side: Side::Sell,
+            qty: Qty(1),
+            order_type: OrderType::Limit { price: Price(111) },
+        });
+        let _ = bridge.deposit(AccountId(1), 500);
+
+        // No oracle installed yet → fall back to CLOB midpoint 110.
+        assert_eq!(bridge.oracle_index_price(), None);
+        assert_eq!(bridge.effective_mark(), Some(MarkPrice(110)));
+
+        // Install an oracle index AT THE SAME PRICE as the midpoint.
+        // Sanity: oracle takes precedence even when values match.
+        bridge.set_oracle_index_price(110);
+        assert_eq!(bridge.oracle_index_price(), Some(110));
+        assert_eq!(bridge.effective_mark(), Some(MarkPrice(110)));
+
+        // Install an oracle index BELOW the midpoint. The withdraw
+        // rule should now tighten — at mark 90 vs midpoint 110:
+        //   uPnL = (90-100)*10 = -100
+        //   equity = 500 - 100 = 400
+        //   IM at mark 90 = 10*90*10%/1 = 90
+        //   free = 400 - 90 = 310
+        // (At the midpoint 110 the free would have been ≈ 590.)
+        bridge.set_oracle_index_price(90);
+        assert_eq!(bridge.effective_mark(), Some(MarkPrice(90)));
+        assert_eq!(bridge.withdraw(AccountId(1), 311), None);
+        assert_eq!(bridge.withdraw(AccountId(1), 310), Some(Notional(190)));
+
+        // The precompile global is in lockstep — bridge.set_oracle_…
+        // installs into it too.
+        assert_eq!(
+            crate::precompiles::current_oracle_index_price(),
+            Some(90),
+            "bridge setter must install to the precompile global",
+        );
+
+        // Restore default for other tests in the workspace.
+        crate::precompiles::clear_oracle_index_price();
     }
 
     /// Stage 16b: bridge snapshot round-trips the account map.

@@ -882,6 +882,20 @@ async fn run_reth_devnet(
                 println!("  mark = {} ({mark_source})", mark.0);
                 print_tick_report(&report);
 
+                // Stage 17o: push the oracle's latest aggregated
+                // index price into the bridge so `bridge.withdraw`
+                // / `bridge.margin_health` (and their EVM
+                // precompile siblings, kept in lockstep via the
+                // setter) use the canonical reference price
+                // rather than the CLOB midpoint. `current_price`
+                // returns `None` before the first successful
+                // refresh, in which case the bridge keeps its
+                // last value and consumers fall back to the
+                // midpoint.
+                if let Some(index) = node.oracle().current_price() {
+                    bridge_for_hook.set_oracle_index_price(index.0);
+                }
+
                 // Stage 15b → 16c: apply funding settlements back to
                 // the bridge-owned account map. The bridge is the
                 // sole source of truth for per-account state — every

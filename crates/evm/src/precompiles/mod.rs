@@ -278,6 +278,60 @@ pub fn current_maintenance_margin_bps() -> u32 {
     MAINTENANCE_MARGIN_BPS.load(Ordering::Relaxed)
 }
 
+/// Stage 17o — process-global oracle index price the bridge
+/// installs after each `coordinator.tick`. `None` before any
+/// refresh has succeeded (e.g., the first block, or any block
+/// where the deviation-filtered aggregation failed quorum); the
+/// withdraw + margin_health paths fall back to the CLOB midpoint
+/// in that case via [`effective_mark`].
+///
+/// Production-correct semantics: margin / withdraw / liquidation
+/// should consult the **oracle index**, not the CLOB midpoint —
+/// the midpoint can be manipulated by anyone who places a tight
+/// book, the oracle index is the cross-venue reference. Stage 17o
+/// closes the bridge + precompile half of this; the integration
+/// coordinator's liquidation scan still passes the midpoint as
+/// mark on per-block ticks (separate refactor).
+static ORACLE_INDEX_PRICE: RwLock<Option<u64>> = RwLock::new(None);
+
+/// Set the process-global oracle index price. Called by
+/// `LiveRethEvmBridge::set_oracle_index_price` so the bridge's
+/// Rust-side `effective_mark` and the precompile's EVM-side reads
+/// stay in lockstep.
+pub fn install_oracle_index_price(price: u64) {
+    *ORACLE_INDEX_PRICE
+        .write()
+        .expect("ORACLE_INDEX_PRICE rwlock poisoned") = Some(price);
+}
+
+/// Clear the process-global oracle index price. Test-only typical
+/// use; idempotent.
+pub fn clear_oracle_index_price() {
+    *ORACLE_INDEX_PRICE
+        .write()
+        .expect("ORACLE_INDEX_PRICE rwlock poisoned") = None;
+}
+
+/// Read the process-global oracle index price.
+#[must_use]
+pub fn current_oracle_index_price() -> Option<u64> {
+    *ORACLE_INDEX_PRICE
+        .read()
+        .expect("ORACLE_INDEX_PRICE rwlock poisoned")
+}
+
+/// Stage 17o — the "what mark do margin / withdraw / margin_health
+/// actually consult" question, resolved. Returns the installed
+/// oracle index if any, falling back to the CLOB midpoint
+/// otherwise. The mark precompile/bridge consumers both call this
+/// so a flipped oracle source is one-line plumbing later.
+#[must_use]
+pub fn effective_mark() -> Option<openhl_funding::MarkPrice> {
+    current_oracle_index_price()
+        .map(openhl_funding::MarkPrice)
+        .or_else(current_mark)
+}
+
 /// Read the currently-installed CLOB's best bid. Returns `None` if no CLOB
 /// is installed or if the book has no bids. Public so tests can verify
 /// install/uninstall without going through the precompile dispatch.
@@ -645,9 +699,13 @@ pub(crate) fn withdraw(input: &[u8], _gas_limit: u64, _reservoir: u64) -> Precom
     // `INITIAL_MARGIN_BPS` (installed by
     // `LiveRethEvmBridge::with_initial_margin_bps`), so this stays
     // in lockstep with the bridge's Rust-side withdraw rule.
+    //
+    // Stage 17o: the mark consulted is `effective_mark()` — oracle
+    // index when set, CLOB midpoint as fallback. Same source the
+    // bridge's `withdraw` uses.
     let free = crate::live_node::withdraw_free_collateral(
         acct,
-        current_mark(),
+        effective_mark(),
         current_initial_margin_bps(),
     );
     if i128::from(amount_i64) > i128::from(free) {
@@ -709,7 +767,11 @@ pub(crate) fn margin_health(
     }
     let account_id = u64_from_be_chunk(&input[0..32]);
 
-    let Some(mark) = current_mark() else {
+    // Stage 17o: prefer the installed oracle index; fall back to
+    // CLOB midpoint. `effective_mark()` returns `None` only when
+    // neither source is available (no oracle refresh yet AND a
+    // one-sided book) — Indeterminate response.
+    let Some(mark) = effective_mark() else {
         return Ok(PrecompileOutput::new(
             MARGIN_HEALTH_BASE_GAS_COST,
             Bytes::from(out),
@@ -1398,6 +1460,87 @@ mod tests {
         // Malformed input → Indeterminate.
         let r = margin_health(&[0u8; 16], 100_000, 0).unwrap();
         assert_eq!(r.bytes[31], margin_health_tag::INDETERMINATE);
+
+        // Cleanup.
+        uninstall_clob();
+        uninstall_accounts();
+    }
+
+    /// Stage 17o — the `openhl_margin_health` precompile reads
+    /// `effective_mark()`, so an installed oracle index takes
+    /// precedence over the CLOB midpoint.
+    #[test]
+    fn margin_health_precompile_prefers_oracle_index() {
+        use openhl_funding::{MarkPrice, PositionSize};
+
+        let _g = TEST_SERIALIZER.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        uninstall_clob();
+        uninstall_accounts();
+        clear_oracle_index_price();
+        install_initial_margin_bps(openhl_clearing::DEFAULT_INITIAL_MARGIN_BPS);
+        install_maintenance_margin_bps(openhl_clearing::DEFAULT_MAINTENANCE_MARGIN_BPS);
+
+        let calldata = |account: u64| -> Vec<u8> {
+            let mut buf = vec![0u8; 32];
+            buf[24..32].copy_from_slice(&account.to_be_bytes());
+            buf
+        };
+
+        // Account 42: long 10 @ 100, collateral 100.
+        let accounts = Arc::new(Mutex::new(HashMap::new()));
+        install_accounts(Arc::clone(&accounts));
+        accounts.lock().unwrap().insert(
+            AccountId(42),
+            Account {
+                account: AccountId(42),
+                position_size: PositionSize(10),
+                avg_entry: MarkPrice(100),
+                collateral: Notional(100),
+            },
+        );
+
+        // Install a healthy CLOB midpoint at 110 (bid 109 / ask 111).
+        let book = Arc::new(Mutex::new(Book::new()));
+        book.lock().unwrap().submit(Order {
+            id: OrderId(101),
+            account: AccountId(99),
+            side: Side::Buy,
+            qty: Qty(1),
+            order_type: OrderType::Limit { price: Price(109) },
+        });
+        book.lock().unwrap().submit(Order {
+            id: OrderId(102),
+            account: AccountId(98),
+            side: Side::Sell,
+            qty: Qty(1),
+            order_type: OrderType::Limit { price: Price(111) },
+        });
+        install_clob(Arc::clone(&book));
+        assert_eq!(current_mark(), Some(MarkPrice(110)));
+
+        // At CLOB midpoint 110, uPnL=+100 → equity=200 → MR ≈ 1818 bps
+        // (well above 1000 IM) → Safe.
+        let r = margin_health(&calldata(42), 100_000, 0).unwrap();
+        assert_eq!(r.bytes[31], margin_health_tag::SAFE);
+
+        // Install an oracle index at 92 — production-correct mark that
+        // overrides the CLOB midpoint. At mark 92: uPnL=-80,
+        // equity=20, notional=920, MR ≈ 217 bps ⇒ AtRisk (not yet
+        // below maintenance 200). One tick lower and it'd flip
+        // Liquidatable, but AtRisk is sufficient to prove the
+        // precompile's reading the oracle rather than the midpoint.
+        install_oracle_index_price(92);
+        let r = margin_health(&calldata(42), 100_000, 0).unwrap();
+        assert_eq!(
+            r.bytes[31],
+            margin_health_tag::AT_RISK,
+            "oracle index 92 overrides CLOB midpoint 110",
+        );
+
+        // Clear the oracle: should fall back to the midpoint → Safe.
+        clear_oracle_index_price();
+        let r = margin_health(&calldata(42), 100_000, 0).unwrap();
+        assert_eq!(r.bytes[31], margin_health_tag::SAFE, "oracle cleared, midpoint resumes");
 
         // Cleanup.
         uninstall_clob();

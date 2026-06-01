@@ -36,6 +36,10 @@ With a one-sided book the rule falls back to IM at `avg_entry` (conservative). F
 
 `LiveRethEvmBridge::with_liquidation_params(params)` stores the full `LiquidationParams` (initial / maintenance / fee bps) on the bridge AND installs `params.initial_margin_bps` + `params.maintenance_margin_bps` into precompile-module globals so the EVM-side reads exactly what the bridge enforces. `bin/openhl` plumbs it from `OpenHlNodeConfig::liquidation_params` at boot; tests use `LiquidationParams::hyperliquid_default()` (1000 bps initial, 200 bps maintenance, 150 bps fee).
 
+#### Oracle index as mark (Stage 17o)
+
+Margin / withdraw / margin_health all consult `bridge.effective_mark()` (Rust) / `precompiles::effective_mark()` (EVM) which prefers an installed oracle index over the CLOB midpoint. `bin/openhl` pushes `coordinator.oracle().current_price()` into the bridge after every `coordinator.tick`; the bridge's setter installs the same value into the precompile global, so on-chain and off-chain reads stay in lockstep. Before the first successful oracle refresh — or after any tick where the deviation filter failed quorum — there's no installed index and consumers fall back to the CLOB midpoint. The integration coordinator's per-block liquidation scan still reads `TickInput.mark` from the bridge's midpoint (not yet oracle-driven); that's a separate refactor.
+
 #### Queryable margin health (Stages 17m–17n + 19a)
 
 Three surfaces, all returning the same production-shape `Safe / AtRisk / Liquidatable / Underwater` classification computed by `openhl-liquidation::margin_health` at the current CLOB midpoint:

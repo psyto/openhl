@@ -108,6 +108,22 @@ pub trait OpenHlInfoApi {
     #[method(name = "currentMark")]
     fn current_mark(&self) -> RpcResult<Option<u64>>;
 
+    /// Latest aggregated oracle index price (Stage 17o), or `null`
+    /// before the first refresh has succeeded. This is the
+    /// production-correct mark for margin / withdraw — the bridge
+    /// prefers it over `currentMark` (the CLOB midpoint) when
+    /// computing free collateral.
+    #[method(name = "oracleIndexPrice")]
+    fn oracle_index_price(&self) -> RpcResult<Option<u64>>;
+
+    /// Mark actually consulted by `marginHealth` and the
+    /// withdraw rule right now: `oracleIndexPrice` if any has
+    /// been installed, otherwise `currentMark`. Returns `null`
+    /// when neither source is available (no oracle refresh yet
+    /// AND a one-sided/empty book).
+    #[method(name = "effectiveMark")]
+    fn effective_mark(&self) -> RpcResult<Option<u64>>;
+
     /// Account IDs the bridge has seen at least one fill or
     /// deposit for, sorted ascending.
     #[method(name = "accounts")]
@@ -179,6 +195,14 @@ where
 {
     fn current_mark(&self) -> RpcResult<Option<u64>> {
         Ok(self.bridge_or_err()?.current_mark().map(|m| m.0))
+    }
+
+    fn oracle_index_price(&self) -> RpcResult<Option<u64>> {
+        Ok(self.bridge_or_err()?.oracle_index_price())
+    }
+
+    fn effective_mark(&self) -> RpcResult<Option<u64>> {
+        Ok(self.bridge_or_err()?.effective_mark().map(|m| m.0))
     }
 
     fn accounts(&self) -> RpcResult<Vec<u64>> {
