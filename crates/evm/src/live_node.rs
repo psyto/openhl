@@ -45,7 +45,10 @@ use reth_chainspec::{ChainSpec, EthChainSpec};
 use reth_consensus::HeaderValidator;
 use reth_engine_primitives::ConsensusEngineHandle;
 use reth_ethereum_consensus::EthBeaconConsensus;
-use reth_ethereum_engine_primitives::EthEngineTypes;
+use reth_ethereum_engine_primitives::{EthEngineTypes, EthPayloadAttributes};
+use reth_payload_builder::{
+    BuildNewPayload, EthBuiltPayload, PayloadBuilderHandle, PayloadKind,
+};
 use reth_primitives_traits::SealedHeader;
 use reth_storage_api::{BlockNumReader, HeaderProvider};
 use std::collections::HashMap;
@@ -72,6 +75,16 @@ pub struct LiveRethEvmBridge<P> {
     /// `None` at v0 means commits stay local to the bridge's `state.chain`
     /// `HashMap` — fine for unit tests, but RPC clients won't see new heads.
     engine_handle: Option<ConsensusEngineHandle<EthEngineTypes>>,
+    /// Optional handle to Reth's `PayloadBuilderService` (Stage 20a).
+    /// When installed, [`Self::build_real_payload`] can request a
+    /// real `ExecutionPayloadV3` from Reth — with mempool
+    /// transactions actually executed, real state root, real
+    /// receipts root — rather than synthesizing a header locally.
+    /// `None` keeps the existing synthesized-header `build_payload`
+    /// path as-is. Threading this in production is the foundation
+    /// for the "Solidity full-tx path"; subsequent stages will
+    /// wire it into `build_payload` itself + `newPayload` on commit.
+    payload_builder_handle: Option<PayloadBuilderHandle<EthEngineTypes>>,
     state: Mutex<State>,
     /// Per-account perp state, mutated by every fill the bridge sees
     /// (Stage 16b). Indexed by [`AccountId`] for O(1) update; the
@@ -147,6 +160,7 @@ impl<P> LiveRethEvmBridge<P> {
             clob,
             pending_fills,
             engine_handle: None,
+            payload_builder_handle: None,
             state: Mutex::new(State::default()),
             accounts,
             liquidation_params: LiquidationParams::hyperliquid_default(),
@@ -302,6 +316,99 @@ impl<P> LiveRethEvmBridge<P> {
     #[must_use]
     pub const fn has_engine_handle(&self) -> bool {
         self.engine_handle.is_some()
+    }
+
+    /// Stage 20a — install Reth's `PayloadBuilderHandle`. With this
+    /// in place, [`Self::build_real_payload`] can request a real
+    /// `ExecutionPayloadV3` from Reth (with mempool transactions
+    /// actually executed) rather than the synthesized header
+    /// `build_payload` produces today. No callers in production
+    /// yet — Stage 20a is the foundation, 20b wires it into the
+    /// `build_payload`/`commit` flow.
+    #[must_use]
+    pub fn with_payload_builder_handle(
+        mut self,
+        handle: PayloadBuilderHandle<EthEngineTypes>,
+    ) -> Self {
+        self.payload_builder_handle = Some(handle);
+        self
+    }
+
+    #[must_use]
+    pub const fn has_payload_builder_handle(&self) -> bool {
+        self.payload_builder_handle.is_some()
+    }
+
+    /// Stage 20a — request a real payload from Reth's
+    /// `PayloadBuilderService`. The service pulls transactions
+    /// from the mempool, executes them against the parent state,
+    /// and returns an [`EthBuiltPayload`] with the produced
+    /// `ExecutionPayloadV3`. The parent block MUST already be
+    /// known to Reth (via genesis or a prior `newPayload`); a
+    /// request against an unknown parent will hang.
+    ///
+    /// Returns `Err(BridgeError::Rejected)` when no payload
+    /// builder handle is installed. Existing
+    /// [`Self::build_payload`] (synthesized header path) is
+    /// unchanged.
+    pub async fn build_real_payload(
+        &self,
+        parent: BlockHash,
+        attrs: PayloadAttrs,
+    ) -> Result<EthBuiltPayload, BridgeError> {
+        let Some(builder) = self.payload_builder_handle.as_ref() else {
+            return Err(BridgeError::Rejected(
+                "build_real_payload: no PayloadBuilderHandle installed (use with_payload_builder_handle)".into(),
+            ));
+        };
+        let parent_b256 = B256::from(parent.0);
+
+        // Build the `PayloadAttributes` Reth expects. Shanghai is
+        // the highest hardfork the dev chain enables (genesis
+        // JSON's `shanghaiTime = 0`), so `withdrawals` must be
+        // `Some(empty)` and `parent_beacon_block_root` must be
+        // `None`.
+        let attributes = EthPayloadAttributes {
+            timestamp: attrs.timestamp,
+            prev_randao: B256::from(attrs.prev_randao),
+            suggested_fee_recipient: Address::from(attrs.fee_recipient),
+            withdrawals: Some(Vec::new()),
+            parent_beacon_block_root: None,
+            // Amsterdam fork's slot number — None on our pre-
+            // Amsterdam dev chain.
+            slot_number: None,
+        };
+
+        let build_input = BuildNewPayload {
+            attributes,
+            parent_hash: parent_b256,
+            cache: None,
+            trie_handle: None,
+        };
+
+        // `send_new_payload` returns immediately with a receiver;
+        // the actual job runs in the PayloadBuilderService task.
+        let payload_id = builder
+            .send_new_payload(build_input)
+            .await
+            .map_err(|e| BridgeError::Internal(eyre::eyre!("payload builder send: {e}")))?
+            .map_err(|e| BridgeError::Internal(eyre::eyre!("payload builder error: {e}")))?;
+
+        // `PayloadKind::Earliest` returns whatever's built so far
+        // (vs `WaitForPending` which waits until the timeout). Dev
+        // mempool is usually empty so the earliest payload is the
+        // final payload.
+        let built = builder
+            .resolve_kind(payload_id, PayloadKind::Earliest)
+            .await
+            .ok_or_else(|| {
+                BridgeError::Internal(eyre::eyre!(
+                    "payload builder dropped the job for id {payload_id:?}"
+                ))
+            })?
+            .map_err(|e| BridgeError::Internal(eyre::eyre!("payload builder resolve: {e}")))?;
+
+        Ok(built)
     }
 
     #[must_use]
@@ -2594,6 +2701,96 @@ mod tests {
             matches!(err, BridgeError::Rejected(_)),
             "unknown hash must yield Rejected"
         );
+
+        uninstall_fill_sink();
+        uninstall_clob();
+        drop(handle);
+    }
+
+    /// **Stage 20a**: with Reth's `PayloadBuilderHandle` installed,
+    /// `bridge.build_real_payload` asks the running
+    /// `PayloadBuilderService` to produce a real
+    /// `ExecutionPayloadV3` on top of genesis. The builder pulls
+    /// transactions from the mempool (empty here), executes them,
+    /// computes the state / receipts roots, and returns the
+    /// finished payload. This is the foundation the future
+    /// signed-tx-through-mempool path will build on; subsequent
+    /// stages will wire the result back into `build_payload` /
+    /// `commit` so consensus actually decides on real Reth-built
+    /// blocks.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn build_real_payload_via_reth_payload_builder() {
+        use crate::OpenHlExecutorBuilder;
+        use crate::precompiles::{uninstall_clob, uninstall_fill_sink};
+        use reth_node_ethereum::node::EthereumAddOns;
+
+        uninstall_clob();
+        uninstall_fill_sink();
+
+        let runtime = Runtime::test();
+        let chain_spec = dev_chain_spec();
+        let node_config = NodeConfig::test().dev().with_chain(chain_spec.clone());
+
+        let handle = NodeBuilder::new(node_config)
+            .testing_node(runtime)
+            .with_types::<EthereumNode>()
+            .with_components(EthereumNode::components().executor(OpenHlExecutorBuilder))
+            .with_add_ons(EthereumAddOns::default())
+            .launch()
+            .await
+            .expect("launch failed");
+
+        // Stage 20a: PayloadBuilderHandle is exposed by the launched
+        // node alongside the engine handle.
+        let payload_builder_handle = handle.node.payload_builder_handle.clone();
+
+        let bridge = LiveRethEvmBridge::new(handle.node.provider.clone(), chain_spec)
+            .with_payload_builder_handle(payload_builder_handle);
+        assert!(
+            bridge.has_payload_builder_handle(),
+            "with_payload_builder_handle must install the handle",
+        );
+
+        let genesis_hash_b256 = handle
+            .node
+            .provider
+            .block_hash(0)
+            .expect("provider call failed")
+            .expect("provider has no genesis");
+
+        // Build on top of genesis.
+        let attrs = PayloadAttrs {
+            // Pre-Shanghai timestamps cause the builder to reject;
+            // 1 second after genesis is fine.
+            timestamp: 1,
+            fee_recipient: [0u8; 20],
+            prev_randao: [0u8; 32],
+        };
+        let built = bridge
+            .build_real_payload(BlockHash(genesis_hash_b256.0), attrs.clone())
+            .await
+            .expect("build_real_payload failed");
+
+        // Sanity-check the result: the payload's block should
+        // parent on genesis and sit at height 1. We don't inspect
+        // the body because no mempool transactions are present in
+        // this isolated test — the empty-block path is sufficient
+        // proof that the integration works end-to-end.
+        let block = built.block();
+        assert_eq!(
+            block.parent_hash, genesis_hash_b256,
+            "real payload must parent on genesis",
+        );
+        assert_eq!(block.number, 1, "real payload at height 1");
+
+        // Negative: no handle installed → Rejected.
+        let bridge_no_pb =
+            LiveRethEvmBridge::new(handle.node.provider.clone(), bridge.chain_spec().clone());
+        let err = bridge_no_pb
+            .build_real_payload(BlockHash(genesis_hash_b256.0), attrs)
+            .await
+            .expect_err("must reject when no handle installed");
+        assert!(matches!(err, BridgeError::Rejected(_)));
 
         uninstall_fill_sink();
         uninstall_clob();

@@ -33,6 +33,7 @@ reth-node-builder        = { workspace = true }
 alloy-evm                = { workspace = true }
 reth-engine-primitives          = { workspace = true }
 reth-ethereum-engine-primitives = { workspace = true }
+reth-payload-builder            = { workspace = true }
 alloy-rpc-types-engine          = { workspace = true }
 
 [dev-dependencies]
