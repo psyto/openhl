@@ -19,12 +19,34 @@ Plus four pure state-machine subsystems that the EL composes:
 
 Collateral enters and leaves accounts through `deposit`/`withdraw`, exposed two ways (Stages 17b–17e):
 
-- **Bridge methods** — `LiveRethEvmBridge::deposit(account, amount: i64)` (signed, no balance check) and `withdraw(account, amount: u64) -> Option<Notional>` (margin-aware). Used by `bin/openhl` to seed demo collateral.
+- **Bridge methods** — `LiveRethEvmBridge::deposit(account, amount: i64)` (signed, no balance check) and `withdraw(account, amount: u64) -> Option<Notional>` (margin-aware). Used by `bin/openhl` to seed demo collateral and by RPC clients via the bridge cell.
 - **EVM precompiles** — `openhl_deposit` at `0x…0c1d` and `openhl_withdraw` at `0x…0c1e`, alongside the two CLOB precompiles (`clob_read_best_bid` at `0x…0c1b`, `clob_place_order` at `0x…0c1c`). They mutate the same `Arc<Mutex<HashMap<AccountId, Account>>>` the bridge owns, shared via the precompile module's install globals — so an EVM-side deposit and a Rust-side bridge deposit are the same state change.
 
-The withdraw rule (bridge + precompile, identical math) is **mark-aware free collateral** as of Stage 17j: when the CLOB has both a bid and an ask, `free = (collateral + uPnL) − |size| × mark × im_bps / 10⁴`; with a one-sided book it falls back to IM at `avg_entry`. Stage 17l → 17m made the margin model runtime-tunable: `LiveRethEvmBridge::with_liquidation_params(params)` stores the full `LiquidationParams` (initial / maintenance / fee bps) on the bridge AND installs `params.initial_margin_bps` into a precompile-module global so the EVM-side withdraw reads the same value. `bin/openhl` plumbs it from `OpenHlNodeConfig::liquidation_params` at boot; tests use `LiquidationParams::hyperliquid_default()` (1000 bps initial, 200 bps maintenance, 150 bps fee). Stage 17m exposes `bridge.margin_health(account) -> Option<MarginHealth>`, the production-shape `Safe / AtRisk / Liquidatable / Underwater` classification computed by `openhl-liquidation::margin_health` at the current CLOB midpoint. Stage 17n adds the same classifier as the `openhl_margin_health` precompile at `0x…0c1f` so Solidity contracts can query their own solvency on-chain; calldata is a single `uint64` account id, return is a 32-byte word whose last byte carries the discriminator (`0` Indeterminate / `1` Safe / `2` AtRisk / `3` Liquidatable / `4` Underwater). Stage 19a exposes the same accessors over JSON-RPC as `openhl_currentMark` / `openhl_accounts` / `openhl_accountSnapshot` / `openhl_marginHealth` / `openhl_liquidationParams` — see the README's RPC section.
+#### Mark-aware free collateral (Stage 17j)
 
-The precompiles are **revert-aware** as of Stage 17k: `OpenHlEvmFactory::create_evm` returns an `OpenHlEvm<DB, I, P>` wrapper that internally composes the user-facing inspector with `OpenHlRevertGuard` via REVM's `Inspector for (L, R)` tuple impl. The guard snapshots `{accounts, CLOB book, pending_fills}` on every call-frame entry and restores on revert — a contract that calls `openhl_deposit` and then `REVERT`s no longer mints collateral. The wrapper presents `Inspector = I` to satisfy `EvmFactory`'s GAT bound; users can still pass any inspector via `create_evm_with_inspector` and it runs alongside the guard.
+Both withdraw paths share one helper. When the CLOB has both a bid and an ask, the midpoint serves as the mark and the production-shape rule applies:
+
+```
+free = (collateral + unrealized_pnl) − |size| × mark × im_bps / 10⁴
+```
+
+With a one-sided book the rule falls back to IM at `avg_entry` (conservative). Flat accounts collapse to the raw-collateral check.
+
+#### Tunable margin params (Stages 17l → 17m)
+
+`LiveRethEvmBridge::with_liquidation_params(params)` stores the full `LiquidationParams` (initial / maintenance / fee bps) on the bridge AND installs `params.initial_margin_bps` + `params.maintenance_margin_bps` into precompile-module globals so the EVM-side reads exactly what the bridge enforces. `bin/openhl` plumbs it from `OpenHlNodeConfig::liquidation_params` at boot; tests use `LiquidationParams::hyperliquid_default()` (1000 bps initial, 200 bps maintenance, 150 bps fee).
+
+#### Queryable margin health (Stages 17m–17n + 19a)
+
+Three surfaces, all returning the same production-shape `Safe / AtRisk / Liquidatable / Underwater` classification computed by `openhl-liquidation::margin_health` at the current CLOB midpoint:
+
+- **Rust** — `bridge.margin_health(account) -> Option<MarginHealth>` (Stage 17m).
+- **EVM precompile** — `openhl_margin_health` at `0x…0c1f` (Stage 17n). Calldata: single `uint64` account id. Return: 32-byte word whose last byte is the discriminator (`0` Indeterminate / `1` Safe / `2` AtRisk / `3` Liquidatable / `4` Underwater).
+- **JSON-RPC** — `openhl_marginHealth(account)` (Stage 19a). Plus `openhl_currentMark`, `openhl_accounts`, `openhl_accountSnapshot`, `openhl_liquidationParams` for the rest of the accessor surface. See the README's RPC section.
+
+#### Revert-safe precompile mutations (Stages 17i + 17k)
+
+`OpenHlEvmFactory::create_evm` returns an `OpenHlEvm<DB, I, P>` wrapper that internally composes the user-facing inspector with `OpenHlRevertGuard` via REVM's `Inspector for (L, R)` tuple impl. The guard snapshots `{accounts, CLOB book, pending_fills}` on every call-frame entry and restores on revert — a contract that calls `openhl_deposit` and then `REVERT`s no longer mints collateral. The wrapper presents `Inspector = I` to satisfy `EvmFactory`'s GAT bound; users can still pass any inspector via `create_evm_with_inspector` and it runs alongside the guard.
 
 ## The CL/EL contract
 
@@ -62,4 +84,4 @@ The pure crates never call `SystemTime::now`, `HashMap` iteration order, `rand`,
 
 ## ADRs
 
-Significant design decisions are recorded as ADRs under `docs/adr/`. Each ADR is dated, stable, and never edited after acceptance — supersede with a new ADR instead.
+`docs/adr/` is reserved for Architecture Decision Records that need their own dated, stable artifact (think: chain reorg semantics, validator-set rotation, fee market). The directory is empty today — design notes through Stage 19a live in commit messages and this document, which has been adequate so far. Add an ADR when a decision is (a) load-bearing, (b) likely to be revisited, and (c) hard to reconstruct from the diff alone. ADRs are never edited after acceptance — supersede with a new one instead.

@@ -41,6 +41,42 @@ cargo test -p openhl-evm via_evm_bytecode -- --ignored --test-threads=1
 - `live_node::tests::deposit_via_evm_bytecode_persists_on_return` (Stage 17i)
 - `live_node::tests::deposit_via_evm_bytecode_rolls_back_on_revert_through_create_evm` (Stage 17k — production-wiring path)
 
+## Smoke-testing the `openhl_*` RPC namespace (Stage 19a)
+
+`bin/openhl reth-devnet` exposes the bridge's accessors over HTTP JSON-RPC on `127.0.0.1:8545` (default Reth bind, alongside the `eth_*` namespace). Quick way to confirm the surface end-to-end:
+
+```bash
+# 1. Boot a single-validator devnet for enough rounds that it
+#    stays up long enough to curl. Background it; capture the PID.
+TEMPDIR=$(mktemp -d)
+openhl reth-devnet --moniker rpcsmoke --data-dir "$TEMPDIR" --rounds 60 \
+  > /tmp/openhl-rpc.log 2>&1 &
+RUN_PID=$!
+
+# 2. Wait until Reth's HTTP RPC server logs "RPC HTTP server started".
+until grep -q "RPC HTTP server started" /tmp/openhl-rpc.log; do sleep 1; done
+
+# 3. Query each method.
+for method in openhl_currentMark openhl_accounts openhl_liquidationParams; do
+  echo "--- $method ---"
+  curl -s -X POST -H 'Content-Type: application/json' \
+    --data "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"$method\",\"params\":[]}" \
+    http://127.0.0.1:8545
+  echo
+done
+
+# 4. Account-scoped methods take one positional u64 arg.
+curl -s -X POST -H 'Content-Type: application/json' \
+  --data '{"jsonrpc":"2.0","id":2,"method":"openhl_marginHealth","params":[20]}' \
+  http://127.0.0.1:8545
+
+# 5. Cleanup.
+kill $RUN_PID 2>/dev/null
+rm -rf "$TEMPDIR" /tmp/openhl-rpc.log
+```
+
+Expected post-seed responses (Stage 17h boot scenario): `currentMark` → `96`, `accounts` → `[10,20,30,40,50]`, `liquidationParams` → `{1000, 200, 150}` bps, `marginHealth(20)` → `"Safe"` (Bob is post-cascade flat once the run has progressed; on the very first tick he reads as `"Liquidatable"` per the seed contract — see `bin/openhl`'s seed docstring).
+
 ## Startup fail-fast behavior
 
 `OpenHlNode::start()` now waits for the first consensus app message by
