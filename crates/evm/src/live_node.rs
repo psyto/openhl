@@ -31,7 +31,7 @@
 
 use alloy_consensus::Header;
 use alloy_primitives::{Address, B256};
-use alloy_rpc_types_engine::ForkchoiceState;
+use alloy_rpc_types_engine::{ExecutionData, ExecutionPayload, ForkchoiceState};
 use async_trait::async_trait;
 use openhl_clearing::{apply_fill, Account};
 use openhl_clob::{AccountId, Book, Fill, FillResult, Order};
@@ -122,11 +122,25 @@ pub struct LiveRethEvmBridge<P> {
 #[derive(Debug, Default)]
 struct State {
     next_payload_id: u64,
-    /// Pending payloads keyed by `PayloadId.0`. Value is (`block_hash`, `header`,
-    /// fills drained from the CLOB at `build_payload` time).
-    pending: HashMap<u64, (B256, Header, Vec<Fill>)>,
+    /// Pending payloads keyed by `PayloadId.0`.
+    pending: HashMap<u64, PendingPayload>,
     chain: HashMap<B256, Header>,
     head: Option<B256>,
+}
+
+/// In-flight payload metadata. The `built` slot is filled when the
+/// bridge has a `PayloadBuilderHandle` installed (Stage 20b) — in
+/// that case `build_payload` got the header from Reth's actual
+/// `PayloadBuilderService` and `commit` forwards the full payload
+/// via `engine.new_payload` before `fork_choice_updated`. Without a
+/// handle the synthesized-header path stays in use and `built` is
+/// `None` — `commit` falls back to FCU-only (Stage 7d behavior).
+#[derive(Debug, Clone)]
+struct PendingPayload {
+    hash: B256,
+    header: Header,
+    fills: Vec<Fill>,
+    built: Option<EthBuiltPayload>,
 }
 
 impl<P> LiveRethEvmBridge<P> {
@@ -551,7 +565,7 @@ impl<P> LiveRethEvmBridge<P> {
     #[must_use]
     pub fn payload_fills(&self, id: PayloadId) -> Option<Vec<Fill>> {
         let s = self.state.lock().expect("state mutex poisoned");
-        s.pending.get(&id.0).map(|(_, _, fills)| fills.clone())
+        s.pending.get(&id.0).map(|p| p.fills.clone())
     }
 
     /// Number of fills currently buffered, waiting for the next `build_payload`.
@@ -705,6 +719,43 @@ where
     ) -> Result<PayloadId, BridgeError> {
         let parent_b256 = B256::from(parent.0);
 
+        // Stage 20b: if a `PayloadBuilderHandle` is installed, get
+        // the header from Reth's real `PayloadBuilderService`. The
+        // service pulls mempool transactions, executes them against
+        // the parent state, and produces a Header with real state /
+        // receipts / transactions roots. `commit` will forward the
+        // built payload via `engine.new_payload` so Reth canonicalises
+        // the block. Without a handle the synthesized-header path
+        // below stays the source of truth — fine for unit tests and
+        // any bridge that hasn't been wired into a live node yet.
+        if self.payload_builder_handle.is_some() {
+            let built = self.build_real_payload(parent, attrs).await?;
+            let header = built.block().header().clone();
+            let hash = built.block().hash();
+
+            // Drain fills + reserve id + insert under the state mutex
+            // (without holding it across the await above).
+            let mut s = self.state.lock().expect("state mutex poisoned");
+            let id = s.next_payload_id;
+            s.next_payload_id += 1;
+            let drained_fills = std::mem::take(
+                &mut *self
+                    .pending_fills
+                    .lock()
+                    .expect("pending_fills mutex poisoned"),
+            );
+            s.pending.insert(
+                id,
+                PendingPayload {
+                    hash,
+                    header,
+                    fills: drained_fills,
+                    built: Some(built),
+                },
+            );
+            return Ok(PayloadId(id));
+        }
+
         // Look up the parent header. Two sources:
         //
         //   (a) Bridge's internal `chain` map — populated by `commit()`
@@ -790,24 +841,32 @@ where
                 .expect("pending_fills mutex poisoned"),
         );
 
-        s.pending.insert(id, (hash, header, drained_fills));
+        s.pending.insert(
+            id,
+            PendingPayload {
+                hash,
+                header,
+                fills: drained_fills,
+                built: None,
+            },
+        );
         Ok(PayloadId(id))
     }
 
     async fn payload_ready(&self, id: PayloadId) -> Result<ExecutedBlock, BridgeError> {
         let s = self.state.lock().expect("state mutex poisoned");
         let n = id.0;
-        let (hash, header, _fills) = s
+        let p = s
             .pending
             .get(&n)
             .cloned()
             .ok_or_else(|| BridgeError::Rejected(format!("unknown payload id {n}")))?;
         Ok(ExecutedBlock {
-            hash: BlockHash(hash.0),
-            parent_hash: BlockHash(header.parent_hash.0),
-            number: header.number,
-            state_root: header.state_root.0,
-            timestamp: header.timestamp,
+            hash: BlockHash(p.hash.0),
+            parent_hash: BlockHash(p.header.parent_hash.0),
+            number: p.header.number,
+            state_root: p.header.state_root.0,
+            timestamp: p.header.timestamp,
         })
     }
 
@@ -824,8 +883,8 @@ where
             let s = self.state.lock().expect("state mutex poisoned");
             s.pending
                 .values()
-                .find(|(h, _, _)| *h == block_hash)
-                .map(|(_, h, _)| h.clone())
+                .find(|p| p.hash == block_hash)
+                .map(|p| p.header.clone())
                 .or_else(|| s.chain.get(&block_hash).cloned())
         };
         let Some(header) = header else {
@@ -855,29 +914,49 @@ where
 
     async fn commit(&self, block_hash: BlockHash) -> Result<(), BridgeError> {
         let hash = B256::from(block_hash.0);
-        let header = {
+        let pending = {
             let mut s = self.state.lock().expect("state mutex poisoned");
-            let header = s
+            let entry = s
                 .pending
                 .values()
-                .find(|(h, _, _)| *h == hash)
-                .map(|(_, h, _)| h.clone())
+                .find(|p| p.hash == hash)
+                .cloned()
                 .ok_or_else(|| {
                     BridgeError::Rejected(format!("commit for unknown hash {hash}"))
                 })?;
-            s.chain.insert(hash, header.clone());
+            s.chain.insert(hash, entry.header.clone());
             s.head = Some(hash);
-            header
+            entry
         };
 
+        // Stage 20b: when the bridge has a real built payload AND an
+        // engine handle, send `newPayload` BEFORE the fork-choice
+        // update. The engine needs to know the body exists before it
+        // can canonicalise the head; otherwise FCU returns SYNCING.
+        // Best-effort — log-and-drop pattern matches the FCU below.
+        // (The engine emits an `INVALID` status as a returned value,
+        // not an `Err`, so a real failure here surfaces only via
+        // telemetry; a follow-up stage can add a tracing line.)
+        if let (Some(handle), Some(built)) =
+            (&self.engine_handle, &pending.built)
+        {
+            let sealed = built.block().clone();
+            let block_hash_b256 = sealed.hash();
+            let block = sealed.into_block();
+            let (payload, sidecar) =
+                ExecutionPayload::from_block_unchecked(block_hash_b256, &block);
+            let data = ExecutionData { payload, sidecar };
+            let _ = handle.new_payload(data).await;
+        }
+
         // Stage 7d: if an Engine API handle has been installed, also tell
-        // Reth's consensus engine about the new canonical head. We always
-        // commit *locally* first (above) — sending to the engine is best-
-        // effort at this stage because we haven't yet uploaded a real
-        // ExecutionPayload via newPayload (Stage 8d's drained fills aren't
-        // EVM-executable yet), so the engine will return SYNCING/INVALID.
-        // The wire being connected is what 7d proves; full payload-execution
-        // alignment is downstream once fills become EVM transactions.
+        // Reth's consensus engine about the new canonical head. With a real
+        // payload uploaded above (Stage 20b path), FCU returns VALID and
+        // Reth's canonical chain advances in lockstep with consensus. With
+        // only the synthesized-header path (Stage 7d fallback) FCU returns
+        // SYNCING because Reth doesn't have an executable body for this
+        // hash — that's still useful (proves the wire is connected) and
+        // doesn't fail the commit.
         if let Some(handle) = &self.engine_handle {
             let state = ForkchoiceState {
                 head_block_hash: hash,
@@ -887,9 +966,9 @@ where
             let _ = handle.fork_choice_updated(state, None).await;
         }
 
-        // `header` is bound so the post-engine path can read fields off it
+        // `pending` is bound so the post-engine path can read fields off it
         // for telemetry if desired. Drop is fine.
-        drop(header);
+        drop(pending);
         Ok(())
     }
 
@@ -901,7 +980,7 @@ where
     /// format so adding fill-replication later doesn't break the
     /// schema).
     async fn encode_proposed_block(&self, id: PayloadId) -> Result<Vec<u8>, BridgeError> {
-        let (hash, header, _fills) = {
+        let p = {
             let s = self.state.lock().expect("state mutex poisoned");
             s.pending
                 .get(&id.0)
@@ -914,11 +993,11 @@ where
                 })?
         };
         let block = ExecutedBlock {
-            hash: BlockHash(hash.0),
-            parent_hash: BlockHash(header.parent_hash.0),
-            number: header.number,
-            state_root: header.state_root.0,
-            timestamp: header.timestamp,
+            hash: BlockHash(p.hash.0),
+            parent_hash: BlockHash(p.header.parent_hash.0),
+            number: p.header.number,
+            state_root: p.header.state_root.0,
+            timestamp: p.header.timestamp,
         };
         // Note: drained fills are intentionally NOT included in the wire
         // format at v0. The proposer's `pending_fills` are CLOB-local
@@ -926,7 +1005,18 @@ where
         // transactions, so the follower has no use for them. When fills
         // become real EVM txs the schema gets a fills field — adding
         // one to `ProposedBlockWire` is the only change.
-        let wire = ProposedBlockWire { header, block };
+        //
+        // Stage 20b: similarly, the Reth-built `ExecutionPayloadV3`
+        // (when the proposer has a `PayloadBuilderHandle` installed)
+        // is NOT shipped over the wire yet. Followers receive only
+        // the Header, so a follower-side Reth running 20b would fall
+        // back to the FCU-only path (engine returns SYNCING, ignored).
+        // Stage 20c will extend `ProposedBlockWire` with the full
+        // payload so followers can run `engine.new_payload` too.
+        let wire = ProposedBlockWire {
+            header: p.header,
+            block,
+        };
         serde_json::to_vec(&wire).map_err(|e| {
             BridgeError::Internal(eyre::eyre!("serialise proposed block: {e}"))
         })
@@ -959,8 +1049,15 @@ where
         let mut s = self.state.lock().expect("state mutex poisoned");
         let id = s.next_payload_id;
         s.next_payload_id += 1;
-        s.pending
-            .insert(id, (computed, wire.header, Vec::new()));
+        s.pending.insert(
+            id,
+            PendingPayload {
+                hash: computed,
+                header: wire.header,
+                fills: Vec::new(),
+                built: None,
+            },
+        );
         Ok(wire.block)
     }
 }
@@ -2791,6 +2888,111 @@ mod tests {
             .await
             .expect_err("must reject when no handle installed");
         assert!(matches!(err, BridgeError::Rejected(_)));
+
+        uninstall_fill_sink();
+        uninstall_clob();
+        drop(handle);
+    }
+
+    /// **Stage 20b**: end-to-end. With BOTH the engine handle AND
+    /// the payload builder handle installed, `build_payload` calls
+    /// Reth's real `PayloadBuilderService` (so the resulting Header
+    /// has real state / receipts / transactions roots), then
+    /// `commit` sends `engine.new_payload` followed by
+    /// `engine.fork_choice_updated` — so Reth's canonical chain
+    /// advances to the new head. We confirm by reading
+    /// `provider.block_hash(1)` after commit.
+    ///
+    /// Stage 7d's test proves FCU alone gets through. Stage 20a's
+    /// test proves the builder service can produce a real payload.
+    /// 20b is the bridge between the two — proves the bridge's
+    /// `commit` ACTUALLY canonicalises a Reth-built payload, which
+    /// is the load-bearing claim for everything downstream: real
+    /// receipts, real eth_getTransactionByHash, real signed
+    /// transactions winning blocks.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn commit_canonicalises_real_payload_via_engine_new_payload() {
+        use crate::OpenHlExecutorBuilder;
+        use crate::precompiles::{uninstall_clob, uninstall_fill_sink};
+        use reth_node_ethereum::node::EthereumAddOns;
+
+        uninstall_clob();
+        uninstall_fill_sink();
+
+        let runtime = Runtime::test();
+        let chain_spec = dev_chain_spec();
+        let node_config = NodeConfig::test().dev().with_chain(chain_spec.clone());
+
+        let handle = NodeBuilder::new(node_config)
+            .testing_node(runtime)
+            .with_types::<EthereumNode>()
+            .with_components(EthereumNode::components().executor(OpenHlExecutorBuilder))
+            .with_add_ons(EthereumAddOns::default())
+            .launch()
+            .await
+            .expect("launch failed");
+
+        let engine_handle = handle.node.add_ons_handle.beacon_engine_handle.clone();
+        let payload_builder_handle = handle.node.payload_builder_handle.clone();
+
+        let bridge = LiveRethEvmBridge::new(handle.node.provider.clone(), chain_spec)
+            .with_engine_handle(engine_handle)
+            .with_payload_builder_handle(payload_builder_handle);
+
+        let genesis_hash_b256 = handle
+            .node
+            .provider
+            .block_hash(0)
+            .expect("provider call failed")
+            .expect("provider has no genesis");
+
+        // Pre-condition: Reth's canonical chain has only genesis.
+        assert!(
+            handle
+                .node
+                .provider
+                .block_hash(1)
+                .expect("provider call failed")
+                .is_none(),
+            "no block 1 in Reth yet",
+        );
+
+        let attrs = PayloadAttrs {
+            timestamp: 1,
+            fee_recipient: [0u8; 20],
+            prev_randao: [0u8; 32],
+        };
+
+        // Build through the real PayloadBuilder.
+        let id = bridge
+            .build_payload(BlockHash(genesis_hash_b256.0), attrs)
+            .await
+            .expect("build_payload via real builder failed");
+        let block = bridge.payload_ready(id).await.expect("payload_ready failed");
+        assert_eq!(block.parent_hash, BlockHash(genesis_hash_b256.0));
+        assert_eq!(block.number, 1);
+
+        // Commit — fires engine.new_payload + fork_choice_updated.
+        bridge
+            .commit(block.hash)
+            .await
+            .expect("commit failed");
+
+        // The load-bearing assertion: Reth's canonical chain has
+        // advanced to height 1, and the hash matches the bridge's
+        // committed head. Stage 7d's FCU-only commit could not do
+        // this (engine returns SYNCING because Reth has no payload);
+        // Stage 20b's new_payload + FCU sequence does.
+        let canonical_h1 = handle
+            .node
+            .provider
+            .block_hash(1)
+            .expect("provider call failed")
+            .expect("Reth must have canonical block 1 after commit");
+        assert_eq!(
+            canonical_h1.0, block.hash.0,
+            "Reth's canonical block 1 hash must match the bridge's committed head",
+        );
 
         uninstall_fill_sink();
         uninstall_clob();
