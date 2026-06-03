@@ -3030,4 +3030,221 @@ mod tests {
         uninstall_clob();
         drop(handle);
     }
+
+    /// Stage 20d helper — same dev chain spec, but with a known EOA
+    /// pre-funded so a signed transfer can pay gas. Address is the
+    /// Anvil/Hardhat default account 0 (well-known privkey, see
+    /// `DEV_ANVIL_PRIVKEY` below) — using it intentionally so anyone
+    /// can sign txs against this dev chain with off-the-shelf tools.
+    /// Gas limit is bumped from `0x5208` (21000, the cost of an empty
+    /// transfer with zero margin) to 30M so a Solidity tx fits.
+    fn dev_chain_spec_with_funded_eoa() -> Arc<ChainSpec> {
+        use alloy_genesis::GenesisAccount;
+        use alloy_primitives::{address, U256};
+
+        let custom_genesis = r#"{
+            "nonce": "0x42",
+            "timestamp": "0x0",
+            "extraData": "0x5343",
+            "gasLimit": "0x1c9c380",
+            "difficulty": "0x400000000",
+            "mixHash": "0x0000000000000000000000000000000000000000000000000000000000000000",
+            "coinbase": "0x0000000000000000000000000000000000000000",
+            "alloc": {},
+            "number": "0x0",
+            "gasUsed": "0x0",
+            "parentHash": "0x0000000000000000000000000000000000000000000000000000000000000000",
+            "config": {
+                "ethash": {},
+                "chainId": 2600,
+                "homesteadBlock": 0,
+                "eip150Block": 0,
+                "eip155Block": 0,
+                "eip158Block": 0,
+                "byzantiumBlock": 0,
+                "constantinopleBlock": 0,
+                "petersburgBlock": 0,
+                "istanbulBlock": 0,
+                "berlinBlock": 0,
+                "londonBlock": 0,
+                "terminalTotalDifficulty": 0,
+                "terminalTotalDifficultyPassed": true,
+                "shanghaiTime": 0
+            }
+        }"#;
+        let mut genesis: Genesis = serde_json::from_str(custom_genesis).expect("dev genesis parses");
+        genesis.alloc.insert(
+            address!("0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266"),
+            GenesisAccount {
+                // 1000 ETH (1e21 wei) — plenty for any test tx's gas + value.
+                balance: U256::from(1_000_000_000_000_000_000_000u128),
+                ..Default::default()
+            },
+        );
+        Arc::new(genesis.into())
+    }
+
+    /// **Stage 20d**: end-to-end signed-tx → mined-block path.
+    ///
+    /// Submits a signed `TxLegacy` via Reth's transaction pool (the
+    /// same path `eth_sendRawTransaction` takes after recovering),
+    /// drives `bridge.build_payload` so Reth's `PayloadBuilder`
+    /// pulls the tx from the mempool, then `commit` so the engine
+    /// canonicalises the block. Asserts:
+    ///   * the built payload's body carries our tx (proves the
+    ///     mempool → builder → block path)
+    ///   * `provider.transaction_by_hash` returns Some after commit
+    ///     (proves Reth canonicalised + indexed the tx)
+    ///
+    /// This is the load-bearing claim of the "Solidity full-tx
+    /// path" bullet: a user-signed transaction is reachable via
+    /// standard `eth_*` accessors after a single bridge cycle.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn eth_send_raw_transaction_lands_in_real_block() {
+        use crate::OpenHlExecutorBuilder;
+        use crate::precompiles::{uninstall_clob, uninstall_fill_sink};
+        use alloy_consensus::{SignableTransaction, TxLegacy};
+        use alloy_eips::eip2718::Encodable2718;
+        use alloy_primitives::{Address, TxKind, U256};
+        use alloy_signer::SignerSync;
+        use alloy_signer_local::PrivateKeySigner;
+        use reth_ethereum_primitives::PooledTransactionVariant;
+        use reth_node_ethereum::node::EthereumAddOns;
+        use reth_storage_api::TransactionsProvider;
+        use reth_transaction_pool::{EthPooledTransaction, PoolTransaction, TransactionPool};
+
+        uninstall_clob();
+        uninstall_fill_sink();
+
+        let runtime = Runtime::test();
+        let chain_spec = dev_chain_spec_with_funded_eoa();
+        let node_config = NodeConfig::test().dev().with_chain(chain_spec.clone());
+
+        let handle = NodeBuilder::new(node_config)
+            .testing_node(runtime)
+            .with_types::<EthereumNode>()
+            .with_components(EthereumNode::components().executor(OpenHlExecutorBuilder))
+            .with_add_ons(EthereumAddOns::default())
+            .launch()
+            .await
+            .expect("launch failed");
+
+        let engine_handle = handle.node.add_ons_handle.beacon_engine_handle.clone();
+        let payload_builder_handle = handle.node.payload_builder_handle.clone();
+
+        let bridge = LiveRethEvmBridge::new(handle.node.provider.clone(), chain_spec)
+            .with_engine_handle(engine_handle)
+            .with_payload_builder_handle(payload_builder_handle);
+
+        // Sign a TxLegacy with the well-known Anvil dev key 0
+        // (matches the funded address in the chain spec above).
+        const DEV_ANVIL_PRIVKEY: [u8; 32] = [
+            0xac, 0x09, 0x74, 0xbe, 0xc3, 0x9a, 0x17, 0xe3, 0x6b, 0xa4, 0xa6, 0xb4, 0xd2,
+            0x38, 0xff, 0x94, 0x4b, 0xac, 0xb4, 0x78, 0xcb, 0xed, 0x5e, 0xfc, 0xae, 0x78,
+            0x4d, 0x7b, 0xf4, 0xf2, 0xff, 0x80,
+        ];
+        let signer = PrivateKeySigner::from_bytes(&DEV_ANVIL_PRIVKEY.into())
+            .expect("PrivateKeySigner from Anvil dev key");
+
+        let tx = TxLegacy {
+            chain_id: Some(2600),
+            nonce: 0,
+            gas_price: 1_000_000_000, // 1 gwei
+            gas_limit: 21_000,
+            to: TxKind::Call(Address::from([0xde; 20])),
+            value: U256::from(1u64),
+            input: Default::default(),
+        };
+        let sig = signer
+            .sign_hash_sync(&tx.signature_hash())
+            .expect("sign tx hash");
+        let signed = tx.into_signed(sig);
+        let tx_hash = *signed.hash();
+        // Wrap as a TxEnvelope so encoded_2718 produces a real
+        // eth_sendRawTransaction wire payload.
+        let envelope: alloy_consensus::TxEnvelope = signed.into();
+        let raw = envelope.encoded_2718();
+
+        // The same path `eth_sendRawTransaction` takes after parsing:
+        // recover the sender + wrap as the pool's transaction type.
+        let recovered =
+            reth_rpc_eth_types::utils::recover_raw_transaction::<PooledTransactionVariant>(&raw)
+                .expect("recover signed tx");
+        let pooled = EthPooledTransaction::from_pooled(recovered);
+
+        handle
+            .node
+            .pool
+            .add_external_transaction(pooled)
+            .await
+            .expect("pool accepted tx");
+
+        // Drive the bridge: PayloadBuilder pulls our tx out of the
+        // mempool and bakes it into the block.
+        let genesis_hash_b256 = handle
+            .node
+            .provider
+            .block_hash(0)
+            .expect("provider call failed")
+            .expect("provider has no genesis");
+        let attrs = PayloadAttrs {
+            timestamp: 1,
+            fee_recipient: [0u8; 20],
+            prev_randao: [0u8; 32],
+        };
+        let id = bridge
+            .build_payload(BlockHash(genesis_hash_b256.0), attrs)
+            .await
+            .expect("build_payload failed");
+        let block = bridge.payload_ready(id).await.expect("payload_ready failed");
+
+        // Assertion 1: the built payload's body carries our tx.
+        // payload_fills is the wrong accessor (those are CLOB
+        // fills); we read the body off the pending entry's built
+        // payload directly.
+        let body_tx_count = {
+            let s = bridge.state.lock().expect("state mutex poisoned");
+            let pending = s
+                .pending
+                .values()
+                .find(|p| p.hash.0 == block.hash.0)
+                .expect("pending entry");
+            pending
+                .built
+                .as_ref()
+                .expect("real-payload path stores built")
+                .block()
+                .body()
+                .transactions
+                .len()
+        };
+        assert_eq!(
+            body_tx_count, 1,
+            "Reth's PayloadBuilder must have pulled our mempool tx into the block",
+        );
+
+        // Commit — fires engine.new_payload + FCU; Reth canonicalises.
+        bridge.commit(block.hash).await.expect("commit failed");
+
+        // Assertion 2: the tx is reachable via Reth's standard
+        // `provider.transaction_by_hash`, which is the same accessor
+        // backing `eth_getTransactionByHash`. This is the visible-
+        // to-clients proof.
+        let indexed = handle
+            .node
+            .provider
+            .transaction_by_hash(tx_hash)
+            .expect("provider call failed")
+            .expect("Reth must index our tx after commit");
+        // Sanity: the indexed tx is our tx.
+        let indexed_hash = indexed.hash();
+        assert_eq!(
+            *indexed_hash, tx_hash,
+            "indexed tx hash must match the one we signed",
+        );
+
+        uninstall_fill_sink();
+        uninstall_clob();
+        drop(handle);
+    }
 }

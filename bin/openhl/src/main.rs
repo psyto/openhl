@@ -1279,11 +1279,16 @@ fn parse_socket_spec(spec: &str) -> eyre::Result<(IpAddr, u16)> {
 /// reth custom-dev-node example so behaviour can be compared 1:1 if
 /// needed. Same shape `crates/evm` uses in its integration tests.
 fn dev_chain_spec() -> Arc<ChainSpec> {
+    // Stage 20d: gas_limit bumped from `0x5208` (21000 — the cost
+    // of an empty value transfer with no headroom) to 30M so any
+    // Solidity tx submitted via `eth_sendRawTransaction` actually
+    // fits. The old limit was a leftover from when the devnet's
+    // payload bodies were synthesized headers with no real exec.
     let genesis_json = r#"{
         "nonce": "0x42",
         "timestamp": "0x0",
         "extraData": "0x5343",
-        "gasLimit": "0x5208",
+        "gasLimit": "0x1c9c380",
         "difficulty": "0x400000000",
         "mixHash": "0x0000000000000000000000000000000000000000000000000000000000000000",
         "coinbase": "0x0000000000000000000000000000000000000000",
@@ -1316,6 +1321,21 @@ fn dev_chain_spec() -> Arc<ChainSpec> {
     // having to know the precompile address layout. See
     // `reader_contracts.rs` for the contracts + their ABIs.
     genesis.alloc.extend(reader_contracts::genesis_alloc());
+    // Stage 20d: pre-fund the well-known Anvil dev account 0
+    // (privkey `0xac0974…ff80`, address `0xf39F…2266`) with 1000
+    // ETH so anyone connecting MetaMask / cast / web3.py with that
+    // key has gas to spend. Using the canonical Anvil address means
+    // existing tooling (Foundry, Hardhat) just works against this
+    // chain without bespoke setup.
+    use alloy_genesis::GenesisAccount;
+    use alloy_primitives::{address, U256};
+    genesis.alloc.insert(
+        address!("0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266"),
+        GenesisAccount {
+            balance: U256::from(1_000_000_000_000_000_000_000u128),
+            ..Default::default()
+        },
+    );
     Arc::new(genesis.into())
 }
 

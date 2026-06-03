@@ -43,7 +43,13 @@ reth-node-ethereum   = { workspace = true, features = ["test-utils"] }
 reth-node-core       = { workspace = true }
 reth-tasks           = { workspace = true }
 reth-provider        = { workspace = true }
+reth-transaction-pool = { workspace = true }
+reth-rpc-eth-types   = { workspace = true }
 alloy-genesis        = { workspace = true }
+alloy-network        = { workspace = true }
+alloy-signer         = { workspace = true }
+alloy-signer-local   = { workspace = true }
+alloy-eips           = { workspace = true }
 tempfile             = "3"
 
 [lints]

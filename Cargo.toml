@@ -55,6 +55,8 @@ reth-provider             = { git = "https://github.com/paradigmxyz/reth", rev =
 reth-storage-api          = { git = "https://github.com/paradigmxyz/reth", rev = "88505c7fcbfdebfd3b56d88c86b62e950043c6c4" }
 reth-consensus            = { git = "https://github.com/paradigmxyz/reth", rev = "88505c7fcbfdebfd3b56d88c86b62e950043c6c4" }
 reth-ethereum-consensus   = { git = "https://github.com/paradigmxyz/reth", rev = "88505c7fcbfdebfd3b56d88c86b62e950043c6c4" }
+reth-transaction-pool     = { git = "https://github.com/paradigmxyz/reth", rev = "88505c7fcbfdebfd3b56d88c86b62e950043c6c4" }
+reth-rpc-eth-types        = { git = "https://github.com/paradigmxyz/reth", rev = "88505c7fcbfdebfd3b56d88c86b62e950043c6c4" }
 reth-primitives-traits    = "0.3"
 alloy-genesis             = { version = "2.0", default-features = false }
 alloy-evm                 = { version = "0.34", default-features = false }
@@ -77,6 +79,10 @@ alloy-primitives = { version = "1.5", default-features = false }
 alloy-rlp        = { version = "0.3", default-features = false }
 alloy-consensus  = { version = "2.0", default-features = false }
 alloy-rpc-types-engine = { version = "2.0", default-features = false }
+alloy-network    = { version = "2.0", default-features = false }
+alloy-signer     = { version = "2.0", default-features = false }
+alloy-signer-local = { version = "2.0", default-features = false }
+alloy-eips       = { version = "2.0", default-features = false }
 reth-ethereum-engine-primitives = { git = "https://github.com/paradigmxyz/reth", rev = "88505c7fcbfdebfd3b56d88c86b62e950043c6c4" }
 
 # --- Shared runtime / utilities (crates.io) ---
