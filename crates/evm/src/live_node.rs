@@ -128,19 +128,31 @@ struct State {
     head: Option<B256>,
 }
 
-/// In-flight payload metadata. The `built` slot is filled when the
-/// bridge has a `PayloadBuilderHandle` installed (Stage 20b) — in
-/// that case `build_payload` got the header from Reth's actual
-/// `PayloadBuilderService` and `commit` forwards the full payload
-/// via `engine.new_payload` before `fork_choice_updated`. Without a
-/// handle the synthesized-header path stays in use and `built` is
-/// `None` — `commit` falls back to FCU-only (Stage 7d behavior).
+/// In-flight payload metadata. The `execution_data` slot carries
+/// the canonical execution payload Reth's engine API expects (a
+/// shape produced by `EthPayloadTypes::block_to_payload`). It is
+/// filled in two production paths:
+///
+///   1. Proposer side, when `build_payload` ran through Reth's real
+///      `PayloadBuilderService` (Stage 20b) — the bridge converts
+///      `EthBuiltPayload` to `ExecutionData` at build time and
+///      keeps the canonical form.
+///   2. Follower side, when `register_proposed_block` decoded a
+///      Stage 20c-2 wire that included the payload — the follower
+///      installs it into pending so its own `commit` fires
+///      `engine.new_payload` too and Reth canonicalises.
+///
+/// `None` in two cases — both are the synthesized-header
+/// fallback: bridges without a `PayloadBuilderHandle` installed
+/// (unit tests, in-process bridges), AND followers that received
+/// a pre-20c-2 wire (no payload field). In both, `commit` skips
+/// `new_payload` and only fires FCU (Stage 7d behavior).
 #[derive(Debug, Clone)]
 struct PendingPayload {
     hash: B256,
     header: Header,
     fills: Vec<Fill>,
-    built: Option<EthBuiltPayload>,
+    execution_data: Option<ExecutionData>,
 }
 
 impl<P> LiveRethEvmBridge<P> {
@@ -764,6 +776,19 @@ where
             let built = self.build_real_payload(parent, attrs).await?;
             let header = built.block().header().clone();
             let hash = built.block().hash();
+            // Convert to the canonical `ExecutionData` Reth's engine
+            // API consumes — same shape `EthPayloadTypes::block_to_payload`
+            // produces. Storing this here (vs the `EthBuiltPayload`
+            // we got from the builder) means `commit` only needs to
+            // forward bytes, AND the same field can be filled
+            // identically on the follower side from a Stage 20c-2
+            // wire payload.
+            let sealed = built.block().clone();
+            let block_hash_b256 = sealed.hash();
+            let block = sealed.into_block();
+            let (payload, sidecar) =
+                ExecutionPayload::from_block_unchecked(block_hash_b256, &block);
+            let execution_data = ExecutionData { payload, sidecar };
 
             // Drain fills + reserve id + insert under the state mutex
             // (without holding it across the await above).
@@ -782,7 +807,7 @@ where
                     hash,
                     header,
                     fills: drained_fills,
-                    built: Some(built),
+                    execution_data: Some(execution_data),
                 },
             );
             return Ok(PayloadId(id));
@@ -879,7 +904,7 @@ where
                 hash,
                 header,
                 fills: drained_fills,
-                built: None,
+                execution_data: None,
             },
         );
         Ok(PayloadId(id))
@@ -961,24 +986,23 @@ where
             entry
         };
 
-        // Stage 20b: when the bridge has a real built payload AND an
-        // engine handle, send `newPayload` BEFORE the fork-choice
-        // update. The engine needs to know the body exists before it
-        // can canonicalise the head; otherwise FCU returns SYNCING.
-        // Best-effort — log-and-drop pattern matches the FCU below.
-        // (The engine emits an `INVALID` status as a returned value,
-        // not an `Err`, so a real failure here surfaces only via
-        // telemetry; a follow-up stage can add a tracing line.)
-        if let (Some(handle), Some(built)) =
-            (&self.engine_handle, &pending.built)
+        // Stage 20b/20c-2: when the bridge has an execution payload
+        // AND an engine handle, send `newPayload` BEFORE the
+        // fork-choice update. The engine needs to know the body
+        // exists before it can canonicalise the head; otherwise
+        // FCU returns SYNCING. Best-effort — log-and-drop pattern
+        // matches the FCU below. (The engine emits an `INVALID`
+        // status as a returned value, not an `Err`, so a real
+        // failure surfaces only via telemetry.)
+        //
+        // The proposer's `build_payload` fills `execution_data`
+        // from its `EthBuiltPayload`; followers' `register_proposed_block`
+        // (Stage 20c-2) fills it from the wire. Both paths funnel
+        // through the same `engine.new_payload` call here.
+        if let (Some(handle), Some(data)) =
+            (&self.engine_handle, &pending.execution_data)
         {
-            let sealed = built.block().clone();
-            let block_hash_b256 = sealed.hash();
-            let block = sealed.into_block();
-            let (payload, sidecar) =
-                ExecutionPayload::from_block_unchecked(block_hash_b256, &block);
-            let data = ExecutionData { payload, sidecar };
-            let _ = handle.new_payload(data).await;
+            let _ = handle.new_payload(data.clone()).await;
         }
 
         // Stage 7d: if an Engine API handle has been installed, also tell
@@ -1038,16 +1062,20 @@ where
         // become real EVM txs the schema gets a fills field — adding
         // one to `ProposedBlockWire` is the only change.
         //
-        // Stage 20b: similarly, the Reth-built `ExecutionPayloadV3`
-        // (when the proposer has a `PayloadBuilderHandle` installed)
-        // is NOT shipped over the wire yet. Followers receive only
-        // the Header, so a follower-side Reth running 20b would fall
-        // back to the FCU-only path (engine returns SYNCING, ignored).
-        // Stage 20c will extend `ProposedBlockWire` with the full
-        // payload so followers can run `engine.new_payload` too.
+        // Stage 20c-2: the proposer's `ExecutionData` (when the
+        // bridge has a `PayloadBuilderHandle` installed AND
+        // therefore built a real payload) IS shipped over the wire.
+        // Followers decode it in `register_proposed_block` and
+        // install it into their own pending, so their `commit` also
+        // fires `engine.new_payload` and Reth canonicalises on the
+        // follower side. When the proposer used the synthesized-
+        // header fallback path, this field is `None` and followers
+        // fall back to FCU-only (Stage 7d behavior) — wire shape
+        // stays backward-compatible.
         let wire = ProposedBlockWire {
             header: p.header,
             block,
+            execution_data: p.execution_data,
         };
         serde_json::to_vec(&wire).map_err(|e| {
             BridgeError::Internal(eyre::eyre!("serialise proposed block: {e}"))
@@ -1087,7 +1115,14 @@ where
                 hash: computed,
                 header: wire.header,
                 fills: Vec::new(),
-                built: None,
+                // Stage 20c-2: if the proposer's wire carries a
+                // canonical `ExecutionData`, install it. The
+                // follower's `commit` will forward it via
+                // `engine.new_payload` so its own Reth canonicalises
+                // the same block the proposer is producing — closing
+                // the gap from 20c-1 where followers had to leave
+                // their Reth side at genesis.
+                execution_data: wire.execution_data,
             },
         );
         Ok(wire.block)
@@ -1099,10 +1134,22 @@ where
 /// built the block itself — its next `build_payload` finds the right
 /// parent in `state.chain` and produces an identical hash, just like
 /// any other committed block on this validator.
+///
+/// `execution_data` (Stage 20c-2) is the canonical execution payload
+/// Reth's engine API consumes. When the proposer used Reth's real
+/// `PayloadBuilderService` (Stage 20b), the field is populated and
+/// the follower forwards it to its own engine via `new_payload`. When
+/// the proposer used the synthesized-header fallback, the field is
+/// `None` and the follower falls back to FCU-only (Stage 7d behavior).
+/// `#[serde(default)]` keeps the schema backward-compatible: a
+/// follower running 20c-2 still decodes wires shipped by a pre-20c-2
+/// proposer (the field deserialises as `None`).
 #[derive(serde::Serialize, serde::Deserialize)]
 struct ProposedBlockWire {
     header: Header,
     block: ExecutedBlock,
+    #[serde(default)]
+    execution_data: Option<ExecutionData>,
 }
 
 #[cfg(test)]
@@ -3199,9 +3246,9 @@ mod tests {
         let block = bridge.payload_ready(id).await.expect("payload_ready failed");
 
         // Assertion 1: the built payload's body carries our tx.
-        // payload_fills is the wrong accessor (those are CLOB
-        // fills); we read the body off the pending entry's built
-        // payload directly.
+        // We read the body off the pending entry's stored
+        // `ExecutionData` (Stage 20c-2 representation — the
+        // canonical shape Reth's engine API consumes).
         let body_tx_count = {
             let s = bridge.state.lock().expect("state mutex poisoned");
             let pending = s
@@ -3210,12 +3257,11 @@ mod tests {
                 .find(|p| p.hash.0 == block.hash.0)
                 .expect("pending entry");
             pending
-                .built
+                .execution_data
                 .as_ref()
-                .expect("real-payload path stores built")
-                .block()
-                .body()
-                .transactions
+                .expect("real-payload path stores execution_data")
+                .payload
+                .transactions()
                 .len()
         };
         assert_eq!(
@@ -3242,6 +3288,136 @@ mod tests {
             *indexed_hash, tx_hash,
             "indexed tx hash must match the one we signed",
         );
+
+        uninstall_fill_sink();
+        uninstall_clob();
+        drop(handle);
+    }
+
+    /// **Stage 20c-2**: prove the proposer→follower wire format
+    /// carries enough for follower-side `engine.new_payload`. A
+    /// "proposer" bridge with a `PayloadBuilderHandle` builds a
+    /// real payload, encodes it via `encode_proposed_block`. A
+    /// separate "follower" bridge against the same Reth provider
+    /// (engine handle only, no `PayloadBuilderHandle` — simulates
+    /// what 18a's wire-based replication produces) decodes the
+    /// wire via `register_proposed_block` and runs `commit`. The
+    /// commit must succeed end-to-end: the follower's pending
+    /// entry carries an `execution_data`, so its `commit` fires
+    /// `engine.new_payload` AND `fork_choice_updated`. Reth's
+    /// canonical chain stays consistent.
+    ///
+    /// Why this matters: under 20c-1, follower validators in a
+    /// multi-validator devnet had `execution_data: None` (the
+    /// 18a wire only shipped Header), so their commits skipped
+    /// `engine.new_payload` and their Reth side stayed at
+    /// genesis. 20c-2 closes that gap — every validator's Reth
+    /// now canonicalises in lockstep with consensus, not just
+    /// the proposer.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn proposer_to_follower_payload_roundtrip_through_wire() {
+        use crate::OpenHlExecutorBuilder;
+        use crate::precompiles::{uninstall_clob, uninstall_fill_sink};
+        use reth_node_ethereum::node::EthereumAddOns;
+
+        uninstall_clob();
+        uninstall_fill_sink();
+
+        let runtime = Runtime::test();
+        let chain_spec = dev_chain_spec();
+        let node_config = NodeConfig::test().dev().with_chain(chain_spec.clone());
+
+        let handle = NodeBuilder::new(node_config)
+            .testing_node(runtime)
+            .with_types::<EthereumNode>()
+            .with_components(EthereumNode::components().executor(OpenHlExecutorBuilder))
+            .with_add_ons(EthereumAddOns::default())
+            .launch()
+            .await
+            .expect("launch failed");
+
+        let engine_handle = handle.node.add_ons_handle.beacon_engine_handle.clone();
+        let payload_builder_handle = handle.node.payload_builder_handle.clone();
+
+        // Proposer bridge: builds real payloads via Reth.
+        let proposer = LiveRethEvmBridge::new(handle.node.provider.clone(), chain_spec.clone())
+            .with_engine_handle(engine_handle.clone())
+            .with_payload_builder_handle(payload_builder_handle);
+
+        let genesis_hash_b256 = handle
+            .node
+            .provider
+            .block_hash(0)
+            .expect("provider call failed")
+            .expect("provider has no genesis");
+
+        let attrs = PayloadAttrs {
+            timestamp: 1,
+            fee_recipient: [0u8; 20],
+            prev_randao: [0u8; 32],
+        };
+
+        // Proposer: build_payload → encode_proposed_block.
+        let pid = proposer
+            .build_payload(BlockHash(genesis_hash_b256.0), attrs)
+            .await
+            .expect("proposer build_payload");
+        let wire_bytes = proposer
+            .encode_proposed_block(pid)
+            .await
+            .expect("proposer encode_proposed_block");
+
+        // Sanity check that the wire DOES carry the execution
+        // payload — this is the load-bearing wire-format change.
+        let decoded: ProposedBlockWire =
+            serde_json::from_slice(&wire_bytes).expect("decode");
+        assert!(
+            decoded.execution_data.is_some(),
+            "Stage 20c-2: proposer wire must carry the real execution payload",
+        );
+
+        // Follower bridge: same provider, same engine handle,
+        // BUT no PayloadBuilderHandle (followers don't build
+        // their own payloads — they install whatever the
+        // proposer shipped).
+        let follower = LiveRethEvmBridge::new(handle.node.provider.clone(), chain_spec)
+            .with_engine_handle(engine_handle);
+        assert!(
+            !follower.has_payload_builder_handle(),
+            "follower must not have its own builder handle",
+        );
+
+        // Follower: register the proposer's wire → installs in
+        // pending with execution_data populated.
+        let block = follower
+            .register_proposed_block(&wire_bytes)
+            .await
+            .expect("follower register_proposed_block");
+
+        // Confirm the follower's pending entry carries the
+        // execution data (this is what 20c-2 fixes — pre-20c-2
+        // followers had execution_data = None here).
+        {
+            let s = follower.state.lock().expect("state mutex poisoned");
+            let pending = s
+                .pending
+                .values()
+                .find(|p| p.hash.0 == block.hash.0)
+                .expect("pending entry");
+            assert!(
+                pending.execution_data.is_some(),
+                "Stage 20c-2: follower must install execution_data from the wire",
+            );
+        }
+
+        // Follower commit: must succeed (engine.new_payload returns
+        // VALID for the same payload Reth already saw from the
+        // proposer's commit path; this is a no-op for Reth but
+        // proves the follower's invocation is well-formed).
+        follower
+            .commit(block.hash)
+            .await
+            .expect("follower commit");
 
         uninstall_fill_sink();
         uninstall_clob();

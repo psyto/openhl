@@ -78,7 +78,7 @@ informalsystems-malachitebft-signing-ed25519 = { git = "https://github.com/infor
 alloy-primitives = { version = "1.5", default-features = false }
 alloy-rlp        = { version = "0.3", default-features = false }
 alloy-consensus  = { version = "2.0", default-features = false }
-alloy-rpc-types-engine = { version = "2.0", default-features = false }
+alloy-rpc-types-engine = { version = "2.0", default-features = false, features = ["serde"] }
 alloy-network    = { version = "2.0", default-features = false }
 alloy-signer     = { version = "2.0", default-features = false }
 alloy-signer-local = { version = "2.0", default-features = false }
