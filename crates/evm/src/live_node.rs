@@ -369,7 +369,10 @@ impl<P> LiveRethEvmBridge<P> {
         &self,
         parent: BlockHash,
         attrs: PayloadAttrs,
-    ) -> Result<EthBuiltPayload, BridgeError> {
+    ) -> Result<EthBuiltPayload, BridgeError>
+    where
+        P: HeaderProvider<Header = Header>,
+    {
         let Some(builder) = self.payload_builder_handle.as_ref() else {
             return Err(BridgeError::Rejected(
                 "build_real_payload: no PayloadBuilderHandle installed (use with_payload_builder_handle)".into(),
@@ -377,13 +380,42 @@ impl<P> LiveRethEvmBridge<P> {
         };
         let parent_b256 = B256::from(parent.0);
 
+        // Stage 20c-1: Reth's engine-API tree validator rejects any
+        // header whose `timestamp` isn't strictly greater than the
+        // parent's. In production the consensus driver may pass
+        // `attrs.timestamp = 0` (the demo `OpenHlNode::tick` starts
+        // its clock at zero); the synthesized-header path bumps to
+        // `parent.timestamp + 1` automatically, so do the same here.
+        // Without this, block 1 builds successfully but
+        // `engine.new_payload` returns INVALID and the chain stops.
+        let parent_timestamp = {
+            let from_chain = {
+                let s = self.state.lock().expect("state mutex poisoned");
+                s.chain.get(&parent_b256).map(|h| h.timestamp)
+            };
+            if let Some(t) = from_chain {
+                t
+            } else {
+                self.provider
+                    .sealed_header_by_hash(parent_b256)
+                    .map_err(|e| BridgeError::Internal(eyre::eyre!("provider error: {e}")))?
+                    .map(|sh| sh.header().timestamp)
+                    .ok_or_else(|| {
+                        BridgeError::Rejected(format!(
+                            "build_real_payload: parent {parent_b256} not in chain or provider"
+                        ))
+                    })?
+            }
+        };
+        let timestamp = attrs.timestamp.max(parent_timestamp + 1);
+
         // Build the `PayloadAttributes` Reth expects. Shanghai is
         // the highest hardfork the dev chain enables (genesis
         // JSON's `shanghaiTime = 0`), so `withdrawals` must be
         // `Some(empty)` and `parent_beacon_block_root` must be
         // `None`.
         let attributes = EthPayloadAttributes {
-            timestamp: attrs.timestamp,
+            timestamp,
             prev_randao: B256::from(attrs.prev_randao),
             suggested_fee_recipient: Address::from(attrs.fee_recipient),
             withdrawals: Some(Vec::new()),

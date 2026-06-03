@@ -538,9 +538,29 @@ async fn run_reth_devnet(
     // uses `params.initial_margin_bps` for withdraw and the full
     // params for `margin_health()`.
     let liquidation_params = OpenHlNodeConfig::hyperliquid_default().liquidation_params;
+    // Stage 20c-1: thread Reth's Engine API + PayloadBuilder
+    // handles into the bridge so `build_payload` invokes the real
+    // payload builder (real state / receipts / transactions roots)
+    // and `commit` fires `engine.new_payload` followed by
+    // `fork_choice_updated` — Reth's canonical chain now advances
+    // in lockstep with consensus. Prior to this, every commit went
+    // only to the bridge's local chain map; Reth stayed at genesis
+    // and RPC clients saw a frozen `eth_blockNumber = 0`.
+    //
+    // Multi-validator devnet: followers continue to receive only
+    // the Header via `ProposedBlockWire` (Stage 18a wire format),
+    // so their bridge's `pending.built` is `None` and their commit
+    // skips `engine.new_payload`. Their Reth stays at genesis (same
+    // as 18a's behavior). Stage 20c-2 will extend the wire format
+    // with the full `ExecutionPayloadV3` so followers also install
+    // and canonicalise the payload.
+    let engine_handle = node.add_ons_handle.beacon_engine_handle.clone();
+    let payload_builder_handle = node.payload_builder_handle.clone();
     let bridge = Arc::new(
         LiveRethEvmBridge::new(node.provider.clone(), chain_spec)
-            .with_liquidation_params(liquidation_params),
+            .with_liquidation_params(liquidation_params)
+            .with_engine_handle(engine_handle)
+            .with_payload_builder_handle(payload_builder_handle),
     );
     // Stage 19a: now that the bridge exists, fill the RPC cell so
     // openhl_* methods start resolving against it. Any client that
