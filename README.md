@@ -140,6 +140,18 @@ openhl reth-devnet --moniker alice --data-dir /tmp/openhl-a \
 
 **Cross-validator note:** every validator MUST load the same fixture. The seed runs in production code paths and the resulting bridge state is part of the determinism contract — different fixtures → different initial state → consensus diverges.
 
+## Sending real Ethereum transactions
+
+Stage 20d shipped the end-to-end `eth_sendRawTransaction` path; Stage 20e ships a one-command demo:
+
+```bash
+./examples/eth-sendrawtx-demo.sh
+```
+
+The script boots `openhl reth-devnet` against a temp data dir, signs a 1-wei transfer from the pre-funded Anvil dev account 0 (`0xf39F…2266`, well-known privkey — same address Foundry/Hardhat use, so any off-the-shelf tooling works against this chain), submits via `curl + eth_sendRawTransaction`, polls `eth_getTransactionReceipt` until the tx mines, and prints the receipt + the before/after balance delta. Requires `cargo`, `curl`, `jq` — no external Ethereum tooling. Signing is handled by `crates/evm/examples/sign-transfer.rs`, which you can also invoke directly (`cargo run -q -p openhl-evm --example sign-transfer -- <nonce> <to-addr> <value-wei>`) to mint custom transactions for your own experiments.
+
+Connecting MetaMask / cast / web3.py works too — point them at `http://127.0.0.1:8545` with chain id `2600` and import the Anvil dev key 0 (`0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80`).
+
 ## Build
 
 ```bash
