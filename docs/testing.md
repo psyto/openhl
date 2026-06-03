@@ -211,3 +211,28 @@ diff <(jq -S . /tmp/v-a/coordinator/state.json) \
 
 No code is N-specific; the dial-list construction (Stage 13l) and
 the consensus validator set already handle arbitrary N.
+
+### Verifying real-payload canonicalisation on every validator (Stage 20c-2)
+
+Through Stage 20c-1 the follower validators' Reth side stayed at
+genesis — only the proposer's `engine.new_payload` ran, because
+the Stage 18a `ProposedBlockWire` carried only the Header. Stage
+20c-2 extends the wire with `ExecutionData`; followers install it
+via their own `engine.new_payload` so every validator's Reth
+canonicalises in lockstep with consensus.
+
+Verify by hitting each node's `eth_blockNumber` against its
+distinct `--rpc-bind` after a few rounds. All three should
+report the same nonzero block number:
+
+```bash
+for port in 8545 8546 8547; do
+  curl -s -X POST -H 'Content-Type: application/json' \
+    --data '{"jsonrpc":"2.0","method":"eth_blockNumber","params":[],"id":1}' \
+    http://127.0.0.1:$port | jq -r '.result'
+done
+# expect three matching nonzero results, e.g. 0x14 / 0x14 / 0x14
+```
+
+Pre-20c-2, the proposer's port returned a nonzero value while
+the other two returned `0x0`. Verified at N=3 (alice/bob/carol).
