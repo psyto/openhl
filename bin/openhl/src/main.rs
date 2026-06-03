@@ -37,6 +37,7 @@
 //! (persistent across restarts, real network config, multi-validator)
 //! lands in Stage 13f.
 
+mod chain_history;
 mod reader_contracts;
 mod rpc;
 mod seed_fixture;
@@ -203,6 +204,31 @@ enum Command {
         /// byte-identically.
         #[arg(long)]
         seed_fixture: Option<PathBuf>,
+
+        /// Stage 21 — path to a JSON chain-history file
+        /// (`crate::chain_history::ChainHistory` shape). When
+        /// set, the boot scenario is replayed PER BLOCK during
+        /// consensus instead of all-at-once before consensus
+        /// starts. Each block's events apply at the start of
+        /// the tick callback for that height; the cascade
+        /// emerges naturally when the position / mark / oracle
+        /// constellation first crosses the liquidation
+        /// thresholds.
+        ///
+        /// Mutually exclusive with `--seed-fixture` — both
+        /// modify the boot scenario and combining them would
+        /// make the determinism contract ambiguous.
+        ///
+        /// Cross-validator note: identical to `--seed-fixture`
+        /// — every validator MUST load the same chain-history
+        /// file, distributed out-of-band, or their bridge
+        /// states diverge.
+        ///
+        /// See `examples/chain-history-default.json` for a
+        /// chain-history that reproduces the current hardcoded
+        /// seed's cascade, staggered across multiple blocks.
+        #[arg(long, conflicts_with = "seed_fixture")]
+        chain_history: Option<PathBuf>,
     },
 }
 
@@ -256,6 +282,7 @@ fn main() -> eyre::Result<()> {
             listen_addr,
             rpc_bind,
             seed_fixture,
+            chain_history,
         } => tokio_rt()?.block_on(run_reth_devnet(
             rounds,
             moniker,
@@ -265,6 +292,7 @@ fn main() -> eyre::Result<()> {
             listen_addr,
             rpc_bind,
             seed_fixture,
+            chain_history,
         )),
     }
 }
@@ -413,6 +441,7 @@ async fn run_reth_devnet(
     listen_addr: Option<String>,
     rpc_bind: Option<String>,
     seed_fixture_path: Option<PathBuf>,
+    chain_history_path: Option<PathBuf>,
 ) -> eyre::Result<()> {
     println!(
         "openhl v{} — driving {} reth-backed decision{}",
@@ -820,8 +849,47 @@ async fn run_reth_devnet(
     // Scan and ADL never share an account in a single tick — the
     // disjoint-target invariant the `apply records` logic below
     // relies on is preserved across the retire-the-MM rewrite.
+    // Stage 21: load `--chain-history` if present so the
+    // tick-hook applier can fire per-block events. The applier
+    // is constructed BEFORE the seed branch below so the
+    // chain-history mode can skip seeding via the
+    // hardcoded/fixture paths entirely — its events are the
+    // whole boot scenario.
+    let chain_history_applier: Option<Arc<chain_history::ChainHistoryApplier>> =
+        if let Some(path) = chain_history_path.as_deref() {
+            let history = chain_history::load_from_path(path)?;
+            let applier = chain_history::ChainHistoryApplier::new(history)?;
+            println!(
+                "      chain history        = {} ({} block(s) listed: heights {:?})",
+                path.display(),
+                applier.total_blocks(),
+                applier.heights(),
+            );
+            Some(Arc::new(applier))
+        } else {
+            None
+        };
+
     let accounts_already_loaded = !bridge.accounts_snapshot().is_empty();
-    if accounts_already_loaded {
+    if chain_history_applier.is_some() {
+        // Stage 21: chain-history mode owns the entire seed.
+        // Events for each block — deposits, trades, the mark
+        // book itself — apply per-tick inside the engine app
+        // hook below. Skip ALL the hardcoded / fixture seed
+        // branches.
+        if accounts_already_loaded {
+            println!(
+                "      accounts             = {} loaded from bridge snapshot",
+                bridge.accounts_snapshot().len(),
+            );
+            println!(
+                "      mark book            = (chain-history mode — re-seed via the relevant block in the JSON)",
+            );
+        } else {
+            println!("      accounts             = (chain-history mode — applied per-tick)");
+            println!("      mark book            = (chain-history mode — applied per-tick)");
+        }
+    } else if accounts_already_loaded {
         println!(
             "      accounts             = {} loaded from bridge snapshot",
             bridge.accounts_snapshot().len(),
@@ -885,6 +953,7 @@ async fn run_reth_devnet(
     let coordinator_for_hook = coordinator.clone();
     let publishers_for_hook = publishers.clone();
     let bridge_for_hook = bridge.clone();
+    let chain_history_for_hook = chain_history_applier.clone();
     let app_task = tokio::spawn(async move {
         run_engine_app(
             bridge_for_engine,
@@ -894,6 +963,34 @@ async fn run_reth_devnet(
             initial_height_for_consensus,
             rounds_usize,
             move |hash, height, block_time| {
+                // Stage 21: chain-history applier fires FIRST,
+                // before oracle ingest / tick. Events at the
+                // current height go through `bridge.submit_order`
+                // / `bridge.deposit` — same code paths the
+                // hardcoded seed uses — so the snapshot fed into
+                // `node.tick` below reflects this block's events
+                // before scan / ADL / funding run.
+                if let Some(applier) = chain_history_for_hook.as_ref() {
+                    match applier.apply_for_height(bridge_for_hook.as_ref(), height.0) {
+                        Ok(Some((trades, fills, deposits))) => {
+                            println!(
+                                "  chain-history apply: height={} → {} trade(s), {} fill(s), {} deposit(s)",
+                                height.0, trades, fills, deposits,
+                            );
+                        }
+                        Ok(None) => {
+                            // No entry at this height — fine, the
+                            // history is sparser than the run length.
+                        }
+                        Err(e) => {
+                            return Err(eyre::eyre!(
+                                "chain-history apply failed at height {}: {e}",
+                                height.0,
+                            ));
+                        }
+                    }
+                }
+
                 let mut node = coordinator_for_hook
                     .lock()
                     .map_err(|_| eyre::eyre!("coordinator mutex poisoned"))?;

@@ -1,0 +1,57 @@
+{
+  "_doc_": [
+    "Stage 21 chain-history example — produces the same accounts + cascade as",
+    "the hardcoded all-at-once seed, but staggered across three blocks. Every",
+    "validator must load the same file (determinism contract, see",
+    "bin/openhl/src/chain_history.rs).",
+    "",
+    "Block 1: deposits for all 5 accounts + Dave/Eve place resting Sell orders",
+    "         at 110. No fills yet — the book has asks but no bids cross them.",
+    "Block 2: Alice/Bob/Carol each market-buy against Dave's/Eve's resting asks.",
+    "         Four fills land; Alice/Bob/Carol are long, Dave/Eve are short.",
+    "         At the end of tick 2 the oracle has been publishing 102, so Bob",
+    "         (collateral 90, position long 10 @ 110) is Liquidatable and Carol",
+    "         (collateral 100, position long 50 @ 110) is Underwater — the",
+    "         cascade fires for the first time.",
+    "Block 3: Mark-book orders (Buy 95, Sell 97 → midpoint 96). With both the",
+    "         oracle (102) and the CLOB midpoint (96) available, effective_mark",
+    "         is still the oracle. Position state already cleared by tick 2's",
+    "         cascade, so block 3's tick is a no-op except for funding.",
+    "",
+    "Run with:",
+    "  openhl reth-devnet --rounds 5 --moniker demo \\",
+    "    --chain-history examples/chain-history-default.json"
+  ],
+  "blocks": [
+    {
+      "height": 1,
+      "deposits": [
+        {"account": 10, "amount": 200},
+        {"account": 20, "amount": 90},
+        {"account": 30, "amount": 100},
+        {"account": 40, "amount": 300},
+        {"account": 50, "amount": 200}
+      ],
+      "trades": [
+        {"id": 1001, "account": 40, "side": "Sell", "qty": 50, "kind": "Limit", "price": 110},
+        {"id": 1002, "account": 50, "side": "Sell", "qty": 20, "kind": "Limit", "price": 110}
+      ]
+    },
+    {
+      "height": 2,
+      "trades": [
+        {"id": 1003, "account": 10, "side": "Buy", "qty": 10, "kind": "Market"},
+        {"id": 1004, "account": 20, "side": "Buy", "qty": 10, "kind": "Market"},
+        {"id": 1005, "account": 30, "side": "Buy", "qty": 30, "kind": "Market"},
+        {"id": 1006, "account": 30, "side": "Buy", "qty": 20, "kind": "Market"}
+      ]
+    },
+    {
+      "height": 3,
+      "trades": [
+        {"id": 2001, "account": 1, "side": "Buy",  "qty": 1, "kind": "Limit", "price": 95},
+        {"id": 2002, "account": 2, "side": "Sell", "qty": 1, "kind": "Limit", "price": 97}
+      ]
+    }
+  ]
+}
